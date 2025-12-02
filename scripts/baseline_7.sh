@@ -1,0 +1,20 @@
+python train.py \
+  --wandb_run disen_ctc+layerkd \
+  --out outputs/disen/ctc+layerkd \
+  --data_script ./librispeech_asr.py \
+  --data_cfg train_100 \
+  --train_split train.clean.100 \
+  --val_split dev.clean \
+  --test_split test.clean \
+  --teacher_name stt_en_conformer_ctc_small \
+  --use_ctc True \
+  --use_logit_kd False \
+  --use_layer_kd True \
+  --use_flow False \
+  --use_diffkd False \
+  --use_disent True \
+  --flow_steps 8 \
+  --batch_size 32 \
+  --epochs 100 \
+  --gpus 1 
+
