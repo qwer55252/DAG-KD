@@ -172,7 +172,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # Speaker classifier (파란 박스 - teacher speaker embedding CE)
         self.num_spk = getattr(cfg, "num_spk", 0)
-        self.spk_cls = nn.Linear(self.latent_dim, max(1, self.num_spk)) if (self.num_spk > 1) else None
+        if self.num_spk > 1:
+            # stats pooling: mean + std → 2 * latent_dim
+            self.spk_cls = nn.Linear(self.latent_dim * 2, self.num_spk)
+        else:
+            self.spk_cls = None
         self.disen_spk_ce_lambda = getattr(cfg, "disen_spk_ce_lambda", 1.0)
 
         # Reconstruction loss weight
@@ -376,7 +380,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         return F.kl_div(logp_s_T, p_t, reduction="batchmean") * (T * T)
 
     def _layer_metric_kd(self):
-        # (옵션) 기존 구현 유지
+        # 기존 구현 유지
         if not self.stu_feats or not self.tch_feats:
             return torch.tensor(0.0, device=self.device)
 
@@ -419,7 +423,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         return sum(losses) / len(losses)
 
     # ===== Teacher Text/Speaker/Prosody embedding 생성 =====
-    def _make_embeddings(self, meta: Optional[Dict[str, torch.Tensor]]):
+    def _make_embeddings(self, speaker_ids):
         """
         반환: dict(
           txt_emb   = text embedding (B, E),
@@ -475,20 +479,29 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
-        if self.spk_cls is not None and meta is not None:
-            spk_ids = meta.get("spk_ids", None)
-            if spk_ids is not None:
-                valid_mask = (spk_ids >= 0)
-                if valid_mask.any():
-                    logits = self.spk_cls(spk_emb)                 # (B, num_spk)
-                    # CE는 valid한 샘플만
-                    spk_ce = F.cross_entropy(
-                        logits[valid_mask],
-                        spk_ids[valid_mask].clamp(min=0)
-                    )
-                    # accuracy 계산
-                    preds = logits.argmax(dim=-1)
-                    spk_acc = (preds[valid_mask] == spk_ids[valid_mask]).float().mean()
+        if self.spk_cls is not None:
+            valid_mask = (speaker_ids >= 0)
+            if valid_mask.any():
+                # spk_emb: (B, latent_dim, T)
+                # 1) stats pooling: mean + std → utterance-level embedding
+                spk_mean = spk_emb.mean(dim=-1)              # (B, latent_dim)
+                spk_std  = spk_emb.std(dim=-1)               # (B, latent_dim)
+                spk_utt  = torch.cat([spk_mean, spk_std], dim=-1)  # (B, 2*latent_dim)
+
+                spk_utt_valid = spk_utt[valid_mask]          # (B_valid, 2*latent_dim)
+                target_valid = speaker_ids[valid_mask]
+                target_valid = target_valid.clamp(min=0).long()   # ★ int64 로 변환 ★
+                
+                # 2) classifier: (B_valid, num_spk)
+                logits_utt = self.spk_cls(spk_utt_valid)     # (B_valid, num_spk)
+
+                # 3) CE loss
+                spk_ce = F.cross_entropy(logits_utt, target_valid)
+
+                # 4) accuracy
+                all_logits = self.spk_cls(spk_utt)           # (B, num_spk)
+                preds = all_logits.argmax(dim=-1)            # (B,) long
+                spk_acc = (preds[valid_mask] == target_valid).float().mean()
 
         # XAI: 시각화
         if self.vis_enable:
@@ -534,9 +547,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             mi = mi / cnt
         return mi
 
-    def set_meta_lookup(self, meta_lookup):
-        self._meta_lookup = meta_lookup
-
     def training_step(self, batch, batch_idx):
         """
         그림과 맞게 학습 순서:
@@ -548,15 +558,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         """
         # NeMo ASR default batch: (signal, signal_len, transcript, transcript_len)
         if len(batch) == 5:
-            signal, sig_len, y, ylen, sample_ids = batch
-            if hasattr(self, "_meta_lookup") and (self._meta_lookup is not None):
-                meta = self._meta_lookup.batch_meta(sample_ids, device=signal.device)
-            else:
-                meta = None
+            signal, sig_len, y, ylen, speaker_ids = batch
         elif len(batch) == 4:
             signal, sig_len, y, ylen = batch
-            sample_ids = None
-            meta = None
+            speaker_ids = None
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
 
@@ -573,7 +578,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # 3) Factorization embeddings + MI/Rec/Speaker CE
         if self.use_disent:
             # Factorization embeddings + MI/Rec/Speaker CE
-            embs = self._make_embeddings(meta)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
+            embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
 
             # MI term
             mi_term = self._mi_loss(embs)
@@ -625,7 +630,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/logit_kd", kd_logit, on_step=True, on_epoch=True)
             total = total + self.kd_alpha * kd_logit
 
-        # 7) (옵션) Layer-wise metric KD
+        # 7) Layer-wise metric KD
         if self.use_layer_kd:
             kd_layer = self._layer_metric_kd()
             self.log("train/layer_kd", kd_layer, on_step=True, on_epoch=True)

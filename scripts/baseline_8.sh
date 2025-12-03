@@ -13,9 +13,10 @@ python train.py \
   --use_flow False \
   --use_diffkd False \
   --use_disent True \
+  --disent_spk_layers "4" \
+  --disent_txt_layers "16" \
   --flow_steps 8 \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-  --resume_ckpt_path /workspace/DAG-KD/outputs/disen/ctc+logitkd+layerkd/checkpoints/last.ckpt \
 

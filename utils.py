@@ -53,7 +53,7 @@ def save_speaker_mapping(spk2idx, idx2spk, out_path: str):
 
     print(f"[SPEAKER MAP] saved id<->idx mapping to {out_path}")
     
-# <<<<<<<<<<<<<<<<<<<<<<<<<< Utils
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -62,14 +62,14 @@ def str2bool(v):
     if v in ("no", "false","f", "n", "0"): return False
     raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 
+
 def _clean_text(s: str) -> str:
     s = re.sub(r"\{.*?\}", "", s)
     s = s.replace("<sil>", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s.lower()
-# >>>>>>>>>>>>>>>>>>>>>>>>>>
 
-# <<<<<<<<<<<<<<<<<<<<<<<<<< speaker utils
+
 def scan_speakers(ds):
     spk_set = set()
     for ex in ds:
@@ -248,49 +248,9 @@ def release_nemoAPI(model, out_folder: str):
     connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
     model._save_restore_connector.model_extracted_dir = out_folder
     AppState().nemo_file_folder = out_folder
-# >>>>>>>>>>>>>>>>>>>>>>>>>>
 
-class SampleMetaLookup:
-    """
-    manifest(jsonl)에서 id→(speaker, language) 맵을 구축해서
-    training_step에서 sample_id 텐서를 받아 바로 meta 텐서로 바꿔준다.
-    """
-    def __init__(self, *manifest_paths):
-        self.id2spk = {}
-        for mp in manifest_paths:
-            try:
-                with open(mp, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if not line.strip(): continue
-                        obj = json.loads(line)
-                        sid = str(obj.get("id", ""))
-                        if not sid: continue
-                        self.id2spk[sid] = int(obj.get("speaker", -1))
-            except FileNotFoundError:
-                pass
 
-    def batch_meta(self, sample_ids, device):
-        """
-        sample_ids: List[str] or Tensor of encoded strings
-        returns: dict {'spk_ids': LongTensor [B], 'lang_ids': LongTensor [B]}
-        """
-        ids = []
-        if isinstance(sample_ids, (list, tuple)):
-            ids = [sid if isinstance(sid, str) else str(sid) for sid in sample_ids]
-        else:
-            # (B,) tensor of python objects 지원 안될 수 있어 list로 강제
-            try:
-                ids = [str(x) for x in sample_ids]
-            except Exception:
-                # 마지막 수단: 전부 unknown 처리
-                return {"spk_ids": torch.full((len(sample_ids),), -1, dtype=torch.long, device=device)}
 
-        spk = [self.id2spk.get(sid, -1) for sid in ids]
-        return {"spk_ids": torch.tensor(spk, dtype=torch.long, device=device)}
-
-# ==== GST pretrained weight loader ====
-
-import torch
 
 def _strip_module_prefix(sd: dict) -> dict:
     # DataParallel 등에 의해 앞에 'module.' 있을 때 제거

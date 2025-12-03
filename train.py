@@ -40,8 +40,7 @@ from datasets import load_dataset, DownloadConfig, config as hf_config
 from models import DistilDAGKDCTCModelBPE
 from utils import (
     scan_speakers, 
-    build_manifest_from_hf_with_meta, 
-    SampleMetaLookup,
+    build_manifest_from_hf_with_meta,
     str2bool,
     release_nemoAPI,
     compute_sample_wers,
@@ -69,7 +68,7 @@ def main():
     # Logging/ckpt
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--gpus", type=int, default=1)
-    p.add_argument("--out", type=str, default="outputs_dag_kd")
+    p.add_argument("--out", type=str, default="outputs")
     p.add_argument("--resume_ckpt_path", type=str, default="", help="Checkpoint path to resume training from")
 
     # Teacher/Student
@@ -105,7 +104,7 @@ def main():
 
     # Output & manifests
     os.makedirs(args.out, exist_ok=True)
-    manifest_dir = os.path.join(args.data_dir, "manifests")
+    manifest_dir = os.path.join(args.data_dir, args.data_cfg, "manifests")
     os.makedirs(manifest_dir, exist_ok=True)
 
     # HF datasets
@@ -145,13 +144,6 @@ def main():
         except Exception as e:
             print(f"[WARN] Could not load split '{split_name}': {e}")
     
-    if args.test_mode:
-        train_ds = train_ds.select(range(200))
-        val_ds   = val_ds.select(range(200))
-        test_ds  = test_ds.select(range(200))
-        for k in list(extra_splits.keys()):
-            extra_splits[k] = extra_splits[k].select(range(min(200, len(extra_splits[k]))))
-    
     # 스캔
     spk2idx, idx2spk = scan_speakers(train_ds)
     num_spk = len(spk2idx)
@@ -160,13 +152,6 @@ def main():
     spk_map_path = os.path.join(manifest_dir, "speaker_id_mapping.json")
     save_speaker_mapping(spk2idx, idx2spk, spk_map_path)
     
-    if args.test_mode:
-        test_mode_train_manifest = os.path.join(manifest_dir, "test_mode_train.json")
-        test_mode_val_manifest = os.path.join(manifest_dir, "test_mode_val.json")
-        test_mode_test_manifest = os.path.join(manifest_dir, "test_mode_test.json")
-        build_manifest_from_hf_with_meta(train_ds, test_mode_train_manifest, cache_dir, spk2idx)
-        build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx)
-        build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx)
     
     train_manifest      = os.path.join(manifest_dir, "train.json")
     dev_clean_manifest  = os.path.join(manifest_dir, "dev_clean.json")
@@ -187,9 +172,24 @@ def main():
         build_manifest_from_hf_with_meta(extra_splits["test.other"], test_other_manifest, cache_dir, spk2idx)
 
     # speaker별 발화 시간 총합 계산 (train split 기준)
-    train_manifest_for_stat = train_manifest if not args.test_mode else test_mode_train_manifest
+    train_manifest_for_stat = train_manifest
     spk_dur_out = os.path.join(manifest_dir, "speaker_durations_train.json")
     compute_speaker_durations(train_manifest_for_stat, spk_dur_out)
+    
+    
+    if args.test_mode:
+        train_ds = train_ds.select(range(200))
+        val_ds   = val_ds.select(range(200))
+        test_ds  = test_ds.select(range(200))
+        for k in list(extra_splits.keys()):
+            extra_splits[k] = extra_splits[k].select(range(min(200, len(extra_splits[k]))))
+        
+        test_mode_train_manifest = os.path.join(manifest_dir, "test_mode_train.json")
+        test_mode_val_manifest = os.path.join(manifest_dir, "test_mode_val.json")
+        test_mode_test_manifest = os.path.join(manifest_dir, "test_mode_test.json")
+        build_manifest_from_hf_with_meta(train_ds, test_mode_train_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx)
     
     
     # W&B
@@ -264,7 +264,6 @@ def main():
     # cfg 주입
     stu_cfg.num_spk = num_spk
     stu_cfg.num_lang = 0  # 모노링구얼: 언어 헤드 비활성
-    meta_lookup = SampleMetaLookup(train_manifest, dev_clean_manifest, test_clean_manifest)
     stu_cfg.out_dir = args.out
     stu_cfg.disen_vis_enable = args.disen_vis_enable
 
@@ -287,7 +286,6 @@ def main():
         disent_spk_layers=args.disent_spk_layers,
         disent_txt_layers=args.disent_txt_layers,
     )
-    model.set_meta_lookup(meta_lookup)
     
     # ====== 멜 스펙트로그램 예시 저장 ======
     mel_dir = os.path.join(args.out, "xai/mel_examples")
