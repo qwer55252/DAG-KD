@@ -160,7 +160,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.latent_dim = cfg.latent_dim
         
         # Projection for metric KD (student->teacher) - 옵션
-        self.stu_proj = nn.Conv1d(self.dim_s, self.latent_dim, kernel_size=1, bias=True)
+        self.stu_proj = nn.Conv1d(self.dim_s, self.dim_t, kernel_size=1, bias=True)
 
         # Text Encoder (Conv1x1 → Conv1x1, Rec loss)
         self.txt_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
@@ -480,7 +480,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
         if self.spk_cls is not None:
-            valid_mask = (speaker_ids >= 0)
+            valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
             if valid_mask.any():
                 # spk_emb: (B, latent_dim, T)
                 # 1) stats pooling: mean + std → utterance-level embedding
@@ -492,6 +492,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 target_valid = speaker_ids[valid_mask]
                 target_valid = target_valid.clamp(min=0).long()   # ★ int64 로 변환 ★
                 
+                # (선택) 디버그용 안전 체크
+                if torch.any(target_valid < 0) or torch.any(target_valid >= self.num_spk):
+                    raise RuntimeError(
+                        f"[BUG] speaker_ids out of range: "
+                        f"min={int(target_valid.min())}, max={int(target_valid.max())}, "
+                        f"num_spk={self.num_spk}"
+                    )
+                
                 # 2) classifier: (B_valid, num_spk)
                 logits_utt = self.spk_cls(spk_utt_valid)     # (B_valid, num_spk)
 
@@ -502,7 +510,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 all_logits = self.spk_cls(spk_utt)           # (B, num_spk)
                 preds = all_logits.argmax(dim=-1)            # (B,) long
                 spk_acc = (preds[valid_mask] == target_valid).float().mean()
-
+        
         # XAI: 시각화
         if self.vis_enable:
             self._xai_visualize(
