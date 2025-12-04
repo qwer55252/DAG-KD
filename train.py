@@ -145,12 +145,14 @@ def main():
             print(f"[WARN] Could not load split '{split_name}': {e}")
     
     # 스캔
+    print(f"[INFO] scanning speakers from train split...")
     spk2idx, idx2spk = scan_speakers(train_ds)
     num_spk = len(spk2idx)
     print(f"[SCAN] num_speakers={num_spk}")
     # id -> idx 매핑 파일 저장
     spk_map_path = os.path.join(manifest_dir, "speaker_id_mapping.json")
     save_speaker_mapping(spk2idx, idx2spk, spk_map_path)
+    print(f"[INFO] saved speaker ID mapping to {spk_map_path}")
     
     
     train_manifest      = os.path.join(manifest_dir, "train.json")
@@ -172,9 +174,11 @@ def main():
         build_manifest_from_hf_with_meta(extra_splits["test.other"], test_other_manifest, cache_dir, spk2idx)
 
     # speaker별 발화 시간 총합 계산 (train split 기준)
+    print(f"[INFO] calculating speaker durations from train manifest...")
     train_manifest_for_stat = train_manifest
     spk_dur_out = os.path.join(manifest_dir, "speaker_durations_train.json")
     compute_speaker_durations(train_manifest_for_stat, spk_dur_out)
+    print(f"[INFO] saved speaker durations to {spk_dur_out}")
     
     
     if args.test_mode:
