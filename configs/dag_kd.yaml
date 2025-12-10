@@ -1,0 +1,105 @@
+# DAG-KD experiment configuration
+# 본 파일은 train.py의 argparse 인자 및 내부 stu_cfg 주입 키를 정리한 YAML입니다.
+# 필요 시 값을 수정하여 사용하세요.
+
+experiment:
+  out: outputs_dag_kd
+  wandb_project: ${env:PRJ_NAME,DAG-KD}
+  wandb_run: ${env:EXP_NAME,dagkd_run}
+
+trainer:
+  epochs: 100
+  gpus: 1
+
+data:
+  data_dir: data
+  # Hugging Face dataset loader (trust_remote_code=True 가정)
+  data_script: ./librispeech_asr.py
+  data_cfg: train_100
+  train_split: train.clean.100
+  val_split: dev.clean
+  test_split: test.clean
+  sample_rate: 16000
+  batch_size: 8
+  test_mode: false
+  # manifest 생성 시 메타 키
+  lang_key: language
+  spk_key: speaker
+
+teacher:
+  # NeMo pretrained teacher model name
+  teacher_name: stt_en_conformer_ctc_small
+  train_teacher: false
+
+kd:
+  use_ctc: true
+  use_logit_kd: true
+  kd_alpha: 0.5
+  kd_temperature: 1.0
+  use_layer_kd: false
+  layer_kd_alpha: 0.5
+
+generative_kd:
+  use_flow: false
+  flow_steps: 8
+  flow_weight: 1.0
+  use_diffkd: false
+  diffkd_steps: 5
+
+disentanglement:
+  use_disent: true
+  disent_lang_lambda: 0.0      # 모노링구얼 ASR이므로 기본 0.0 권장
+  disent_spk_lambda: 0.1
+  disent_apply_layers: "low,mid"  # 예: low,mid,high 중 선택/조합
+
+# 아래 블록은 stu_cfg(학생 모델 cfg)에 주입되는 추가/오버라이드 키들입니다.
+# teacher.cfg를 deepcopy한 후 train.py에서 절반 스케일 및 데이터 경로 등이 덮어써집니다.
+model_overrides:
+  # dataloaders
+  train_ds:
+    is_tarred: false
+    manifest_filepath: ${data.data_dir}/manifests/train.json
+    sample_rate: ${data.sample_rate}
+    batch_size: ${data.batch_size}
+    return_sample_id: true
+  validation_ds:
+    is_tarred: false
+    manifest_filepath: ${data.data_dir}/manifests/val.json
+    sample_rate: ${data.sample_rate}
+    batch_size: ${data.batch_size}
+    return_sample_id: false
+  test_ds:
+    is_tarred: false
+    manifest_filepath: ${data.data_dir}/manifests/test.json
+    sample_rate: ${data.sample_rate}
+    batch_size: ${data.batch_size}
+    return_sample_id: false
+
+  # encoder/decoder 스케일은 스크립트에서 자동으로 teacher의 절반으로 설정됩니다.
+  # 필요 시 수동 고정하려면 주석 해제 후 명시:
+  # encoder:
+  #   d_model: 128     # 예) teacher 256인 경우 절반
+  #   n_heads: 2       # 예) teacher 4인 경우 절반
+  # decoder:
+  #   feat_in: 128     # 예) teacher 256인 경우 절반
+
+  # 모노링구얼 환경용 헤드/메타
+  num_lang: 0            # 언어 헤드 비활성
+  # train.py에서 scan_speakers 결과로 num_spk가 주입됩니다.
+  # num_spk: 0          # (자동 셋업)
+
+  # 추가 연구용 하이퍼
+  embed_dim: null        # 기본적으로 encoder.d_model과 동일하게 해석
+  mi_weight: 0.1         # λ_MI
+  mi_pairs: "zs,zp,ps"   # mutual information 제약 적용 쌍
+  gst_tokens: 10
+  gst_heads: 4
+  gst_token_dim: 128
+  ref_dim: 128
+  disent_spk_ce_lambda: 0.1
+
+# 로깅/체크포인트
+logging:
+  checkpoint_dir: ${experiment.out}/checkpoints
+  save_last: true
+  save_top_k: 0

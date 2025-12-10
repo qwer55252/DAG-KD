@@ -2,3 +2,6 @@ NeMo/*
 data/*
 outputs_dag_kd/*
 outputs/*
+*.pyc
+lightning_logs/*
+pretrained_weights/*

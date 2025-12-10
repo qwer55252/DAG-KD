@@ -108,7 +108,7 @@ def main():
     os.makedirs(manifest_dir, exist_ok=True)
 
     # HF datasets
-    cache_dir = os.path.join(args.data_dir, "cache")
+    cache_dir = os.path.join(args.data_dir, args.data_cfg, "cache")
     os.makedirs(cache_dir, exist_ok=True)
     hf_config.HF_DATASETS_CACHE = cache_dir
     dl_cfg = DownloadConfig(
@@ -255,8 +255,8 @@ def main():
     stu_cfg.validation_ds.return_sample_id = False
     stu_cfg.test_ds.return_sample_id = False
     
-    stu_cfg.latent_dim = 96
     # stu_cfg에 다음 키를 추가하면 튜닝 용이
+    stu_cfg.latent_dim = 96
     stu_cfg.disen_mi_weight = 1e-3              # λ_MI
     stu_cfg.rec_txt_lambda = 0.1
     stu_cfg.rec_spk_lambda = 0.1              
