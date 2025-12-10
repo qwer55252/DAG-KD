@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=3 python train.py \
+CUDA_VISIBLE_DEVICES=0 python train.py \
   --wandb_run disen_spk48_txt16_ctc+logitkd+layerkd \
   --out outputs/disen_spk48_txt16/ctc+logitkd+layerkd \
   --data_script ./librispeech_asr.py \
@@ -18,4 +18,3 @@ CUDA_VISIBLE_DEVICES=3 python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-  --resume_ckpt_path /workspace/DAG-KD/outputs/disen/ctc+logitkd+layerkd/checkpoints/last.ckpt \
