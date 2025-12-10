@@ -118,7 +118,7 @@ def main():
         max_retries=8,
         disable_tqdm=False,
         download_desc="Downloading dataset",
-        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=7200)}},
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=72000)}},
         delete_extracted=False,
         extract_compressed_file=True,
         force_extract=True,
@@ -151,8 +151,9 @@ def main():
     print(f"[SCAN] num_speakers={num_spk}")
     # id -> idx 매핑 파일 저장
     spk_map_path = os.path.join(manifest_dir, "speaker_id_mapping.json")
-    save_speaker_mapping(spk2idx, idx2spk, spk_map_path)
-    print(f"[INFO] saved speaker ID mapping to {spk_map_path}")
+    if not os.path.isfile(spk_map_path):
+        save_speaker_mapping(spk2idx, idx2spk, spk_map_path)
+        print(f"[INFO] saved speaker ID mapping to {spk_map_path}")
     
     
     train_manifest      = os.path.join(manifest_dir, "train.json")
