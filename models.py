@@ -173,9 +173,32 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # Speaker classifier (파란 박스 - teacher speaker embedding CE)
         self.num_spk = getattr(cfg, "num_spk", 0)
         if self.num_spk > 1:
+            # TDNN-like speaker backbone: (B, latent_dim, T) -> (B, latent_dim, T)
+            self.spk_backbone = nn.Sequential(
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=2, padding=2, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=3, padding=3, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+            )
+
             # stats pooling: mean + std → 2 * latent_dim
-            self.spk_cls = nn.Linear(self.latent_dim * 2, self.num_spk)
+            spk_cls_hidden = getattr(cfg, "spk_cls_hidden", self.latent_dim * 2)
+
+            self.spk_cls = nn.Sequential(
+                nn.Linear(self.latent_dim * 2, spk_cls_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=getattr(cfg, "spk_cls_dropout", 0.3)),
+                nn.Linear(spk_cls_hidden, self.num_spk),
+            )
         else:
+            self.spk_backbone = None
             self.spk_cls = None
         self.disen_spk_ce_lambda = getattr(cfg, "disen_spk_ce_lambda", 1.0)
 
@@ -480,15 +503,22 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
         if self.spk_cls is not None:
-            valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+            valid_mask = (speaker_ids is not None) & (speaker_ids >= 0) & (speaker_ids < self.num_spk)
             if valid_mask.any():
                 # spk_emb: (B, latent_dim, T)
-                # 1) stats pooling: mean + std → utterance-level embedding
-                spk_mean = spk_emb.mean(dim=-1)              # (B, latent_dim)
-                spk_std  = spk_emb.std(dim=-1)               # (B, latent_dim)
+
+                # (1) TDNN-style backbone 통과
+                if self.spk_backbone is not None:
+                    spk_feat = self.spk_backbone(spk_emb)      # (B, latent_dim, T)
+                else:
+                    spk_feat = spk_emb
+
+                # (2) stats pooling: mean + std → utterance-level embedding
+                spk_mean = spk_feat.mean(dim=-1)              # (B, latent_dim)
+                spk_std  = spk_feat.std(dim=-1)               # (B, latent_dim)
                 spk_utt  = torch.cat([spk_mean, spk_std], dim=-1)  # (B, 2*latent_dim)
 
-                spk_utt_valid = spk_utt[valid_mask]          # (B_valid, 2*latent_dim)
+                spk_utt_valid = spk_utt[valid_mask]           # (B_valid, 2*latent_dim)
                 target_valid = speaker_ids[valid_mask]
                 target_valid = target_valid.clamp(min=0).long()   # ★ int64 로 변환 ★
                 
@@ -500,15 +530,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                         f"num_spk={self.num_spk}"
                     )
                 
-                # 2) classifier: (B_valid, num_spk)
-                logits_utt = self.spk_cls(spk_utt_valid)     # (B_valid, num_spk)
+                # (3) classifier: (B_valid, num_spk)
+                logits_utt = self.spk_cls(spk_utt_valid)      # (B_valid, num_spk)
 
-                # 3) CE loss
+                # (4) CE loss
                 spk_ce = F.cross_entropy(logits_utt, target_valid)
 
-                # 4) accuracy
-                all_logits = self.spk_cls(spk_utt)           # (B, num_spk)
-                preds = all_logits.argmax(dim=-1)            # (B,) long
+                # (5) accuracy (전체 배치 기준)
+                all_logits = self.spk_cls(spk_utt)            # (B, num_spk)
+                preds = all_logits.argmax(dim=-1)             # (B,) long
                 spk_acc = (preds[valid_mask] == target_valid).float().mean()
         
         # XAI: 시각화
@@ -589,15 +619,17 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
 
             # MI term
-            mi_term = self._mi_loss(embs)
-            self.log("train/mi_upper", mi_term, on_step=True, on_epoch=True)
-            total = total + self.mi_weight * mi_term
+            mi_raw = self._mi_loss(embs)
+            mi_loss = torch.clamp(mi_raw, min=0.0)
+            self.log("train/mi_upper_raw", mi_raw, on_epoch=True)
+            self.log("train/mi_upper", mi_loss, on_epoch=True)
+            total = total + self.mi_weight * mi_loss
 
             # Reconstruction loss
             rec_txt = embs["rec_txt"]
             rec_spk = embs["rec_spk"]
-            self.log("train/rec_txt", rec_txt, on_step=True, on_epoch=True)
-            self.log("train/rec_spk", rec_spk, on_step=True, on_epoch=True)
+            self.log("train/rec_txt", rec_txt, on_epoch=True)
+            self.log("train/rec_spk", rec_spk, on_epoch=True)
             total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
 
             # Speaker CE & ACC
@@ -605,46 +637,46 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             spk_acc = embs.get("spk_acc", None)
 
             if spk_ce is not None and torch.is_tensor(spk_ce):
-                self.log("train/spk_ce", spk_ce, on_step=True, on_epoch=True)
+                self.log("train/spk_ce", spk_ce, on_step=False, on_epoch=True)
                 total = total + self.disen_spk_ce_lambda * spk_ce
 
             if spk_acc is not None and torch.is_tensor(spk_acc):
-                self.log("train/spk_acc", spk_acc, on_step=True, on_epoch=True)
+                self.log("train/spk_acc", spk_acc, on_epoch=True)
         else:
             # disent off일 때는 관련 loss를 0으로만 로깅 (원하면 생략해도 됨)
             zero = torch.tensor(0.0, device=logp.device)
-            self.log("train/mi_upper", zero, on_step=True, on_epoch=True)
-            self.log("train/rec_txt", zero, on_step=True, on_epoch=True)
-            self.log("train/rec_spk", zero, on_step=True, on_epoch=True)
-            self.log("train/spk_ce", zero, on_step=True, on_epoch=True)
+            self.log("train/mi_upper", zero, on_step=False, on_epoch=True)
+            self.log("train/rec_txt", zero, on_step=False, on_epoch=True)
+            self.log("train/rec_spk", zero, on_step=False, on_epoch=True)
+            self.log("train/spk_ce", zero, on_step=False, on_epoch=True)
             # self._txt_emb 도 이때는 사용 안 하도록 보장하고 싶으면 명시적으로 초기화
             self._txt_emb = None
         
         # 4) Generative KD (FM / DF)
         if self.use_flow or self.use_diffkd:
             gen_kd = self._generative_kd()
-            self.log("train/gen_kd", gen_kd, on_step=True, on_epoch=True)
+            self.log("train/gen_kd", gen_kd, on_step=False, on_epoch=True)
             total = total + gen_kd
 
         # 5) CTC
         if self.use_ctc:
             ctc = self._ctc_loss(logp, enc_len, y, ylen)
-            self.log("train/ctc", ctc, on_step=True, on_epoch=True)
+            self.log("train/ctc", ctc, on_step=False, on_epoch=True)
             total = total + ctc
 
         # 6) Logit KD
         if self.use_logit_kd:
             kd_logit = self._logit_kd(logp)
-            self.log("train/logit_kd", kd_logit, on_step=True, on_epoch=True)
+            self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
             total = total + self.kd_alpha * kd_logit
 
         # 7) Layer-wise metric KD
         if self.use_layer_kd:
             kd_layer = self._layer_metric_kd()
-            self.log("train/layer_kd", kd_layer, on_step=True, on_epoch=True)
+            self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
             total = total + self.layer_kd_alpha * kd_layer
 
-        self.log("train/total", total, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
         return total
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):

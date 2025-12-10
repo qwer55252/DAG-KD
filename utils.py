@@ -241,16 +241,27 @@ def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str, lang_key: str
 # >>>>>>>>>>>>>>>>>>>>>>>>>>
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<< NeMo .nemo unpack helper
-def release_nemoAPI(model, out_folder: str):
-    meta = AppState().get_model_metadata_from_guid(model.model_guid)
+# def release_nemoAPI(model, out_folder: str):
+#     meta = AppState().get_model_metadata_from_guid(model.model_guid)
+#     nemo_file = meta.restoration_path
+#     connector = SaveRestoreConnector()
+#     connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
+#     model._save_restore_connector.model_extracted_dir = out_folder
+#     AppState().nemo_file_folder = out_folder
+
+def release_nemoAPI(teacher_model, out_folder: str = "/workspace/outputs/nemo_archive"):
+    # 1) .nemo 실제 경로 조회
+    meta = AppState().get_model_metadata_from_guid(teacher_model.model_guid)
     nemo_file = meta.restoration_path
+    os.makedirs(out_folder, exist_ok=True)
+
+    # 2) 압축 풀기
     connector = SaveRestoreConnector()
     connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
-    model._save_restore_connector.model_extracted_dir = out_folder
+
+    # 3) 다음 복원 때 재활용할 디렉토리 지정
+    teacher_model._save_restore_connector.model_extracted_dir = out_folder
     AppState().nemo_file_folder = out_folder
-
-
-
 
 def _strip_module_prefix(sd: dict) -> dict:
     # DataParallel 등에 의해 앞에 'module.' 있을 때 제거

@@ -256,8 +256,10 @@ def main():
     
     stu_cfg.latent_dim = 96
     # stu_cfg에 다음 키를 추가하면 튜닝 용이
-    stu_cfg.disen_mi_weight = 0.1              # λ_MI
-    stu_cfg.disen_mi_pairs  = "ts,tp,ps"       # 사용 쌍
+    stu_cfg.disen_mi_weight = 1e-3              # λ_MI
+    stu_cfg.rec_txt_lambda = 0.1
+    stu_cfg.rec_spk_lambda = 0.1              
+    stu_cfg.disen_mi_pairs  = "ts,tp,ps"        # 사용 쌍
     stu_cfg.disen_gst_tokens = 10
     stu_cfg.disen_gst_heads  = 4
     stu_cfg.disen_gst_token_dim = 96
