@@ -99,6 +99,11 @@ def main():
     p.add_argument("--wandb_project", type=str, default=os.getenv("PRJ_NAME", "DAG-KD"))
     p.add_argument("--wandb_run", type=str, default=os.getenv("EXP_NAME", "dagkd_run"))
     p.add_argument("--disen_vis_enable", type=str2bool, default=False)
+    
+    # text speaker probe
+    p.add_argument("--use_txt_spk_probe", type=str2bool, default=True)
+    p.add_argument("--txt_probe_lambda", type=float, default=1.0)
+    p.add_argument("--txt_probe_lr", type=float, default=1e-3)
 
     args = p.parse_args()
 
@@ -273,6 +278,11 @@ def main():
     stu_cfg.num_lang = 0  # 모노링구얼: 언어 헤드 비활성
     stu_cfg.out_dir = args.out
     stu_cfg.disen_vis_enable = args.disen_vis_enable
+    
+    # text porbe 설정
+    stu_cfg.use_txt_spk_probe = args.use_txt_spk_probe if hasattr(args, "use_txt_spk_probe") else True
+    stu_cfg.txt_probe_lambda = args.txt_probe_lambda if hasattr(args, "txt_probe_lambda") else 1.0
+    stu_cfg.txt_probe_lr = args.txt_probe_lr if hasattr(args, "txt_probe_lr") else 1e-3
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,

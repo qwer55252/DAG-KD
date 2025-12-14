@@ -19,4 +19,6 @@ python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-
+  --use_txt_spk_probe True \
+  --txt_probe_lambda 1.0 \
+  --txt_probe_lr 0.001

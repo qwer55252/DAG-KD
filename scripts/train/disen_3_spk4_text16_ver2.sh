@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=2 python train.py \
+python train.py \
   --wandb_run disen_3_spk4_text16_ver2 \
   --out outputs/disen/disen_3_spk4_text16_ver2 \
   --data_script ./librispeech_asr.py \
@@ -19,4 +19,7 @@ CUDA_VISIBLE_DEVICES=2 python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
+  --use_txt_spk_probe True \
+  --txt_probe_lambda 1.0 \
+  --txt_probe_lr 0.001
 
