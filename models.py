@@ -236,7 +236,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             self.txt_probe_backbone = None
             self.txt_spk_probe_cls = None
-        self.automatic_optimization = False
+        # self.automatic_optimization = False
 
         
         
@@ -642,15 +642,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
 
-        opts = self.optimizers()
-        if isinstance(opts, (list, tuple)):
-            opt_main = opts[0]
-            opt_probe = opts[1] if len(opts) > 1 else None
-        else:
-            opt_main, opt_probe = opts, None
-
-
-        # ========== 1) MAIN forward & MAIN loss ==========
+        # ========== forward ==========
         logp, enc_len, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
         self._run_teacher(signal, sig_len)
 
@@ -664,46 +656,35 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             mi_loss = torch.clamp(mi_raw, min=0.0)
             total_main = total_main + self.mi_weight * mi_loss
 
-            rec_txt, rec_spk = embs["rec_txt"], embs["rec_spk"]
-            total_main = total_main + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
-
-            spk_ce = embs["spk_ce"]
-            total_main = total_main + self.disen_spk_ce_lambda * spk_ce
+            total_main = total_main + self.rec_txt_lambda * embs["rec_txt"] + self.rec_spk_lambda * embs["rec_spk"]
+            total_main = total_main + self.disen_spk_ce_lambda * embs["spk_ce"]
 
         if self.use_flow or self.use_diffkd:
-            gen_kd = self._generative_kd()
-            total_main = total_main + gen_kd
+            total_main = total_main + self._generative_kd()
 
         if self.use_ctc:
-            ctc = self._ctc_loss(logp, enc_len, y, ylen)
-            total_main = total_main + ctc
+            total_main = total_main + self._ctc_loss(logp, enc_len, y, ylen)
 
         if self.use_logit_kd:
-            kd_logit = self._logit_kd(logp)
-            total_main = total_main + self.kd_alpha * kd_logit
+            total_main = total_main + self.kd_alpha * self._logit_kd(logp)
 
         if self.use_layer_kd:
-            kd_layer = self._layer_metric_kd()
-            total_main = total_main + self.layer_kd_alpha * kd_layer
+            total_main = total_main + self.layer_kd_alpha * self._layer_metric_kd()
 
-        # MAIN backward/step (probe 영향 없음)
-        opt_main.zero_grad()
-        self.manual_backward(total_main)
-        opt_main.step()
-
-        # ========== 2) PROBE step (detach input) ==========
+        # ========== probe loss: "학습은 probe head만", encoder로는 그라디언트 0 ==========
         probe_loss = None
         probe_acc = None
-        if embs is not None and self.use_txt_spk_probe and (opt_probe is not None):
+        if embs is not None and self.use_txt_spk_probe:
             probe_loss = embs.get("txt_probe_ce", None)
-            probe_acc = embs.get("txt_probe_acc", None)
+            probe_acc  = embs.get("txt_probe_acc", None)
 
-            if probe_loss is not None and probe_loss.requires_grad:
-                opt_probe.zero_grad()
-                self.manual_backward(self.txt_probe_lambda * probe_loss)
-                opt_probe.step()
+        total_loss = total_main
+        if probe_loss is not None:
+            # _text_spk_probe() 내부에서 txt_emb.detach()를 쓰므로
+            # probe loss는 probe 파라미터만 업데이트하고 main에는 영향 없음
+            total_loss = total_loss + self.txt_probe_lambda * probe_loss
 
-        # ========== 3) logging ==========
+        # ========== logging ==========
         self.log("train/total_main", total_main, on_step=True, on_epoch=True, prog_bar=True)
         if embs is not None:
             self.log("train/mi_upper", torch.clamp(self._mi_loss(embs), min=0.0), on_epoch=True)
@@ -712,12 +693,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             spk_acc = embs.get("spk_acc", None)
             self.log("train/spk_acc", spk_acc if spk_acc is not None else 0.0, on_epoch=True)
 
-
             self.log("probe/txt_spk_ce", probe_loss if probe_loss is not None else 0.0, on_step=True, on_epoch=True)
             if probe_acc is not None:
                 self.log("probe/txt_spk_acc", probe_acc, on_step=True, on_epoch=True)
 
-        return total_main
+        # training_step 끝부분에 로깅 1줄만 추가 추천
+        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        return total_loss
+
+
 
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -930,18 +914,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         wd = float(getattr(optim_cfg, "weight_decay", 0.0)) if optim_cfg is not None else 0.0
 
         # ===== 3) optimizer 생성 =====
-        opt_main = AdamW(main_params, lr=lr, weight_decay=wd)
-
-        opts = [opt_main]
-
+        param_groups = [
+            {"params": main_params, "lr": lr, "weight_decay": wd},
+        ]
         if len(probe_params) > 0:
-            opt_probe = AdamW(probe_params, lr=float(self.txt_probe_lr), weight_decay=0.0)
-            opts.append(opt_probe)
+            param_groups.append({"params": probe_params, "lr": float(self.txt_probe_lr), "weight_decay": 0.0})
 
-        # ===== 4) Lightning이 좋아하는 형태로만 반환 =====
-        # (여기서 절대 (opts, scheds) 같은 걸 리턴하지 마)
-        assert all(isinstance(o, Optimizer) for o in opts), f"Non-optimizer in opts: {[type(o) for o in opts]}"
-        return opts if len(opts) > 1 else opts[0]
+        opt = AdamW(param_groups)
+        return opt
+
 
 
 class StyleTokenLayer(nn.Module):
