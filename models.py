@@ -545,8 +545,9 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
+        has_spk_acc = False
         if self.spk_cls is not None:
-            valid_mask = (speaker_ids is not None) & (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+            valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
             if valid_mask.any():
                 # spk_emb: (B, latent_dim, T)
 
@@ -583,6 +584,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 all_logits = self.spk_cls(spk_utt)            # (B, num_spk)
                 preds = all_logits.argmax(dim=-1)             # (B,) long
                 spk_acc = (preds[valid_mask] == target_valid).float().mean()
+                has_spk_acc = True
         
         # XAI: 시각화
         if self.vis_enable:
@@ -602,6 +604,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "pros_emb": pros_emb,
             "spk_ce": spk_ce,
             "spk_acc": spk_acc,
+            "has_spk_acc": has_spk_acc,
             "rec_txt": rec_txt,
             "rec_spk": rec_spk,
             "txt_probe_ce": txt_probe_ce,
@@ -689,15 +692,16 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         opt_main.step()
 
         # ========== 2) PROBE step (detach input) ==========
-        probe_loss = torch.tensor(0.0, device=logp.device)
+        probe_loss = None
         probe_acc = None
         if embs is not None and self.use_txt_spk_probe and (opt_probe is not None):
-            probe_loss = embs["txt_probe_ce"]
+            probe_loss = embs.get("txt_probe_ce", None)
             probe_acc = embs.get("txt_probe_acc", None)
 
-            opt_probe.zero_grad()
-            self.manual_backward(self.txt_probe_lambda * probe_loss)
-            opt_probe.step()
+            if probe_loss is not None and probe_loss.requires_grad:
+                opt_probe.zero_grad()
+                self.manual_backward(self.txt_probe_lambda * probe_loss)
+                opt_probe.step()
 
         # ========== 3) logging ==========
         self.log("train/total_main", total_main, on_step=True, on_epoch=True, prog_bar=True)
@@ -705,9 +709,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/mi_upper", torch.clamp(self._mi_loss(embs), min=0.0), on_epoch=True)
             self.log("train/rec_txt", embs["rec_txt"], on_epoch=True)
             self.log("train/rec_spk", embs["rec_spk"], on_epoch=True)
-            self.log("train/spk_acc", embs.get("spk_acc", 0.0), on_epoch=True)
+            spk_acc = embs.get("spk_acc", None)
+            self.log("train/spk_acc", spk_acc if spk_acc is not None else 0.0, on_epoch=True)
 
-            self.log("probe/txt_spk_ce", probe_loss, on_step=True, on_epoch=True)
+
+            self.log("probe/txt_spk_ce", probe_loss if probe_loss is not None else 0.0, on_step=True, on_epoch=True)
             if probe_acc is not None:
                 self.log("probe/txt_spk_acc", probe_acc, on_step=True, on_epoch=True)
 
@@ -879,36 +885,30 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         )
 
     def _text_spk_probe(self, txt_emb, speaker_ids):
-        """
-        txt_emb: (B, latent_dim, T)  (여기서 반드시 detach해서 사용!)
-        return: (probe_ce, probe_acc)
-        """
         if (self.txt_spk_probe_cls is None) or (speaker_ids is None):
-            z = torch.tensor(0.0, device=self.device)
-            return z, None
+            return None, None
 
         valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
         if not valid_mask.any():
-            z = torch.tensor(0.0, device=self.device)
-            return z, None
+            return None, None
 
-        # ★ 핵심: text_emb로 gradient가 절대 흐르면 안 됨
-        x = txt_emb.detach()  # (B, latent_dim, T)
+        x = txt_emb.detach()
 
         if self.txt_probe_backbone is not None:
-            x = self.txt_probe_backbone(x)  # (B, latent_dim, T)
+            x = self.txt_probe_backbone(x)
 
         mean = x.mean(dim=-1)
         std  = x.std(dim=-1)
-        utt  = torch.cat([mean, std], dim=-1)  # (B, 2*latent_dim)
+        utt  = torch.cat([mean, std], dim=-1)
 
-        logits = self.txt_spk_probe_cls(utt)   # (B, num_spk)
-
+        logits = self.txt_spk_probe_cls(utt)
         target = speaker_ids.clamp(min=0).long()
+
         probe_ce = F.cross_entropy(logits[valid_mask], target[valid_mask])
         preds = logits.argmax(dim=-1)
         probe_acc = (preds[valid_mask] == target[valid_mask]).float().mean()
         return probe_ce, probe_acc
+
 
     def configure_optimizers(self):
         # ===== 0) probe 파라미터 목록 만들기 =====
