@@ -7,9 +7,6 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import nemo.collections.asr as nemo_asr
 from typing import Optional, Dict
-from torch.optim import AdamW
-from torch.optim.optimizer import Optimizer
-
 
 class GradReverseFn(torch.autograd.Function):
     @staticmethod
@@ -205,41 +202,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.spk_cls = None
         self.disen_spk_ce_lambda = getattr(cfg, "disen_spk_ce_lambda", 1.0)
 
-        # === Text speaker probe (for invariance check) ===
-        self.use_txt_spk_probe = bool(getattr(cfg, "use_txt_spk_probe", True))
-        self.txt_probe_lambda = float(getattr(cfg, "txt_probe_lambda", 1.0))
-        self.txt_probe_lr = float(getattr(cfg, "txt_probe_lr", 1e-3))
-
-        if self.num_spk > 1 and self.use_txt_spk_probe:
-            # backbone은 선택사항. 일단 spk_backbone과 동일하게 두면 probe capacity가 충분함.
-            self.txt_probe_backbone = nn.Sequential(
-                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(self.latent_dim),
-                nn.ReLU(inplace=True),
-
-                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=2, padding=2, bias=False),
-                nn.BatchNorm1d(self.latent_dim),
-                nn.ReLU(inplace=True),
-
-                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=3, padding=3, bias=False),
-                nn.BatchNorm1d(self.latent_dim),
-                nn.ReLU(inplace=True),
-            )
-
-            txt_probe_hidden = getattr(cfg, "txt_probe_hidden", self.latent_dim * 2)
-            self.txt_spk_probe_cls = nn.Sequential(
-                nn.Linear(self.latent_dim * 2, txt_probe_hidden),
-                nn.ReLU(inplace=True),
-                nn.Dropout(p=getattr(cfg, "txt_probe_dropout", 0.3)),
-                nn.Linear(txt_probe_hidden, self.num_spk),
-            )
-        else:
-            self.txt_probe_backbone = None
-            self.txt_spk_probe_cls = None
-        # self.automatic_optimization = False
-
-        
-        
         # Reconstruction loss weight
         self.rec_txt_lambda = getattr(cfg, "rec_txt_lambda", 1.0)
         self.rec_spk_lambda = getattr(cfg, "rec_spk_lambda", 1.0)
@@ -289,6 +251,38 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         out_dir = getattr(cfg, "out_dir", "./outputs")
         self.vis_dir = Path(out_dir) / "xai"
         os.makedirs(self.vis_dir, exist_ok=True)
+        
+        # === Text speaker probe (for invariance check) ===
+        self.use_txt_spk_probe = bool(getattr(cfg, "use_txt_spk_probe", True))
+        self.txt_probe_lambda  = float(getattr(cfg, "txt_probe_lambda", 1.0))
+
+        if self.num_spk > 1 and self.use_txt_spk_probe:
+            # probe capacity는 spk_backbone 정도면 충분 (ver2와 동일)
+            self.txt_probe_backbone = nn.Sequential(
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=2, padding=2, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+
+                nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, dilation=3, padding=3, bias=False),
+                nn.BatchNorm1d(self.latent_dim),
+                nn.ReLU(inplace=True),
+            )
+
+            txt_probe_hidden = getattr(cfg, "txt_probe_hidden", self.latent_dim * 2)
+            self.txt_spk_probe_cls = nn.Sequential(
+                nn.Linear(self.latent_dim * 2, txt_probe_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=getattr(cfg, "txt_probe_dropout", 0.3)),
+                nn.Linear(txt_probe_hidden, self.num_spk),
+            )
+        else:
+            self.txt_probe_backbone = None
+            self.txt_spk_probe_cls = None
+
 
     # ------ Feature hooks ------
     def _to_BCT(self, x: torch.Tensor) -> torch.Tensor:
@@ -514,9 +508,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         rec_txt = F.mse_loss(txt_rec, txt_rep)
         
         # === text speaker probe ===
-        self._txt_emb = txt_emb  # generative KD용 캐시
         txt_probe_ce, txt_probe_acc = self._text_spk_probe(txt_emb, speaker_ids)
-
 
         # Generative KD용 Text feature 캐시 (B, C_t, T)
         self._txt_emb = txt_emb
@@ -545,9 +537,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
-        has_spk_acc = False
         if self.spk_cls is not None:
-            valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+            valid_mask = (speaker_ids is not None) & (speaker_ids >= 0) & (speaker_ids < self.num_spk)
             if valid_mask.any():
                 # spk_emb: (B, latent_dim, T)
 
@@ -584,7 +575,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 all_logits = self.spk_cls(spk_utt)            # (B, num_spk)
                 preds = all_logits.argmax(dim=-1)             # (B,) long
                 spk_acc = (preds[valid_mask] == target_valid).float().mean()
-                has_spk_acc = True
         
         # XAI: 시각화
         if self.vis_enable:
@@ -604,7 +594,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "pros_emb": pros_emb,
             "spk_ce": spk_ce,
             "spk_acc": spk_acc,
-            "has_spk_acc": has_spk_acc,
             "rec_txt": rec_txt,
             "rec_spk": rec_spk,
             "txt_probe_ce": txt_probe_ce,
@@ -634,6 +623,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         return mi
 
     def training_step(self, batch, batch_idx):
+        """
+        그림과 맞게 학습 순서:
+        1) Student forward
+        2) Teacher forward (_run_teacher)
+        3) Text/Speaker/Prosody factorization + MI, Rec, Speaker CE
+        4) Generative KD(FM/DF) : Student last vs Teacher Text feature
+        5) CTC, Logit KD 등 합산
+        """
+        # NeMo ASR default batch: (signal, signal_len, transcript, transcript_len)
         if len(batch) == 5:
             signal, sig_len, y, ylen, speaker_ids = batch
         elif len(batch) == 4:
@@ -642,67 +640,92 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
 
-        # ========== forward ==========
-        logp, enc_len, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
+        # 1) Student forward
+        logp, enc_len, _ = self.forward(
+            input_signal=signal, input_signal_length=sig_len
+        )
+
+        # 2) Teacher forward (한 번만)
         self._run_teacher(signal, sig_len)
 
-        total_main = torch.tensor(0.0, device=logp.device)
+        total = torch.tensor(0.0, device=logp.device)
 
-        embs = None
+        # 3) Factorization embeddings + MI/Rec/Speaker CE
         if self.use_disent:
-            embs = self._make_embeddings(speaker_ids)
+            # Factorization embeddings + MI/Rec/Speaker CE
+            embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
 
+            # MI term
             mi_raw = self._mi_loss(embs)
             mi_loss = torch.clamp(mi_raw, min=0.0)
-            total_main = total_main + self.mi_weight * mi_loss
+            self.log("train/mi_upper_raw", mi_raw, on_epoch=True)
+            self.log("train/mi_upper", mi_loss, on_epoch=True)
+            total = total + self.mi_weight * mi_loss
 
-            total_main = total_main + self.rec_txt_lambda * embs["rec_txt"] + self.rec_spk_lambda * embs["rec_spk"]
-            total_main = total_main + self.disen_spk_ce_lambda * embs["spk_ce"]
+            # Reconstruction loss
+            rec_txt = embs["rec_txt"]
+            rec_spk = embs["rec_spk"]
+            self.log("train/rec_txt", rec_txt, on_epoch=True)
+            self.log("train/rec_spk", rec_spk, on_epoch=True)
+            total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
 
-        if self.use_flow or self.use_diffkd:
-            total_main = total_main + self._generative_kd()
-
-        if self.use_ctc:
-            total_main = total_main + self._ctc_loss(logp, enc_len, y, ylen)
-
-        if self.use_logit_kd:
-            total_main = total_main + self.kd_alpha * self._logit_kd(logp)
-
-        if self.use_layer_kd:
-            total_main = total_main + self.layer_kd_alpha * self._layer_metric_kd()
-
-        # ========== probe loss: "학습은 probe head만", encoder로는 그라디언트 0 ==========
-        probe_loss = None
-        probe_acc = None
-        if embs is not None and self.use_txt_spk_probe:
-            probe_loss = embs.get("txt_probe_ce", None)
-            probe_acc  = embs.get("txt_probe_acc", None)
-
-        total_loss = total_main
-        if probe_loss is not None:
-            # _text_spk_probe() 내부에서 txt_emb.detach()를 쓰므로
-            # probe loss는 probe 파라미터만 업데이트하고 main에는 영향 없음
-            total_loss = total_loss + self.txt_probe_lambda * probe_loss
-
-        # ========== logging ==========
-        self.log("train/total_main", total_main, on_step=True, on_epoch=True, prog_bar=True)
-        if embs is not None:
-            self.log("train/mi_upper", torch.clamp(self._mi_loss(embs), min=0.0), on_epoch=True)
-            self.log("train/rec_txt", embs["rec_txt"], on_epoch=True)
-            self.log("train/rec_spk", embs["rec_spk"], on_epoch=True)
+            # Speaker CE & ACC
+            spk_ce = embs["spk_ce"]
             spk_acc = embs.get("spk_acc", None)
-            self.log("train/spk_acc", spk_acc if spk_acc is not None else 0.0, on_epoch=True)
 
-            self.log("probe/txt_spk_ce", probe_loss if probe_loss is not None else 0.0, on_step=True, on_epoch=True)
+            if spk_ce is not None and torch.is_tensor(spk_ce):
+                self.log("train/spk_ce", spk_ce, on_step=False, on_epoch=True)
+                total = total + self.disen_spk_ce_lambda * spk_ce
+
+            if spk_acc is not None and torch.is_tensor(spk_acc):
+                self.log("train/spk_acc", spk_acc, on_epoch=True)
+        else:
+            # disent off일 때는 관련 loss를 0으로만 로깅 (원하면 생략해도 됨)
+            zero = torch.tensor(0.0, device=logp.device)
+            self.log("train/mi_upper", zero, on_step=False, on_epoch=True)
+            self.log("train/rec_txt", zero, on_step=False, on_epoch=True)
+            self.log("train/rec_spk", zero, on_step=False, on_epoch=True)
+            self.log("train/spk_ce", zero, on_step=False, on_epoch=True)
+            # self._txt_emb 도 이때는 사용 안 하도록 보장하고 싶으면 명시적으로 초기화
+            self._txt_emb = None
+        
+        # 4) Generative KD (FM / DF)
+        if self.use_flow or self.use_diffkd:
+            gen_kd = self._generative_kd()
+            self.log("train/gen_kd", gen_kd, on_step=False, on_epoch=True)
+            total = total + gen_kd
+
+        # 5) CTC
+        if self.use_ctc:
+            ctc = self._ctc_loss(logp, enc_len, y, ylen)
+            self.log("train/ctc", ctc, on_step=False, on_epoch=True)
+            total = total + ctc
+
+        # 6) Logit KD
+        if self.use_logit_kd:
+            kd_logit = self._logit_kd(logp)
+            self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
+            total = total + self.kd_alpha * kd_logit
+
+        # 7) Layer-wise metric KD
+        if self.use_layer_kd:
+            kd_layer = self._layer_metric_kd()
+            self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
+            total = total + self.layer_kd_alpha * kd_layer
+
+        if self.use_disent and self.use_txt_spk_probe and (embs is not None):
+            probe_ce = embs.get("txt_probe_ce", None)
+            probe_acc = embs.get("txt_probe_acc", None)
+
+            if probe_ce is not None:
+                self.log("probe/txt_spk_ce", probe_ce, on_step=False, on_epoch=True)
+                total = total + self.txt_probe_lambda * probe_ce
+
             if probe_acc is not None:
-                self.log("probe/txt_spk_acc", probe_acc, on_step=True, on_epoch=True)
-
-        # training_step 끝부분에 로깅 1줄만 추가 추천
-        self.log("train/total_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        return total_loss
-
-
-
+                self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
+        
+        self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
+        return total
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         if len(batch) == 4:
@@ -892,38 +915,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         preds = logits.argmax(dim=-1)
         probe_acc = (preds[valid_mask] == target[valid_mask]).float().mean()
         return probe_ce, probe_acc
-
-
-    def configure_optimizers(self):
-        # ===== 0) probe 파라미터 목록 만들기 =====
-        probe_params = []
-        if self.txt_spk_probe_cls is not None:
-            if self.txt_probe_backbone is not None:
-                probe_params += list(self.txt_probe_backbone.parameters())
-            probe_params += list(self.txt_spk_probe_cls.parameters())
-
-        probe_param_ids = {id(p) for p in probe_params}
-
-        # ===== 1) main 파라미터는 probe 제외 =====
-        main_params = [p for p in self.parameters() if p.requires_grad and (id(p) not in probe_param_ids)]
-
-        # ===== 2) lr은 cfg에서 없으면 기본값 사용 =====
-        # NeMo cfg에 따라 cfg.optim.lr / cfg.optim.learning_rate 등 이름이 다를 수 있어서 안전하게 처리
-        optim_cfg = getattr(self.cfg, "optim", None)
-        lr = float(getattr(optim_cfg, "lr", getattr(optim_cfg, "learning_rate", 1e-3))) if optim_cfg is not None else 1e-3
-        wd = float(getattr(optim_cfg, "weight_decay", 0.0)) if optim_cfg is not None else 0.0
-
-        # ===== 3) optimizer 생성 =====
-        param_groups = [
-            {"params": main_params, "lr": lr, "weight_decay": wd},
-        ]
-        if len(probe_params) > 0:
-            param_groups.append({"params": probe_params, "lr": float(self.txt_probe_lr), "weight_decay": 0.0})
-
-        opt = AdamW(param_groups)
-        return opt
-
-
 
 class StyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):
