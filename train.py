@@ -94,6 +94,7 @@ def main():
     p.add_argument("--use_disent", type=str2bool, default=True)
     p.add_argument("--disent_spk_layers", type=int_list_arg, default=[1, 2])
     p.add_argument("--disent_txt_layers", type=int_list_arg, default=[15, 16])
+    p.add_argument("--disen_mi_pairs", type=str, default="ts,tp,ps")
 
     # W&B
     p.add_argument("--wandb_project", type=str, default=os.getenv("PRJ_NAME", "DAG-KD"))
@@ -265,7 +266,7 @@ def main():
     stu_cfg.disen_mi_weight = 1e-3              # λ_MI
     stu_cfg.rec_txt_lambda = 0.1
     stu_cfg.rec_spk_lambda = 0.1              
-    stu_cfg.disen_mi_pairs  = "ts,tp,ps"        # 사용 쌍
+    stu_cfg.disen_mi_pairs  = args.disen_mi_pairs        # 사용 쌍
     stu_cfg.disen_gst_tokens = 10
     stu_cfg.disen_gst_heads  = 4
     stu_cfg.disen_gst_token_dim = 96

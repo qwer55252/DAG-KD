@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import nemo.collections.asr as nemo_asr
 from typing import Optional, Dict
+from torch.optim import AdamW
+from torch.optim.optimizer import Optimizer
+
 
 class GradReverseFn(torch.autograd.Function):
     @staticmethod
@@ -908,45 +911,37 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         return probe_ce, probe_acc
 
     def configure_optimizers(self):
-        # NeMo 기본 optimizer 가져오기
-        base = super().configure_optimizers()
-
-        # base가 dict/tuple/list 등일 수 있어서 케이스 분기
-        # (NeMo/Lightning 버전에 따라 형태가 다름)
-        if isinstance(base, dict) and "optimizer" in base:
-            opt_main = base["optimizer"]
-            sch = base.get("lr_scheduler", None)
-        elif isinstance(base, (list, tuple)):
-            opt_main = base[0]
-            sch = base[1] if len(base) > 1 else None
-        else:
-            opt_main = base
-            sch = None
-
-        opt_probe = None
+        # ===== 0) probe 파라미터 목록 만들기 =====
+        probe_params = []
         if self.txt_spk_probe_cls is not None:
-            opt_probe = torch.optim.AdamW(
-                list(self.txt_probe_backbone.parameters()) + list(self.txt_spk_probe_cls.parameters())
-                if self.txt_probe_backbone is not None else self.txt_spk_probe_cls.parameters(),
-                lr=self.txt_probe_lr,
-                weight_decay=0.0,
-            )
+            if self.txt_probe_backbone is not None:
+                probe_params += list(self.txt_probe_backbone.parameters())
+            probe_params += list(self.txt_spk_probe_cls.parameters())
 
-        # 스케줄러는 main에만 물리는 게 안전
-        # if sch is None:
-        #     return [opt_main, opt_probe] if opt_probe is not None else opt_main
-        # else:
-        #     # Lightning이 [opts], [schedulers] 형태를 받는 경우가 많음
-        #     return [opt_main, opt_probe], [sch] if opt_probe is not None else [opt_main], [sch]
-        if sch is None:
-            if opt_probe is not None:
-                return [opt_main, opt_probe]
-            return opt_main
-        else:
-            if opt_probe is not None:
-                return [opt_main, opt_probe], [sch]
-            return [opt_main], [sch]
+        probe_param_ids = {id(p) for p in probe_params}
 
+        # ===== 1) main 파라미터는 probe 제외 =====
+        main_params = [p for p in self.parameters() if p.requires_grad and (id(p) not in probe_param_ids)]
+
+        # ===== 2) lr은 cfg에서 없으면 기본값 사용 =====
+        # NeMo cfg에 따라 cfg.optim.lr / cfg.optim.learning_rate 등 이름이 다를 수 있어서 안전하게 처리
+        optim_cfg = getattr(self.cfg, "optim", None)
+        lr = float(getattr(optim_cfg, "lr", getattr(optim_cfg, "learning_rate", 1e-3))) if optim_cfg is not None else 1e-3
+        wd = float(getattr(optim_cfg, "weight_decay", 0.0)) if optim_cfg is not None else 0.0
+
+        # ===== 3) optimizer 생성 =====
+        opt_main = AdamW(main_params, lr=lr, weight_decay=wd)
+
+        opts = [opt_main]
+
+        if len(probe_params) > 0:
+            opt_probe = AdamW(probe_params, lr=float(self.txt_probe_lr), weight_decay=0.0)
+            opts.append(opt_probe)
+
+        # ===== 4) Lightning이 좋아하는 형태로만 반환 =====
+        # (여기서 절대 (opts, scheds) 같은 걸 리턴하지 마)
+        assert all(isinstance(o, Optimizer) for o in opts), f"Non-optimizer in opts: {[type(o) for o in opts]}"
+        return opts if len(opts) > 1 else opts[0]
 
 
 class StyleTokenLayer(nn.Module):
