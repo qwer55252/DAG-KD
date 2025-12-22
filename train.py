@@ -95,6 +95,7 @@ def main():
     p.add_argument("--disent_spk_layers", type=int_list_arg, default=[1, 2])
     p.add_argument("--disent_txt_layers", type=int_list_arg, default=[15, 16])
     p.add_argument("--disen_mi_pairs", type=str, default="ts,tp,ps")
+    p.add_argument("--disen_lll_weight", type=float, default=1.0)
 
     # W&B
     p.add_argument("--wandb_project", type=str, default=os.getenv("PRJ_NAME", "DAG-KD"))

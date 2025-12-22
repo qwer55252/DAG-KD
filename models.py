@@ -227,6 +227,16 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.club_zs = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
         self.club_zp = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
         self.club_ps = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
+        
+        # ===== MI 추정기 (AR-vCLUB) =====
+        self.club_ts = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 96))
+        self.club_tp = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 96))
+
+        # LLL 가중치 (논문 식(7)에서 IvCLUB + LLL 같이 들어감)
+        self.lll_weight = getattr(cfg, "disen_lll_weight", 1.0)
+        
+        self.spk_stat_proj = nn.Linear(self.latent_dim * 2, self.latent_dim)
+
 
         # ===== Generative KD 모듈 (Student last layer ↔ Teacher Text feature) =====
         self.flow = FlowMatchingModule(
@@ -518,6 +528,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
         rec_spk = F.mse_loss(spk_rec, spk_rep)         # Speaker Encoder도 X_L^T를 재구성하도록 학습 (그림의 Rec loss)
 
+        # ====== Speaker static (B,96) 만들기 ======
+        # backbone 통과 후 stats pooling 추천
+        spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb  # (B,96,T)
+        spk_mean = spk_feat.mean(dim=-1)   # (B,96)
+        spk_std  = spk_feat.std(dim=-1)    # (B,96)
+        spk_stat = torch.cat([spk_mean, spk_std], dim=-1)  # (B,192) # TODO: 이게 맞아? 
+        spk_stat = self.spk_stat_proj(spk_stat)            # (B,96)
+        
         # ----- Prosody (GST) -----
         T = txt_emb.size(-1)
         if self.use_prosody and (self._last_mel is not None):   # (B, mel_dim=80, T)
@@ -527,11 +545,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             # 2) GST로 스타일 토큰 조합: (B, token_dim=96)
             p_raw = self.pros_gst(ref)                   # (B, token_dim=96)
             # 3) latent_dim으로 proj: (B, 96)
-            pros_emb = self.pros_proj(p_raw)             # (B, latent_dim=96)
+            pros_stat = self.pros_proj(p_raw)            # (B, latent_dim=96) <-- 이게 진짜 static
             # 4) frame-wise로 broadcast: (B,96,T)
-            pros_emb = pros_emb.unsqueeze(-1).expand(-1, -1, T)
+            pros_emb = pros_stat.unsqueeze(-1).expand(-1, -1, T)
 
         else:
+            pros_stat = torch.zeros((txt_emb.size(0), self.latent_dim), device=txt_emb.device)
             pros_emb = torch.zeros_like(txt_emb) # (B, 96, T)
 
         # ----- Speaker CE & ACC -----
@@ -589,9 +608,13 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             )
         
         return {
-            "txt_emb": txt_emb,
-            "spk_emb": spk_emb,
-            "pros_emb": pros_emb,
+            "txt_emb": txt_emb,         # (B,96,T) dynamic
+            "spk_emb": spk_emb,         # (B,96,T) 기존 유지(CE/XAI용)
+            "pros_emb": pros_emb,       # (B,96,T) 기존 유지(XAI용)
+
+            "spk_stat": spk_stat,       # (B,96) static (MI용)
+            "pros_stat": pros_stat,     # (B,96) static (MI용)
+
             "spk_ce": spk_ce,
             "spk_acc": spk_acc,
             "rec_txt": rec_txt,
@@ -599,7 +622,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "txt_probe_ce": txt_probe_ce,
             "txt_probe_acc": txt_probe_acc,
         }
-
+    '''
     def _mi_loss(self, embs):
         """
         vCLUB 상한 합: I(z;s)+I(z;p)+I(p;s)
@@ -621,6 +644,56 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         if cnt > 0:
             mi = mi / cnt
         return mi
+    '''
+    
+    def _mi_loss(self, embs):
+        """
+        return:
+        mi_upper_avg: 평균 MI upper (식 4 추정치)
+        lll_avg: 평균 LLL (식 5)
+        """
+        if embs is None:
+            z = torch.tensor(0.0, device=self.device)
+            return z, z
+
+        txt = embs["txt_emb"]        # (B,96,T) dynamic
+        spk = embs["spk_stat"]       # (B,96)   static
+        pros = embs["pros_stat"]     # (B,96)   static
+
+        pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
+
+        mi_sum  = torch.tensor(0.0, device=txt.device)
+        lll_sum = torch.tensor(0.0, device=txt.device)
+        cnt = 0
+
+        # --- ts: I(txt_{1:T} ; spk_static) ---
+        if "ts" in pairs:
+            # (5) LLL: CLUB(q) 네트워크 학습용 (u,v는 detach)
+            lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach())
+
+            # (4) MI upper: 표현(txt,spk)이 덜 얽히게 만드는 loss
+            # 이때 CLUB 파라미터는 고정하고(gradient 막고) txt/spk 쪽으로만 gradient 흐르게
+            self._freeze_params(self.club_ts, True)
+            mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk)
+            self._freeze_params(self.club_ts, False)
+
+            cnt += 1
+
+        # --- tp: I(txt_{1:T} ; pros_static) ---
+        if "tp" in pairs:
+            lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach())
+
+            self._freeze_params(self.club_tp, True)
+            mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros)
+            self._freeze_params(self.club_tp, False)
+
+            cnt += 1
+
+        if cnt > 0:
+            mi_sum  = mi_sum / cnt
+            lll_sum = lll_sum / cnt
+
+        return mi_sum, lll_sum
 
     def training_step(self, batch, batch_idx):
         """
@@ -656,11 +729,13 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
 
             # MI term
-            mi_raw = self._mi_loss(embs)
-            mi_loss = torch.clamp(mi_raw, min=0.0)
-            self.log("train/mi_upper_raw", mi_raw, on_epoch=True)
-            self.log("train/mi_upper", mi_loss, on_epoch=True)
-            total = total + self.mi_weight * mi_loss
+            mi_upper, lll = self._mi_loss(embs)
+            # mi_loss = torch.clamp(mi_raw, min=0.0)
+            self.log("train/mi_upper", mi_upper, on_epoch=True)
+            # self.log("train/mi_upper", mi_loss, on_epoch=True)
+            self.log("train/lll", lll, on_epoch=True)
+            total = total + self.mi_weight * (mi_upper + self.lll_weight * lll)
+
 
             # Reconstruction loss
             rec_txt = embs["rec_txt"]
@@ -916,6 +991,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         probe_acc = (preds[valid_mask] == target[valid_mask]).float().mean()
         return probe_ce, probe_acc
 
+    def _freeze_params(self, module: nn.Module, freeze: bool):
+        for p in module.parameters():
+            p.requires_grad = (not freeze)
+
+
 class StyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):
         super().__init__()
@@ -1155,3 +1235,75 @@ class ClubGaussian(nn.Module):
         v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
         log_q_neg = self.log_q(u, v_shuffle).mean()
         return (log_q_pos - log_q_neg)
+
+class ARClubGaussian(nn.Module):
+    """
+    Autoregressive vCLUB for I(U_{1:T}; V_static)
+
+    q(u_{1:T} | v) = Π_t N(u_t | mu_t, diag(sigma_t^2))
+    mu_t, sigma_t from a causal RNN that sees (u_{<t}, v)
+
+    MI upper:
+      I(U;V) ≤ E_{p(u,v)}[log q(u|v)] - E_{p(u)p(v)}[log q(u|v)]
+
+    LLL (식 5):
+      LLL = - E_{p(u,v)}[log q(u|v)]
+    """
+    def __init__(self, u_dim=96, v_dim=96, hidden=256):
+        super().__init__()
+        self.v_to_h0 = nn.Sequential(
+            nn.Linear(v_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+        )
+        self.gru = nn.GRU(
+            input_size=u_dim,
+            hidden_size=hidden,
+            batch_first=True,
+        )
+        self.mu = nn.Linear(hidden, u_dim)
+        self.logvar = nn.Linear(hidden, u_dim)
+
+    def _shift_right(self, u_seq):
+        # u_seq: (B, T, Du)
+        z0 = torch.zeros_like(u_seq[:, :1, :])
+        return torch.cat([z0, u_seq[:, :-1, :]], dim=1)  # (B,T,Du)
+
+    def log_q(self, u, v):
+        """
+        u: (B, Du, T)
+        v: (B, Dv)   (static)
+        return: (B, T)  log q(u_t | u_{<t}, v) summed over Du
+        """
+        # (B,Du,T) -> (B,T,Du)
+        u_seq = u.transpose(1, 2)
+
+        # init hidden from v
+        h0 = self.v_to_h0(v).unsqueeze(0)  # (1,B,H)
+
+        # GRU input is shifted u (so that at t, it has u_<t)
+        u_in = self._shift_right(u_seq)    # (B,T,Du)
+        h, _ = self.gru(u_in, h0)          # (B,T,H)
+
+        mu = self.mu(h)                            # (B,T,Du)
+        logvar = self.logvar(h).clamp(-8.0, 8.0)   # (B,T,Du)
+
+        ll = -0.5 * (math.log(2 * math.pi) + logvar) - 0.5 * ((u_seq - mu) ** 2) / logvar.exp()
+        ll = ll.sum(dim=-1)  # (B,T)
+        return ll
+
+    def ll_loss(self, u, v):
+        # LLL = - E[log q(u|v)]
+        return -self.log_q(u, v).mean()
+
+    def mi_upper(self, u, v):
+        # positive term
+        log_q_pos = self.log_q(u, v).mean()
+
+        # negative term: shuffle v across batch to approximate p(u)p(v)
+        v_shuf = v[torch.randperm(v.size(0), device=v.device)]
+        log_q_neg = self.log_q(u, v_shuf).mean()
+
+        return (log_q_pos - log_q_neg)
+
+    
