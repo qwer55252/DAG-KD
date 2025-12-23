@@ -1282,8 +1282,8 @@ class ARClubGaussian(nn.Module):
         h0 = self.v_to_h0(v).unsqueeze(0)  # (1,B,H)
 
         # GRU input is shifted u (so that at t, it has u_<t)
-        u_in = self._shift_right(u_seq)    # (B,T,Du)
-        h, _ = self.gru(u_in, h0)          # (B,T,H)
+        causal_u = self._shift_right(u_seq)    # (B,T,Du)
+        h, _ = self.gru(causal_u, h0)          # (B,T,H)
 
         mu = self.mu(h)                            # (B,T,Du)
         logvar = self.logvar(h).clamp(-8.0, 8.0)   # (B,T,Du)
