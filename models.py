@@ -58,6 +58,8 @@ class DiffKDModule(nn.Module):
         )
         self.mse = nn.MSELoss()
     def forward(self, stu_feat, tch_feat):
+        stu_feat = self._to_BCT(stu_feat, self.student_dim)
+        tch_feat = self._to_BCT(tch_feat, self.teacher_dim)
         # stu_feat/tch_feat: (B, C, T)
         z_t = self.enc(tch_feat).detach()
         rec = self.dec(z_t)
@@ -69,12 +71,18 @@ class DiffKDModule(nn.Module):
             x = x - noise / self.steps
         distill = self.mse(x, z_t)
         return ae + distill
+    def _to_BCT(self, x, C_expected):
+        if x.size(1) == C_expected: return x
+        if x.size(2) == C_expected: return x.transpose(1,2)
+        return x  # 마지막 fallback
 
 
 class FlowMatchingModule(nn.Module):
     """간단화된 Feature-space Flow Matching (Rectified schedule)"""
     def __init__(self, feat_dim_s: int, feat_dim_t: int, hidden=128, time_dim=32, steps=8, loss_weight=1.0):
         super().__init__()
+        self.feat_dim_s = feat_dim_s
+        self.feat_dim_t = feat_dim_t
         self.steps = steps
         self.loss_weight = loss_weight
         self.time = nn.Linear(1, time_dim)
@@ -85,10 +93,11 @@ class FlowMatchingModule(nn.Module):
         )
         self.shape = nn.Linear(feat_dim_s, feat_dim_t)  # s-shape -> t-shape
         self.mse = nn.MSELoss()
+    
     def forward(self, stu_feat, tch_feat):
         # (B,C,T) -> (B,T,C)
-        s = stu_feat.transpose(1, 2)
-        t = tch_feat.transpose(1, 2).detach()
+        s = self._to_BTC(stu_feat, self.feat_dim_s)
+        t = self._to_BTC(tch_feat, self.feat_dim_t).detach()
         x = s
         for i in range(self.steps, 0, -1):
             tt = torch.full((x.size(0), x.size(1), 1), i / self.steps, device=x.device)
@@ -100,7 +109,17 @@ class FlowMatchingModule(nn.Module):
         pred = self.shape(x)
         loss = self.mse(pred, t)
         return self.loss_weight * loss
-
+    
+    def _to_BTC(self, x, feat_dim):
+        # x: (B,C,T) or (B,T,C)  -> (B,T,C)
+        if x.dim() != 3:
+            raise ValueError("expected 3D tensor")
+        if x.size(-1) == feat_dim:       # already (B,T,C)
+            return x
+        if x.size(1) == feat_dim:        # (B,C,T)
+            return x.transpose(1, 2)
+        # fallback(애매하면 last dim이 time일 가능성이 큼): (B,C,T)로 간주
+        return x.transpose(1, 2)
 
 class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(
@@ -240,11 +259,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # ===== Generative KD 모듈 (Student last layer ↔ Teacher Text feature) =====
         self.flow = FlowMatchingModule(
-            self.dim_s, self.dim_t, steps=flow_steps, loss_weight=flow_weight
+            self.dim_s, self.latent_dim, hidden=self.latent_dim, steps=flow_steps, loss_weight=flow_weight
         ) if use_flow else None
 
         self.diffkd = DiffKDModule(
-            teacher_dim=self.dim_t, student_dim=self.dim_s, steps=diffkd_steps
+            teacher_dim=self.latent_dim, latent_dim=self.latent_dim, student_dim=self.dim_s, steps=diffkd_steps
         ) if use_diffkd else None
         
         # forward 중간 결과 저장
@@ -473,19 +492,23 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             return torch.tensor(0.0, device=self.device)
 
         # Student last: (B, T, C_s) -> (B, C_s, T)
-        s = self._last_enc.transpose(1, 2)
+        s_raw = self._last_enc
+        s = self._ensure_BCT(s_raw, C_expected=self.dim_s)   # (B,C_s,T)
         # Teacher text feature: (B, C_t, T)
-        t = self._txt_emb.detach()
+        t_raw = self._txt_emb.detach()
+        t = self._ensure_BCT(t_raw, C_expected=self.latent_dim)  # (B,96,T) or (B,dim_t,T) depending on what you store
 
-        losses = []
+        flow_losses = []
+        diff_losses = []
         if self.use_flow and self.flow is not None:
-            losses.append(self.flow(s, t))
+            flow_losses.append(self.flow(s, t))
         if self.use_diffkd and self.diffkd is not None:
-            losses.append(self.diffkd(s, t))
+            diff_losses.append(self.diffkd(s, t))
 
-        if not losses:
-            return torch.tensor(0.0, device=self.device)
-        return sum(losses) / len(losses)
+        if not flow_losses and not diff_losses:
+            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+        
+        return sum(flow_losses) / len(flow_losses), sum(diff_losses) / len(diff_losses)
 
     # ===== Teacher Text/Speaker/Prosody embedding 생성 =====
     def _make_embeddings(self, speaker_ids):
@@ -766,9 +789,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         
         # 4) Generative KD (FM / DF)
         if self.use_flow or self.use_diffkd:
-            gen_kd = self._generative_kd()
-            self.log("train/gen_kd", gen_kd, on_step=False, on_epoch=True)
-            total = total + gen_kd
+            flow_loss, diff_loss = self._generative_kd()
+            self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
+            self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
+            total = total + flow_loss + diff_loss
 
         # 5) CTC
         if self.use_ctc:
@@ -994,6 +1018,19 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def _freeze_params(self, module: nn.Module, freeze: bool):
         for p in module.parameters():
             p.requires_grad = (not freeze)
+    
+    def _ensure_BCT(self, x, C_expected=None):
+        # x: (B,T,C) or (B,C,T) -> (B,C,T)
+        if x.dim() != 3:
+            raise ValueError("expected 3D")
+        if C_expected is not None:
+            if x.size(1) == C_expected:      # (B,C,T)
+                return x
+            if x.size(2) == C_expected:      # (B,T,C)
+                return x.transpose(1, 2)
+        # 기대 채널을 모르겠으면 마지막 축이 채널일 가능성이 높다고 가정
+        # (NeMo encoder output은 보통 마지막이 C)
+        return x.transpose(1, 2) if x.size(1) > x.size(2) else x
 
 
 class StyleTokenLayer(nn.Module):
@@ -1306,4 +1343,73 @@ class ARClubGaussian(nn.Module):
 
         return (log_q_pos - log_q_neg)
 
-    
+'''
+class ClubGaussian(nn.Module): # 지금 스피커에서 텍스트 뽑고 있음.... # v: speaker, u: text
+    """
+    I(U;V) ≤ E_{p(u,v)}[ log q(u|v) ] - E_{p(u)p(v)}[ log q(u|v) ]
+    q(u|v) = N(u | mu(v), diag(sigma^2(v)))
+    """
+    def __init__(self, u_dim=96, v_dim=96, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(v_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
+        )
+        self.mu = nn.Linear(hidden, u_dim) # <- 가우시안으로 두면 이거 필요없이 mean 취하면 됨.
+        self.logvar = nn.Linear(hidden, u_dim)
+
+    def log_q(self, u, v): # 텍스트에서 스피커를 뽑아내는게 더 자연스러움
+        # u,v shape: (B, latent_dim=96, T)
+        v = v.transpose(1, 2)
+        u = u.transpose(1, 2)
+        # u: (B,Du), v:(B,Dv)  → log N(u|μ(v), Σ(v))
+        h = self.net(v) # <- 이런식으로 과거 정보도 넣어줘야 함
+        mu = self.mu(h) # <- 이거 필요 없이 mean 취한게...
+        logvar = self.logvar(h).clamp(min=-8.0, max=8.0) #<- 이것도 직접 측정해야지 왜 네트워크 씀
+        # 로그우도(대각가우시안)
+        ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
+        return ll.sum(dim=-1)  # (B, T, latent_dim=96)
+
+    def mi_upper(self, u, v):
+        # positive
+        log_q_pos = self.log_q(u, v).mean()
+        # negative with shuffled v
+        v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
+        log_q_neg = self.log_q(u, v_shuffle).mean()
+        return (log_q_pos - log_q_neg)
+
+
+class ClubMonteCarlo(nn.Module): # 지금 스피커에서 텍스트 뽑고 있음.... # v: speaker, u: text
+    """
+    I(U;V) ≤ E_{p(u,v)}[ log q(u|v) ] - E_{p(u)p(v)}[ log q(u|v) ]
+    q(u|v) = N(u | mu(v), diag(sigma^2(v)))
+    """
+    def __init__(self, u_dim=96, v_dim=96, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(v_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
+        )
+        self.mu = nn.Linear(hidden, u_dim) # <- 가우시안으로 두면 이거 필요없이 mean 취하면 됨.
+        self.logvar = nn.Linear(hidden, u_dim)
+
+    def log_q(self, u, v): # 텍스트에서 스피커를 뽑아내는게 더 자연스러움
+        # u,v shape: (B, latent_dim=96, T)
+        v = v.transpose(1, 2)
+        u = u.transpose(1, 2)
+        # u: (B,Du), v:(B,Dv)  → log N(u|μ(v), Σ(v))
+        h = self.net(v, u[:t]) # <- 이런식으로 과거 정보도 넣어줘야 함
+        mu = self.mu(h) # <- 이거 필요 없이 mean 취한게...
+        logvar = self.logvar(h).clamp(min=-8.0, max=8.0) #<- 이것도 직접 측정해야지 왜 네트워크 씀
+        # 로그우도(대각가우시안)
+        ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
+        return ll.sum(dim=-1)  # (B, T, latent_dim=96)
+
+    def mi_upper(self, u, v):
+        # positive
+        log_q_pos = self.log_q(u, v).mean()
+        # negative with shuffled v
+        v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
+        log_q_neg = self.log_q(u, v_shuffle).mean()
+        return (log_q_pos - log_q_neg)
+'''    
