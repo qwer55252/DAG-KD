@@ -107,6 +107,10 @@ def main():
     p.add_argument("--use_txt_spk_probe", type=str2bool, default=True)
     p.add_argument("--txt_probe_lambda", type=float, default=1.0)
     p.add_argument("--txt_probe_lr", type=float, default=1e-3)
+    
+    p.add_argument("--use_stu_spk_adv", type=str2bool, default=False)
+    p.add_argument("--stu_spk_adv_lambda_max", type=float, default=0.1)
+    p.add_argument("--stu_spk_adv_warmup_steps", type=int, default=2000)
 
     args = p.parse_args()
 
@@ -286,6 +290,12 @@ def main():
     stu_cfg.use_txt_spk_probe = args.use_txt_spk_probe if hasattr(args, "use_txt_spk_probe") else True
     stu_cfg.txt_probe_lambda = args.txt_probe_lambda if hasattr(args, "txt_probe_lambda") else 1.0
     stu_cfg.txt_probe_lr = args.txt_probe_lr if hasattr(args, "txt_probe_lr") else 1e-3
+    
+    stu_cfg.use_stu_spk_adv = args.use_stu_spk_adv if hasattr(args, "use_stu_spk_adv") else True
+    stu_cfg.stu_spk_adv_lambda_max = args.stu_spk_adv_lambda_max if hasattr(args, "stu_spk_adv_lambda_max") else 0.1
+    stu_cfg.stu_spk_adv_warmup_steps = args.stu_spk_adv_warmup_steps if hasattr(args, "stu_spk_adv_warmup_steps") else 2000
+    stu_cfg.stu_spk_adv_hidden = 96
+    stu_cfg.stu_spk_adv_dropout = 0.2
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,

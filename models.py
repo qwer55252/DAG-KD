@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -310,8 +311,36 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             )
         else:
             self.txt_probe_backbone = None
-            self.txt_spk_probe_cls = None
+            self.txt_spk_probe_cls = None        
+        
+        # === Student speaker adversary (GRL) ===
+        self.use_stu_spk_adv = bool(getattr(cfg, "use_stu_spk_adv", True))
+        self.stu_spk_adv_lambda_max = float(getattr(cfg, "stu_spk_adv_lambda_max", 0.1))
+        self.stu_spk_adv_warmup_steps = int(getattr(cfg, "stu_spk_adv_warmup_steps", 2000))
 
+        # 상위 레이어만 쓰고 싶으면 hook 기반으로 layer index 사용 (옵션)
+        self.stu_adv_layers = getattr(cfg, "stu_adv_layers", None)  # 예: [15,16] (1-based)
+
+        if self.num_spk > 1 and self.use_stu_spk_adv:
+            # 가벼운 head 권장 (너무 세면 CTC 망가짐)
+            self.stu_spk_adv_backbone = nn.Sequential(
+                nn.Conv1d(self.dim_s, self.dim_s, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(self.dim_s),
+                nn.ReLU(inplace=True),
+            )
+            hidden = int(getattr(cfg, "stu_spk_adv_hidden", self.dim_s))
+            self.stu_spk_adv_cls = nn.Sequential(
+                nn.Linear(self.dim_s * 2, hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=float(getattr(cfg, "stu_spk_adv_dropout", 0.2))),
+                nn.Linear(hidden, self.num_spk),
+            )
+        else:
+            self.stu_spk_adv_backbone = None
+            self.stu_spk_adv_cls = None
+    
+        train_manifest = self.cfg.train_ds.manifest_filepath
+        self._load_manifest_speakers(train_manifest)
 
     # ------ Feature hooks ------
     def _to_BCT(self, x: torch.Tensor) -> torch.Tensor:
@@ -498,17 +527,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         t_raw = self._txt_emb.detach()
         t = self._ensure_BCT(t_raw, C_expected=self.latent_dim)  # (B,96,T) or (B,dim_t,T) depending on what you store
 
-        flow_losses = []
-        diff_losses = []
+        flow_loss = torch.tensor(0.0, device=self.device)
+        diff_loss = torch.tensor(0.0, device=self.device)
         if self.use_flow and self.flow is not None:
-            flow_losses.append(self.flow(s, t))
+            flow_loss = self.flow(s, t)
         if self.use_diffkd and self.diffkd is not None:
-            diff_losses.append(self.diffkd(s, t))
-
-        if not flow_losses and not diff_losses:
-            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+            diff_loss = self.diffkd(s, t)
         
-        return sum(flow_losses) / len(flow_losses), sum(diff_losses) / len(diff_losses)
+        return flow_loss, diff_loss
 
     # ===== Teacher Text/Speaker/Prosody embedding 생성 =====
     def _make_embeddings(self, speaker_ids):
@@ -729,13 +755,20 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         """
         # NeMo ASR default batch: (signal, signal_len, transcript, transcript_len)
         if len(batch) == 5:
-            signal, sig_len, y, ylen, speaker_ids = batch
+            signal, sig_len, y, ylen, sample_ids = batch
+            sample_ids = sample_ids.long()
+            
+            # sample_id -> speaker_id lookup
+            speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
         elif len(batch) == 4:
             signal, sig_len, y, ylen = batch
             speaker_ids = None
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
-
+        
+        assert speaker_ids.min().item() >= -1
+        assert speaker_ids.max().item() < self.num_spk
+        
         # 1) Student forward
         logp, enc_len, _ = self.forward(
             input_signal=signal, input_signal_length=sig_len
@@ -745,12 +778,30 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self._run_teacher(signal, sig_len)
 
         total = torch.tensor(0.0, device=logp.device)
+        
+        # (추가) Student speaker adversary
+        if self.use_stu_spk_adv and (self.num_spk > 1):
+            adv_ce_total = torch.tensor(0.0, device=logp.device)
+            adv_acc_total = torch.tensor(0.0, device=logp.device)
+            for stu_feat in self.stu_feats:
+                adv_ce, adv_acc = self._student_spk_adv_loss(stu_feat, speaker_ids)    
+                adv_acc_total += adv_acc
+                adv_ce_total += adv_ce            
+            adv_acc_mean = adv_acc_total / len(self.stu_feats)
+            adv_ce_mean = adv_ce_total / len(self.stu_feats)
+            if adv_ce_mean is not None:
+                self.log("adv/stu_spk_ce_mean", adv_ce_mean, on_step=False, on_epoch=True)
+                self.log("adv/stu_spk_acc_mean", adv_acc_mean, on_step=False, on_epoch=True)
+                self.log("adv/grl_lambda", torch.tensor(self._grl_lambda(), device=logp.device),
+                        on_step=False, on_epoch=True)
+
+                # GRL이 이미 lam을 적용하므로 보통은 그냥 더함
+                # 필요하면 cfg로 loss_weight 따로 두고 작게(예: 0.1) 곱해라
+                total = total + adv_ce_mean
 
         # 3) Factorization embeddings + MI/Rec/Speaker CE
+        embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
         if self.use_disent:
-            # Factorization embeddings + MI/Rec/Speaker CE
-            embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
-
             # MI term
             mi_upper, lll = self._mi_loss(embs)
             # mi_loss = torch.clamp(mi_raw, min=0.0)
@@ -1031,6 +1082,74 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # 기대 채널을 모르겠으면 마지막 축이 채널일 가능성이 높다고 가정
         # (NeMo encoder output은 보통 마지막이 C)
         return x.transpose(1, 2) if x.size(1) > x.size(2) else x
+    
+    def _grl_lambda(self):
+        # 0 -> lambda_max 선형 warmup
+        if self.stu_spk_adv_warmup_steps <= 0:
+            return self.stu_spk_adv_lambda_max
+        step = int(getattr(self, "global_step", 0))
+        r = min(1.0, step / float(self.stu_spk_adv_warmup_steps))
+        return self.stu_spk_adv_lambda_max * r
+
+    def _get_student_adv_rep(self, s_enc):
+        """
+        반환: rep (B, C_s, T)
+        - 기본: s_enc를 사용
+        - stu_adv_layers가 있으면 hook된 self.stu_feats에서 layer 평균 사용
+        """
+        # 기본: last output
+        rep = self._ensure_BCT(s_enc, C_expected=self.dim_s)  # (B,C,T)
+
+        if self.stu_adv_layers is None:
+            return rep
+
+        if not self.stu_feats:
+            return rep
+
+        L = len(self.stu_feats)
+        idxs = self._prepare_layer_indices(self.stu_adv_layers, L, default_low=False)
+        stack = torch.stack([self.stu_feats[i] for i in idxs], dim=0)  # (K,B,C,T)
+        rep = stack.mean(dim=0)  # (B,C,T)
+        return rep
+
+    def _student_spk_adv_loss(self, stu_feat, speaker_ids):
+        if (self.stu_spk_adv_cls is None) or (speaker_ids is None):
+            return None, None
+
+        valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+        if not valid_mask.any():
+            return None, None
+
+        lam = self._grl_lambda()
+        
+        stu_feat = self._ensure_BCT(stu_feat, C_expected=self.dim_s)  # (B,C,T)
+    
+
+        # GRL 적용: speaker CE가 student rep를 "speaker 못맞추게" 업데이트하도록
+        rep_grl = GradReverseFn.apply(stu_feat, lam)
+        if self.stu_spk_adv_backbone is not None:
+            rep_grl = self.stu_spk_adv_backbone(rep_grl)  # (B,C,T)
+
+        mean = rep_grl.mean(dim=-1)  # (B,C)
+        std  = rep_grl.std(dim=-1)   # (B,C)
+        utt  = torch.cat([mean, std], dim=-1)  # (B,2C)
+
+        logits = self.stu_spk_adv_cls(utt)  # (B,num_spk)
+        target = speaker_ids.clamp(min=0).long()
+
+        ce = F.cross_entropy(logits[valid_mask], target[valid_mask])
+        preds = logits.argmax(dim=-1)
+        acc = (preds[valid_mask] == target[valid_mask]).float().mean()
+        return ce, acc
+
+    def _load_manifest_speakers(self, manifest_path: str):
+        spk = []
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                obj = json.loads(line)
+                spk.append(int(obj.get("speaker", -1)))
+        # (N,) 텐서로 들고 있기
+        self.manifest_speakers = torch.tensor(spk, dtype=torch.long)  # CPU에 둬도 OK
 
 
 class StyleTokenLayer(nn.Module):
