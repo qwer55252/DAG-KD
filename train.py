@@ -111,6 +111,11 @@ def main():
     p.add_argument("--use_stu_spk_adv", type=str2bool, default=False)
     p.add_argument("--stu_spk_adv_lambda_max", type=float, default=0.1)
     p.add_argument("--stu_spk_adv_warmup_steps", type=int, default=2000)
+    
+    p.add_argument("--use_layerwise_disent", type=str2bool, default=False)
+    p.add_argument("--use_layerwise_flow", type=str2bool, default=False)
+    p.add_argument("--use_layerwise_diffkd", type=str2bool, default=False)
+    p.add_argument("--layer_list_for_disent", type=int_list_arg, default=[4,8,12,16])
 
     args = p.parse_args()
 
@@ -296,6 +301,10 @@ def main():
     stu_cfg.stu_spk_adv_warmup_steps = args.stu_spk_adv_warmup_steps if hasattr(args, "stu_spk_adv_warmup_steps") else 2000
     stu_cfg.stu_spk_adv_hidden = 96
     stu_cfg.stu_spk_adv_dropout = 0.2
+    stu_cfg.use_layerwise_disent = args.use_layerwise_disent
+    stu_cfg.use_layerwise_flow = args.use_layerwise_flow  # flow/disdiffkd도 동일하게 맞춤
+    stu_cfg.use_layerwise_diffkd = args.use_layerwise_diffkd
+    stu_cfg.layer_list_for_disent = args.layer_list_for_disent  # 1-based index
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
