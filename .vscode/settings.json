@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "/usr/bin/python",
+  "python.analysis.extraPaths": ["/opt/NeMo"],
+  "python.autoComplete.extraPaths": ["/opt/NeMo"],
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.autoImportCompletions": true
+}
