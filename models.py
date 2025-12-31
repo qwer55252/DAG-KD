@@ -119,7 +119,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         use_diffkd: bool = False,
         diffkd_steps: int = 5,
         # Disentanglement (기존 GRL 기반은 사용 X, MI 기반 factorization만 사용)
-        use_disent: bool = True,
+        use_disent: bool = False,
         disent_spk_layers: list = [1,2],
         disent_txt_layers: list = [15,16],
         
@@ -240,11 +240,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ===== Generative KD 모듈 (Student last layer ↔ Teacher Text feature) =====
         self.flow = FlowMatchingModule(
             self.dim_s, self.latent_dim, hidden=self.latent_dim, steps=flow_steps, loss_weight=flow_weight
-        ) if use_flow else None
+        ) if use_flow or self.use_layerwise_flow else None
 
         self.diffkd = DiffKDModule(
             teacher_dim=self.latent_dim, latent_dim=self.latent_dim, student_dim=self.dim_s, steps=diffkd_steps
-        ) if use_diffkd else None
+        ) if use_diffkd or self.use_layerwise_diffkd else None
         
         # forward 중간 결과 저장
         self._last_mel = None        # Student preprocessor output (B, n_mels, T)
@@ -320,7 +320,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     
         train_manifest = self.cfg.train_ds.manifest_filepath
         self._load_manifest_speakers(train_manifest)
-        L = len(self.tch_feats)
+        L = self.cfg.encoder.n_layers
         self.layer_list_for_disent = self._prepare_layer_indices(getattr(cfg, "layer_list_for_disent", [4,8,12,16]), L, default_low=True)  # 1-based index
 
     # ------ Feature hooks ------
@@ -446,9 +446,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             t_proc, t_len = self.teacher.preprocessor(
                 input_signal=signal, length=sig_len
             )
-            t_enc, _ = self.teacher.encoder(
+            t_enc, t_enc_len = self.teacher.encoder(
                 audio_signal=t_proc, length=t_len
             )  # (B, T, C_t)
+            self.t_enc_len = t_enc_len
             t_logp = self.teacher.decoder(encoder_output=t_enc)
         # 캐시
         self._tch_logp = t_logp
@@ -977,22 +978,24 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             spk  = layer_emb["spk_stat"]    # (B,96)
             pros = layer_emb["pros_stat"]   # (B,96)
 
+            T = txt.size(-1)
+            mask = (torch.arange(T, device=txt.device)[None, :] < self.t_enc_len[:, None]).float()  # (B,T)
+            
             # ts
             if "ts" in pairs:
                 # estimator training term
-                lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach())
-
+                lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach(), reduce_time="mean", mask=mask)
                 # representation disentangle term (freeze estimator params)
                 self._freeze_params(self.club_ts, True)
-                mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk)
+                mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk, reduce_time="mean", mask=mask)
                 self._freeze_params(self.club_ts, False)
 
             # tp
             if "tp" in pairs:
-                lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach())
+                lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach(), reduce_time="mean", mask=mask)
 
                 self._freeze_params(self.club_tp, True)
-                mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros)
+                mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros, reduce_time="mean", mask=mask)
                 self._freeze_params(self.club_tp, False)
 
         # 레이어 평균
@@ -1491,7 +1494,7 @@ class ARClubGaussian(nn.Module):
         z0 = torch.zeros_like(u_seq[:, :1, :])
         return torch.cat([z0, u_seq[:, :-1, :]], dim=1)  # (B,T,Du)
 
-    def log_q(self, u, v):
+    def log_q(self, u, v, reduce_time="mean", mask=None):
         """
         u: (B, Du, T)
         v: (B, Dv)   (static)
@@ -1512,21 +1515,61 @@ class ARClubGaussian(nn.Module):
 
         ll = -0.5 * (math.log(2 * math.pi) + logvar) - 0.5 * ((u_seq - mu) ** 2) / logvar.exp()
         ll = ll.mean(dim=-1)  # (B,T)
-        return ll
+        
+        # 길이 마스크
+        if mask is not None:
+            ll = ll * mask                     # mask: (B,T), 0/1
+            denom = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+        else:
+            denom = ll.new_full((ll.size(0),), ll.size(1))  # (B,) = T
+        
+        # time reduce
+        if reduce_time == "sum":
+            out = ll.sum(dim=1)               # (B,)
+        else:  # "mean"
+            out = ll.sum(dim=1) / denom       # (B,)
+        
+        return out
 
-    def ll_loss(self, u, v):
+    def ll_loss(self, u, v, reduce_time="mean", mask=None):
         # LLL = - E[log q(u|v)]
-        return -self.log_q(u, v).mean()
+        return -self.log_q(u, v, reduce_time=reduce_time, mask=mask).mean()
 
-    def mi_upper(self, u, v):
-        # positive term
-        log_q_pos = self.log_q(u, v).mean()
+    def mi_upper(self, u, v, K=8, reduce_time="mean", mask=None):
+        """
+        u: (B,Du,T)
+        v: (B,Dv)
+        return: scalar
+        """
+        B = u.size(0)
+        device = u.device
 
-        # negative term: shuffle v across batch to approximate p(u)p(v)
-        v_shuf = v[torch.randperm(v.size(0), device=v.device)]
-        log_q_neg = self.log_q(u, v_shuf).mean()
+        # positive: (u_i, v_i)
+        pos = self.log_q(u, v, reduce_time=reduce_time, mask=mask).mean()  # scalar
 
-        return (log_q_pos - log_q_neg)
+        # negative: (u_j, v_i) with K samples per i
+        # idx: (B,K)
+        idx = torch.randint(0, B, (B, K), device=device)
+
+        # (선택) j != i 강제 (원하면)
+        i_idx = torch.arange(B, device=device).unsqueeze(1)
+        idx = torch.where(idx == i_idx, (idx + 1) % B, idx)
+
+        # u_neg: (B,K,Du,T) -> (B*K,Du,T)
+        u_neg = u[idx.reshape(-1)]  # fancy indexing
+
+        # v_i를 K번 반복: (B,Dv) -> (B,K,Dv) -> (B*K,Dv)
+        v_rep = v.unsqueeze(1).expand(B, K, v.size(1)).reshape(-1, v.size(1))
+
+        # mask도 같이 반복해줘야 함 (mask: (B,T) 가정)
+        if mask is not None:
+            mask_rep = mask.unsqueeze(1).expand(B, K, mask.size(1)).reshape(-1, mask.size(1))
+        else:
+            mask_rep = None
+
+        neg = self.log_q(u_neg, v_rep, reduce_time=reduce_time, mask=mask_rep).mean()
+
+        return pos - neg
 
 '''
 class ClubGaussian(nn.Module): # 지금 스피커에서 텍스트 뽑고 있음.... # v: speaker, u: text
