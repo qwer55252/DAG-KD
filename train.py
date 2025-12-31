@@ -116,6 +116,7 @@ def main():
     p.add_argument("--use_layerwise_flow", type=str2bool, default=False)
     p.add_argument("--use_layerwise_diffkd", type=str2bool, default=False)
     p.add_argument("--layer_list_for_disent", type=int_list_arg, default=[4,8,12,16])
+    p.add_argument("--neg_K", type=int, default=8)
 
     args = p.parse_args()
 

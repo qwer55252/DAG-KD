@@ -322,6 +322,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self._load_manifest_speakers(train_manifest)
         L = self.cfg.encoder.n_layers
         self.layer_list_for_disent = self._prepare_layer_indices(getattr(cfg, "layer_list_for_disent", [4,8,12,16]), L, default_low=True)  # 1-based index
+        self.neg_K = int(getattr(cfg, "neg_K", 8))
 
     # ------ Feature hooks ------
     def _to_BCT(self, x: torch.Tensor) -> torch.Tensor:
@@ -987,7 +988,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach(), reduce_time="mean", mask=mask)
                 # representation disentangle term (freeze estimator params)
                 self._freeze_params(self.club_ts, True)
-                mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk, reduce_time="mean", mask=mask)
+                mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk, K=self.neg_K, reduce_time="mean", mask=mask)
                 self._freeze_params(self.club_ts, False)
 
             # tp
@@ -995,7 +996,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach(), reduce_time="mean", mask=mask)
 
                 self._freeze_params(self.club_tp, True)
-                mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros, reduce_time="mean", mask=mask)
+                mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros, K=self.neg_K, reduce_time="mean", mask=mask)
                 self._freeze_params(self.club_tp, False)
 
         # 레이어 평균
