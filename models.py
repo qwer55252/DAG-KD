@@ -497,11 +497,13 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         사이에 Flow Matching / DiffKD 적용.
         """
         if (not self.use_flow and not self.use_diffkd) or (self._last_enc is None):
-            return torch.tensor(0.0, device=self.device)
+            z = torch.tensor(0.0, device=self.device)
+            return z, z
 
         if self._txt_emb is None:
             # Text Encoder가 아직 안 돌았다면 0
-            return torch.tensor(0.0, device=self.device)
+            z = torch.tensor(0.0, device=self.device)
+            return z, z
 
         # Student last: (B, T, C_s) -> (B, C_s, T)
         s_raw = self._last_enc
@@ -749,8 +751,9 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
         
-        assert speaker_ids.min().item() >= -1
-        assert speaker_ids.max().item() < self.num_spk
+        if speaker_ids is not None:
+            assert speaker_ids.min().item() >= -1
+            assert speaker_ids.max().item() < self.num_spk
         
         # 1) Student forward
         logp, enc_len, _ = self.forward(
@@ -810,12 +813,50 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
             if spk_acc is not None and torch.is_tensor(spk_acc):
                 self.log("train/spk_acc", spk_acc, on_epoch=True)
-        elif self.use_layerwise_disent: # All-layer factorization + MI/Rec/SpkCE
+        elif self.use_layerwise_disent:
+            step = int(getattr(self, "global_step", 0))
+            warmup = int(getattr(self.cfg, "mi_warmup_steps", 5000))
+            ramp   = int(getattr(self.cfg, "mi_ramp_steps", 20000))
+
+            mi_lambda_max  = float(getattr(self.cfg, "mi_lambda_max", 0.01))
+            lll_lambda_max = float(getattr(self.cfg, "lll_lambda_max", 0.01))
+
+            # ---- 핵심: warmup에서는 CLUB(LLL)만 학습, MI penalty는 0 ----
+            if step < warmup:
+                est_only = True
+                mi_lambda  = 0.0
+                # warmup 동안 estimator를 실제로 학습시켜야 하므로 0이 되면 안 됨
+                # 보통은 1.0 권장(또는 lll_lambda_max를 그대로 사용해도 됨)
+                lll_lambda = 1.0
+                r_post = 0.0
+            else:
+                est_only = False
+                # warmup 이후에만 ramp: 0 -> 1
+                if ramp <= 0:
+                    r_post = 1.0
+                else:
+                    r_post = min(1.0, max(0.0, (step - warmup) / float(ramp)))
+
+                mi_lambda = mi_lambda_max * r_post
+                # LLL은 계속 estimator를 붙잡아주려면 "상수"로 두는 게 보통 더 안정적
+                lll_lambda = lll_lambda_max   # 또는 lll_lambda_max * r_post (원하면)
+
             layer_embs = self._make_layerwise_embeddings_all(speaker_ids, self.layer_list_for_disent)
             mi_upper, lll = self._mi_loss_layerwise_all(layer_embs)
+
+            self.log("sched/mi_lambda", torch.tensor(mi_lambda, device=self.device), on_step=False, on_epoch=True)
+            self.log("sched/lll_lambda", torch.tensor(lll_lambda, device=self.device), on_step=False, on_epoch=True)
+            self.log("sched/estimator_only", torch.tensor(float(est_only), device=self.device), on_step=False, on_epoch=True)
+            self.log("sched/r_post", torch.tensor(float(r_post), device=self.device), on_step=False, on_epoch=True)
+
             self.log("train/mi_upper", mi_upper, on_step=False, on_epoch=True)
             self.log("train/lll", lll, on_step=False, on_epoch=True)
-            total = total + self.mi_weight * mi_upper + self.lll_weight * lll
+
+            # warmup: LLL만
+            if est_only:
+                total = total + lll_lambda * lll
+            else:
+                total = total + mi_lambda * mi_upper + lll_lambda * lll
 
             # rec: all-layer 평균
             rec_txt = sum(d["rec_txt"] for d in layer_embs) / len(layer_embs)
@@ -824,7 +865,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/rec_spk", rec_spk, on_step=False, on_epoch=True)
             total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
 
-            # spk_ce: all-layer 평균 (진짜로 레이어마다 걸겠다면)
+            # spk_ce: all-layer 평균
             if self.spk_cls is not None:
                 spk_ce = sum(d["spk_ce"] for d in layer_embs) / len(layer_embs)
                 total = total + self.disen_spk_ce_lambda * spk_ce
@@ -835,8 +876,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                     spk_acc = sum(accs) / len(accs)
                     self.log("train/spk_acc", spk_acc, on_step=False, on_epoch=True)
         else:
-            # self._txt_emb 도 이때는 사용 안 하도록 보장하고 싶으면 명시적으로 초기화
             self._txt_emb = None
+
         
         # 4) Generative KD (FM / DF)
         if self.use_flow or self.use_diffkd:
@@ -845,6 +886,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
             total = total + flow_loss + diff_loss
         elif self.use_layerwise_flow or self.use_layerwise_diffkd:
+            layer_embs = self._make_layerwise_embeddings_all(speaker_ids, self.layer_list_for_disent)
             flow_loss, diff_loss = self._generative_kd_layerwise(layer_embs, self.layer_list_for_disent)
             self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
             self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
@@ -1318,6 +1360,17 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # unbiased=False로 분모 0 방지 + eps로 0분산 안정화
         var = torch.var(x, dim=dim, unbiased=False)
         return torch.sqrt(var + eps)
+
+    def _ramp(self, step, warmup, ramp):
+        # warmup 동안 0, 그 이후 ramp 동안 0->1 선형
+        if step < warmup:
+            return 0.0
+        if ramp <= 0:
+            return 1.0
+        x = (step - warmup) / float(ramp)
+        return float(min(1.0, max(0.0, x)))
+
+    
 
 class GlobalStyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):

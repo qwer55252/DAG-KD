@@ -117,6 +117,13 @@ def main():
     p.add_argument("--use_layerwise_diffkd", type=str2bool, default=False)
     p.add_argument("--layer_list_for_disent", type=int_list_arg, default=[4,8,12,16])
     p.add_argument("--neg_K", type=int, default=8)
+    
+    p.add_argument("--mi_warmup_steps", type=int, default=5000)      # CLUB만 학습하는 구간
+    p.add_argument("--mi_ramp_steps", type=int, default=20000)       # penalty를 올리는 구간
+    p.add_argument("--mi_lambda_max", type=float, default=0.01)      # 최종 MI 가중치
+    p.add_argument("--lll_lambda_max", type=float, default=0.01)     # 최종 LLL 가중치 (원하면 분리)
+    p.add_argument("--mi_clamp_min0", type=str2bool, default=True)   # mi_upper <0 클램프
+
 
     args = p.parse_args()
 
@@ -306,6 +313,12 @@ def main():
     stu_cfg.use_layerwise_flow = args.use_layerwise_flow  # flow/disdiffkd도 동일하게 맞춤
     stu_cfg.use_layerwise_diffkd = args.use_layerwise_diffkd
     stu_cfg.layer_list_for_disent = args.layer_list_for_disent  # 1-based index
+
+    stu_cfg.mi_warmup_steps = args.mi_warmup_steps
+    stu_cfg.mi_ramp_steps   = args.mi_ramp_steps
+    stu_cfg.mi_lambda_max   = args.mi_lambda_max
+    stu_cfg.lll_lambda_max  = args.lll_lambda_max
+    stu_cfg.mi_clamp_min0   = args.mi_clamp_min0
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
