@@ -1,9 +1,14 @@
-import re, os, json, uuid, torch, argparse, librosa
+import re, os, json, uuid, glob, torch, argparse, librosa, unicodedata
+import regex as re_u
 import soundfile as sf
 import matplotlib.pyplot as plt
+from typing import Optional, Dict, Any
+from pathlib import Path
+from omegaconf import OmegaConf
 from collections import defaultdict
-from nemo.utils.app_state import AppState
+from torch.utils.data import ConcatDataset
 from nemo.collections import asr as nemo_asr
+from nemo.utils.app_state import AppState
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 
 
@@ -64,9 +69,9 @@ def str2bool(v):
 
 
 def _clean_text(s: str) -> str:
-    s = re.sub(r"\{.*?\}", "", s)
+    s = re_u.sub(r"\{.*?\}", "", s)
     s = s.replace("<sil>", " ")
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re_u.sub(r"\s+", " ", s).strip()
     return s.lower()
 
 
@@ -137,32 +142,20 @@ def build_manifest_from_hf_with_meta(ds, manifest_path: str, cache_dir: str,
             if duration <= 0: continue
 
             text = ex.get("text","").strip().upper()
-            sample_id = ex.get("id", os.path.splitext(os.path.basename(wav_path))[0])
-
-            # 1) 파일명에서 speaker id 파싱
-            spk_from_path = _speaker_from_filepath(wav_path)
-
-            # 2) 필요하면 meta에서도 한번 더 보되, 파일명 파싱이 우선
-            if spk_from_path != -1:
-                spk_raw = spk_from_path
+            full_id = ex.get("id", os.path.splitext(os.path.basename(wav_path))[0])
+            spk_id = ex.get("speaker_id")
+            if spk_id in spk2idx:
+                spk_idx = spk2idx[spk_id]
             else:
-                spk_raw = ex.get("speaker_id", ex.get("speaker", -1))
-
-            # 3) spk2idx가 있으면 index로 매핑 (0 ~ num_spk-1), 없으면 값 그대로 쓰거나 -1
-            if spk2idx and isinstance(spk_raw, int) and spk_raw in spk2idx:
-                spk = spk2idx[spk_raw]
-            elif spk2idx and isinstance(spk_raw, str) and spk_raw.isdigit() and int(spk_raw) in spk2idx:
-                spk = spk2idx[int(spk_raw)]
-            else:
-                # spk2idx가 없거나, 매칭 안 되면 원래 speaker id 그대로 넣거나 -1
-                spk = spk_raw if isinstance(spk_raw, int) and spk_raw >= 0 else -1
+                spk_idx = -1 # unknown speaker (not in train set)
 
             item = {
                 "audio_filepath": wav_path,
                 "duration": duration,
                 "text": text,
-                "id": str(sample_id),
-                "speaker": int(spk),
+                "full_id": str(full_id),
+                "spk_id": int(spk_id),
+                "spk_idx": int(spk_idx),
             }
             fout.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -238,6 +231,151 @@ def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str, lang_key: str
                     entry["speaker"] = str(spk)
 
                 fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def build_manifest_from_hf_gigaspeech(ds, manifest_path: str, cache_dir: str):
+    """
+    HF Dataset -> NeMo manifest(JSONL)
+      { "audio_filepath": ..., "duration": ..., "text": ... }
+    - path 우선 사용, 안되면 cache/extracted 재귀탐색,
+      그래도 안되면 bytes/array를 임시 파일로 저장
+    """
+    import io
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+
+    extract_root  = os.path.join(cache_dir, "extracted")
+    tmp_audio_dir = os.path.join(cache_dir, "tmp_manifest_audio")
+    os.makedirs(tmp_audio_dir, exist_ok=True)
+
+    # [ADDED] 레퍼런스 내 특수 태그 목록 (대소문자 무시)
+    BANNED_TAGS = {
+        "<MUSIC>", "<COMMA>", "<NOISE>", "<VOCALIZED_NOISE>", "<LAUGHTER>",
+        "<SPOKEN_NOISE>", "<PERIOD>", "<QUESTION_MARK>", "<EXCLAMATION_MARK>",
+        "<SEMICOLON>", "<COLON>", "<DASH>", "<ELLIPSIS>", "<SIL>", "<OTHER>"
+    }
+    # [ADDED] 태그 스트립용 정규식 (대소문자 무시)
+    import re as _re
+    _TAGS_RE = _re.compile(r"(?:%s)" % "|".join(_re.escape(t) for t in BANNED_TAGS), _re.IGNORECASE)
+
+    # [ADDED] 태그만 제거하되, 제거 후 빈 문자열이면 "태그만 존재"로 판단
+    def _strip_special_tags(text: str) -> tuple[str, bool]:
+        """
+        Returns: (tags_removed_text, is_tag_only)
+        - 텍스트에서 BANNED_TAGS에 해당하는 토큰을 모두 제거
+        - 제거 결과가 빈 문자열이면 '태그만 있는' 케이스로 간주
+        """
+        if not text:
+            return "", True
+        no_tags = _TAGS_RE.sub(" ", text)
+        no_tags = re_u.sub(r"\s+", " ", no_tags).strip()
+        is_tag_only = (len(no_tags) == 0)
+        return no_tags, is_tag_only
+
+    def _resolve_audio_path(sample) -> tuple[str, float]:
+        """오디오 파일 실제 경로와 duration(sec) 반환"""
+        audio = sample["audio"]
+        # 1) path가 실제 파일이면 그대로 사용
+        orig_path = audio.get("path", None)
+        if isinstance(orig_path, str) and os.path.isfile(orig_path):
+            # duration이 없으면 soundfile로 계산
+            arr = audio.get("array", None)
+            sr  = audio.get("sampling_rate", 16000)
+            if arr is not None:
+                dur = float(len(arr)) / float(sr)
+            else:
+                try:
+                    info = sf.info(orig_path)
+                    dur = float(info.frames) / float(info.samplerate)
+                except Exception:
+                    dur = 0.0
+            return orig_path, dur
+
+        # 2) cache/extracted 아래에서 파일명으로 재귀 검색
+        cand_name = None
+        if isinstance(orig_path, str) and len(orig_path) > 0:
+            cand_name = os.path.basename(orig_path)
+        elif isinstance(sample.get("path", None), str):
+            cand_name = os.path.basename(sample["path"])
+
+        if cand_name:
+            matches = glob.glob(os.path.join(extract_root, "**", cand_name), recursive=True)
+            if matches:
+                found = matches[0]
+                try:
+                    info = sf.info(found)
+                    dur = float(info.frames) / float(info.samplerate)
+                except Exception:
+                    # array가 있으면 fallback
+                    arr = audio.get("array", None)
+                    sr  = audio.get("sampling_rate", 16000)
+                    dur = float(len(arr)) / float(sr) if arr is not None else 0.0
+                return found, dur
+
+        # 3) 원본 파일 바이트가 있으면 그대로 저장(확장자 추정)
+        if audio.get("bytes", None) is not None:
+            # 확장자 추정: path에서 따오거나 기본 .wav
+            ext = ".wav"
+            if isinstance(orig_path, str) and "." in os.path.basename(orig_path):
+                ext = os.path.splitext(orig_path)[1] or ".wav"
+            out_path = os.path.join(tmp_audio_dir, f"hf_{uuid.uuid4().hex}{ext}")
+            with open(out_path, "wb") as f:
+                f.write(audio["bytes"])
+            # duration 계산 시도
+            try:
+                info = sf.info(out_path)
+                dur = float(info.frames) / float(info.samplerate)
+            except Exception:
+                # array가 있으면 fallback
+                arr = audio.get("array", None)
+                sr  = audio.get("sampling_rate", 16000)
+                dur = float(len(arr)) / float(sr) if arr is not None else 0.0
+            return out_path, dur
+
+        # 4) 마지막 수단: array+sr로 WAV 저장
+        arr = audio.get("array", None)
+        sr  = audio.get("sampling_rate", 16000)
+        if arr is not None:
+            out_path = os.path.join(tmp_audio_dir, f"hf_{uuid.uuid4().hex}.wav")
+            sf.write(out_path, arr, sr)
+            dur = float(len(arr)) / float(sr)
+            return out_path, dur
+
+        raise FileNotFoundError("오디오 경로/바이트/배열 중 어느 것도 사용할 수 없습니다.")
+
+    n_written, n_skipped_short, n_skipped_tagonly = 0, 0, 0  # [CHANGED] 카운터 추가
+    min_sec = 1.0
+    with open(manifest_path, "w", encoding="utf-8") as fout:
+        for sample in ds:
+            audio_path, duration = _resolve_audio_path(sample)
+
+            # 너무 짧은 샘플 스킵
+            if duration < min_sec:
+                n_skipped_short += 1
+                continue
+
+            # GigaSpeech는 보통 'text', 일부 스크립트는 'sentence'
+            raw_text = sample.get("sentence", None)
+            if raw_text is None:
+                raw_text = sample.get("text", "")
+
+            # [CHANGED] "태그가 있으면 스킵" → "태그는 제거만, 태그만 있으면 스킵"
+            tag_stripped, is_tag_only = _strip_special_tags(raw_text)
+            if is_tag_only:
+                n_skipped_tagonly += 1
+                continue
+
+            # 이후 일반 정규화
+            text = normalize_text_cv(tag_stripped, keep_punct=False)
+
+            fout.write(json.dumps({
+                "audio_filepath": audio_path,
+                "duration": float(duration),
+                "text": text,
+            }, ensure_ascii=False) + "\n")
+            n_written += 1
+
+    print(f"[manifest] wrote {n_written} lines "
+          f"(skipped {n_skipped_short} < {min_sec}s, "
+          f"skipped {n_skipped_tagonly} tag-only refs) → {manifest_path}")
 # >>>>>>>>>>>>>>>>>>>>>>>>>>
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<< NeMo .nemo unpack helper
@@ -249,19 +387,49 @@ def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str, lang_key: str
 #     model._save_restore_connector.model_extracted_dir = out_folder
 #     AppState().nemo_file_folder = out_folder
 
-def release_nemoAPI(teacher_model, out_folder: str = "/workspace/outputs/nemo_archive"):
-    # 1) .nemo 실제 경로 조회
-    meta = AppState().get_model_metadata_from_guid(teacher_model.model_guid)
-    nemo_file = meta.restoration_path
+# def release_nemoAPI(teacher_model, out_folder: str = "/workspace/outputs/nemo_archive"):
+#     # 1) .nemo 실제 경로 조회
+#     meta = AppState().get_model_metadata_from_guid(teacher_model.model_guid)
+#     nemo_file = meta.restoration_path
+#     os.makedirs(out_folder, exist_ok=True)
+
+#     # 2) 압축 풀기
+#     connector = SaveRestoreConnector()
+#     connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
+
+#     # 3) 다음 복원 때 재활용할 디렉토리 지정
+#     teacher_model._save_restore_connector.model_extracted_dir = out_folder
+#     AppState().nemo_file_folder = out_folder
+
+def release_nemoAPI(model=None, out_folder: str = "/workspace/outputs/nemo_archive", nemo_file: str | None = None):
     os.makedirs(out_folder, exist_ok=True)
 
-    # 2) 압축 풀기
-    connector = SaveRestoreConnector()
-    connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
+    # (A) out_folder에 이미 풀려있는지 체크
+    already_extracted = (
+        os.path.isfile(os.path.join(out_folder, "model_config.yaml")) and
+        os.path.isfile(os.path.join(out_folder, "model_weights.ckpt"))
+    )
 
-    # 3) 다음 복원 때 재활용할 디렉토리 지정
-    teacher_model._save_restore_connector.model_extracted_dir = out_folder
+    # (B) nemo_file이 없으면 model_guid에서 restoration_path를 시도
+    if nemo_file is None and model is not None and hasattr(model, "model_guid"):
+        try:
+            meta = AppState().get_model_metadata_from_guid(model.model_guid)
+            nemo_file = meta.restoration_path
+        except Exception:
+            nemo_file = None
+
+    # (C) 필요하면 압축 풀기 (restoration_path가 있을 때만)
+    if (not already_extracted) and (nemo_file is not None):
+        connector = SaveRestoreConnector()
+        connector._unpack_nemo_file(nemo_file, out_folder=out_folder)
+
+    # (D) 핵심: nemo: artifact 해석용 base dir 세팅
     AppState().nemo_file_folder = out_folder
+
+    # (E) 선택: model이 있으면 extracted_dir도 잡아주기 (restore_from 최적화용)
+    if model is not None and hasattr(model, "_save_restore_connector"):
+        model._save_restore_connector.model_extracted_dir = out_folder
+
 
 def _strip_module_prefix(sd: dict) -> dict:
     # DataParallel 등에 의해 앞에 'module.' 있을 때 제거
@@ -478,3 +646,160 @@ def save_mel_examples_from_manifest(
 
         print(f"[MEL] Saved mel example: {save_path}")
 
+def materialize_nemo_artifacts_in_cfg(cfg, nemo_archive_dir: str):
+    nemo_archive_dir = os.path.abspath(nemo_archive_dir)
+    OmegaConf.set_struct(cfg, False)
+
+    # tokenizer 쪽 nemo: 경로를 로컬 절대경로로 치환
+    if "tokenizer" in cfg and cfg.tokenizer is not None:
+        for k in ["model_path", "vocab_path", "spe_tokenizer_vocab"]:
+            if k in cfg.tokenizer and isinstance(cfg.tokenizer[k], str) and cfg.tokenizer[k].startswith("nemo:"):
+                rel = cfg.tokenizer[k][5:]  # remove "nemo:"
+                abs_path = os.path.join(nemo_archive_dir, rel)
+                cfg.tokenizer[k] = os.path.abspath(abs_path)
+
+    # 안전 체크: 파일 존재 확인
+    tok = cfg.tokenizer
+    for k in ["model_path", "vocab_path", "spe_tokenizer_vocab"]:
+        p = tok.get(k, None)
+        if p is not None and isinstance(p, str):
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"[materialize] tokenizer.{k} not found: {p}")
+
+    return cfg
+
+def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """
+    lengths: (B,)
+    return: mask (B, max_len, 1) where valid=1, pad=0
+    """
+    device = lengths.device
+    B = lengths.size(0)
+    arange = torch.arange(max_len, device=device).unsqueeze(0).expand(B, max_len)
+    mask = (arange < lengths.unsqueeze(1)).float().unsqueeze(-1)
+    return mask
+
+def masked_mse(a: torch.Tensor, b: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    a,b: (B,T,D)
+    lengths: (B,) optional
+    """
+    diff2 = (a - b).pow(2)
+    if lengths is None:
+        return diff2.mean()
+    mask = make_pad_mask(lengths, a.size(1))  # (B,T,1)
+    diff2 = diff2 * mask
+    denom = mask.sum() * a.size(-1) + 1e-8
+    return diff2.sum() / denom
+
+def _to_long(x, device):
+    if torch.is_tensor(x):
+        return x.to(device).long()
+    return torch.as_tensor(x, device=device, dtype=torch.long)
+
+def _get_item_by_global_index(ds, idx: int):
+    if isinstance(ds, ConcatDataset):
+        for sub_i, csz in enumerate(ds.cumulative_sizes):
+            if idx < csz:
+                prev = 0 if sub_i == 0 else ds.cumulative_sizes[sub_i - 1]
+                return ds.datasets[sub_i][idx - prev]
+        raise IndexError(idx)
+    return ds[idx]
+
+def extract_speaker_ids_from_batch(batch, spk_table: torch.Tensor, device):
+    # batch: (signal, signal_len, tokens, tokens_len, sample_id)
+    if not (isinstance(batch, (tuple, list)) and len(batch) >= 5):
+        return None
+    sample_id = batch[4]
+    if not torch.is_tensor(sample_id) or sample_id.dim() != 1:
+        return None
+
+    sample_id = sample_id.to(device).long()
+    spk_table = spk_table.to(device, non_blocking=True)
+    return spk_table[sample_id]  # (B,)
+
+
+def load_speaker_table_from_manifest(manifest_path: str, key_candidates=("spk_idx", "speaker", "spk_id")):
+    table = []
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for line in f:
+            j = json.loads(line)
+            v = -1
+            for k in key_candidates:
+                if k in j:
+                    v = int(j[k])
+                    break
+            table.append(v)
+    # CPU tensor로 들고 있다가, 필요할 때 device로 옮겨서 take/indexing
+    return torch.tensor(table, dtype=torch.long)  # (N,)
+
+def rotate_last_ckpts(ckpt_dir: str, keep: int = 50):
+    p = Path(ckpt_dir)
+    ckpts = sorted(p.glob("last*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
+    if not ckpts:
+        return
+
+    latest = ckpts[0]
+    last = p / "last.ckpt"
+
+    # 1) 최신을 last.ckpt로 만들기
+    if latest != last:
+        if last.exists():
+            # 기존 last는 백업으로 이동
+            backup = p / f"last-prev.ckpt"
+            if backup.exists():
+                backup.unlink()
+            last.rename(backup)
+        latest.rename(last)
+
+    # 2) 나머지 오래된 애들은 last-v1, last-v2 ...로 정렬 (원하면)
+    others = sorted([c for c in p.glob("last*.ckpt") if c.name != "last.ckpt"],
+                    key=lambda x: x.stat().st_mtime, reverse=True)
+
+    for i, f in enumerate(others, start=1):
+        target = p / f"last-v{i}.ckpt"
+        if f != target:
+            if target.exists():
+                target.unlink()
+            f.rename(target)
+
+    # 3) 너무 많으면 prune
+    all_ckpts = sorted(p.glob("last*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for f in all_ckpts[keep:]:
+        f.unlink()
+
+def normalize_text_cv(s: str, keep_punct: bool = False) -> str:
+    # 0) 유니코드 정규화 + 소문자
+    s = unicodedata.normalize("NFKC", s or "").strip().lower()
+
+    # 1) 흔한 특수문자 매핑 및 제거
+    for k, v in {"\u2047": " ","“": '"', "”": '"', "„": '"',"‘": "'", "’": "'","–": "-", "—": "-","…": " ", "‹": " ", "›": " ", "«": " ", "»": " ",}.items():   # DOUBLE QUESTION MARK → 제거(공백)
+        s = s.replace(k, v)
+
+    # 2) 바깥 큰따옴표만 한 쌍이면 제거
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+
+    # 3) CV 특유의 공백+아포스트로피 정리: "men 's" → "men's"
+    s = re_u.sub(r"\s+'\s*s\b", "'s", s)
+
+    # 4) 평가용: 구두점 제거 권장(문자/숫자/공백/아포스트로피/하이픈만 유지)
+    if not keep_punct:
+        s = re_u.sub(r"[^\p{L}\p{N}\s'\-]", " ", s)
+
+    # 5) 공백 정리
+    s = re_u.sub(r"\s+", " ", s).strip()
+    return s
+
+def head_manifest(src_path: str, dst_path: str, n_lines: int) -> str:
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    wrote = 0
+    with open(src_path, "r", encoding="utf-8") as fin, open(dst_path, "w", encoding="utf-8") as fout:
+        for line in fin:
+            if not line.strip():
+                continue
+            fout.write(line)
+            wrote += 1
+            if wrote >= n_lines:
+                break
+    return dst_path, wrote
