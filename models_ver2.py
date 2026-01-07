@@ -396,24 +396,46 @@ class TeacherASRWithDisent(BottleneckEncDecCTCModelBPE):
     def __init__(self, cfg, trainer=None, **kwargs):
         super().__init__(cfg=cfg, trainer=trainer, **kwargs)
         self.num_spk = int(getattr(cfg, "num_spk", 0))
+        self.automatic_optimization = False
 
     def training_step(self, batch, batch_idx):
+        opt_main, opt_club = self.optimizers()  # configure_optimizers에서 반환한 순서
+
+        # ----- batch unpack -----
         if len(batch) == 5:
             audio, audio_len, tokens, tokens_len, sample_ids = batch
             sample_ids = sample_ids.long()
-            
-            # sample_id -> speaker_id lookup
             speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
         elif len(batch) == 4:
             audio, audio_len, tokens, tokens_len = batch
             speaker_ids = None
         else:
             raise ValueError(f"Unexpected batch length: {len(batch)}")
-        if speaker_ids is not None:
-            assert speaker_ids.min().item() >= -1
-            assert speaker_ids.max().item() < self.num_spk
 
-        log_probs, enc_len, z_lat, aux = self.forward_with_z(
+        # =========================================================
+        # (1) CLUB 업데이트: lll_club만 최소화 (u,v는 detach되어 club만 학습)
+        # =========================================================
+        toggle_club_grad(self.disent, True)   # club 파라미터 학습 ON
+
+        _, _, _, aux_c = self.forward_with_z(
+            input_signal=audio,
+            input_signal_length=audio_len,
+            speaker_ids=speaker_ids,
+            compute_loss=True,
+            grl_lambda=1.0,
+        )
+        club_loss = self.disen_lll_weight * aux_c.get("lll_club", torch.zeros([], device=audio.device))
+
+        opt_club.zero_grad(set_to_none=True)
+        self.manual_backward(club_loss)
+        opt_club.step()
+
+        # =========================================================
+        # (2) MAIN 업데이트: CTC + MI(encoder용 raw) (club은 freeze)
+        # =========================================================
+        toggle_club_grad(self.disent, False)  # club 파라미터 학습 OFF (하지만 u로의 grad는 흐름)
+
+        log_probs, enc_len, _, aux_m = self.forward_with_z(
             input_signal=audio,
             input_signal_length=audio_len,
             speaker_ids=speaker_ids,
@@ -428,22 +450,50 @@ class TeacherASRWithDisent(BottleneckEncDecCTCModelBPE):
             target_lengths=tokens_len,
         )
 
-        loss_disen = (
-            self.disen_mi_weight * aux.get("mi_upper", torch.zeros([], device=log_probs.device))
-            + self.disen_lll_weight * aux.get("lll", torch.zeros([], device=log_probs.device))
-        )
+        mi_loss = aux_m.get("mi_upper_enc_raw", torch.zeros([], device=log_probs.device))
+        loss_disen = self.disen_mi_weight * mi_loss  # <= main step에는 MI만
 
         loss = loss_ctc + loss_disen
+
+        opt_main.zero_grad(set_to_none=True)
+        self.manual_backward(loss)
+        opt_main.step()
+
+        # ----- logging -----
         self.log_dict(
-            {"train/loss_ctc": loss_ctc.detach(), "train/loss_disen": loss_disen.detach(), "train/loss_total": loss.detach()},
+            {
+                "train/loss_ctc": loss_ctc.detach(),
+                "train/club_loss": club_loss.detach(),
+                "train/mi_loss": (self.disen_mi_weight * mi_loss).detach(),
+                "train/loss_total": loss.detach(),
+                "train/mi_upper_log": aux_m.get("mi_upper_log", torch.zeros([], device=log_probs.device)).detach(),
+            },
             prog_bar=True,
         )
+
         return loss
 
+
+    # def configure_optimizers(self):
+    #     lr = 1e-4
+    #     params = [p for p in self.parameters() if p.requires_grad]
+    #     return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.98), weight_decay=1e-2)
     def configure_optimizers(self):
-        lr = 1e-4
-        params = [p for p in self.parameters() if p.requires_grad]
-        return torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.98), weight_decay=1e-2)
+        lr_main = 1e-4
+        lr_club = 1e-4
+
+        club_params = []
+        for m in [self.disent.club_ts, self.disent.club_tp, self.disent.club_ps]:
+            club_params += list(m.parameters())
+
+        # club 파라미터를 제외한 나머지
+        club_param_ids = set(id(p) for p in club_params)
+        main_params = [p for p in self.parameters() if p.requires_grad and id(p) not in club_param_ids]
+
+        opt_main = torch.optim.AdamW(main_params, lr=lr_main, betas=(0.9, 0.98), weight_decay=1e-2)
+        opt_club = torch.optim.AdamW(club_params, lr=lr_club, betas=(0.9, 0.98), weight_decay=0.0)
+
+        return [opt_main, opt_club]
 
 
 class StudentASRWithDisentKD(BottleneckEncDecCTCModelBPE):
@@ -638,16 +688,12 @@ class SimpleClsHead(nn.Module):
 
 
 class ARClubGaussian(nn.Module):
-    """
-    Autoregressive vCLUB for I(U_{1:T}; V_static)
-    q(u_{1:T}|v) = Π_t N(u_t | mu_t, diag(sigma^2_t))
-    mu_t, sigma_t from causal GRU that sees u_{<t} with h0 from v.
-    """
-    def __init__(self, u_dim: int, v_dim: int, hidden: int = 256):
+    def __init__(self, u_dim: int, v_dim: int, hidden: int = 256, shift_right: bool = True):
         super().__init__()
         self.u_dim = u_dim
         self.v_dim = v_dim
         self.hidden = hidden
+        self.shift_right = shift_right
 
         self.v_to_h0 = nn.Sequential(
             nn.Linear(v_dim, hidden),
@@ -658,36 +704,37 @@ class ARClubGaussian(nn.Module):
         self.mu = nn.Linear(hidden, u_dim)
         self.logvar = nn.Linear(hidden, u_dim)
 
-    def forward(self, u: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        u: (B,T,Du), v: (B,Dv)
-        return mu, logvar : (B,T,Du)
-        """
-        h0 = self.v_to_h0(v).unsqueeze(0)  # (1,B,H)
-        out, _ = self.gru(u, h0)           # (B,T,H)
+    def forward(self, u: torch.Tensor, v: torch.Tensor):
+        # u: (B,T,Du), v: (B,Dv)
+        if self.shift_right:
+            u_in = torch.zeros_like(u)
+            u_in[:, 1:, :] = u[:, :-1, :]   # u_<t만 보게 함
+        else:
+            u_in = u
+
+        h0 = self.v_to_h0(v).unsqueeze(0)   # (1,B,H)
+        out, _ = self.gru(u_in, h0)         # (B,T,H)
         mu = self.mu(out)
         logvar = self.logvar(out).clamp(min=-12.0, max=6.0)
         return mu, logvar
 
-    def log_prob(self, u: torch.Tensor, v: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        log q(u|v) summed over time+dim, then batch-mean
-        """
+    def log_prob(self, u: torch.Tensor, v: torch.Tensor, lengths=None, time_reduce: str = "mean"):
         mu, logvar = self(u, v)
-        # log N(u|mu, diag(var))
-        # = -0.5 * [ (u-mu)^2/var + log var + log(2pi) ]
         var = logvar.exp()
         lp = -0.5 * (((u - mu) ** 2) / var + logvar + math.log(2.0 * math.pi))
-        # sum over dim
         lp = lp.sum(dim=-1)  # (B,T)
 
         if lengths is not None:
             B, T = lp.shape
             mask = (torch.arange(T, device=lp.device)[None, :] < lengths[:, None]).float()
-            lp = (lp * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+            if time_reduce == "sum":
+                lp = (lp * mask).sum(dim=1)
+            else:  # mean
+                lp = (lp * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         else:
-            lp = lp.mean(dim=1)
-        return lp.mean()  # scalar
+            lp = lp.sum(dim=1) if time_reduce == "sum" else lp.mean(dim=1)
+
+        return lp.mean()  # batch mean
 
 
 @dataclass
@@ -696,6 +743,10 @@ class DisenLossOut:
     z_text_latent: torch.Tensor         # (B,T,latent_dim)  <-- KD는 보통 이걸로
     aux: Dict[str, torch.Tensor]        # losses/embeddings
 
+
+def set_requires_grad(module: nn.Module, flag: bool):
+    for p in module.parameters():
+        p.requires_grad_(flag)
 
 class DisentanglementBottleneck(nn.Module):
     """
@@ -779,29 +830,40 @@ class DisentanglementBottleneck(nn.Module):
         u: torch.Tensor,
         v: torch.Tensor,
         lengths: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        MI upper:  E_{p(u,v)} log q(u|v) - E_{p(u)p(v)} log q(u|v)
-        LLL:      -E_{p(u,v)} log q(u|v)
-        """
-        joint = club.log_prob(u, v, lengths=lengths)
-        # shuffle v across batch for product-of-marginals
-        perm = torch.randperm(v.size(0), device=v.device)
-        v_shuf = v[perm]
-        marg = club.log_prob(u, v_shuf, lengths=lengths)
-        mi_upper = joint - marg
+        num_neg: int = 4,              # <= 추가: negative K개
+        time_reduce: str = "mean",     # "sum"으로 바꾸면 논문과 더 정합
+        detach_for_lll: bool = True,   # CLUB 업데이트용일 때 True 권장
+    ):
+        # joint: E_{p(u,v)} log q(u|v)
+        u_joint = u.detach() if detach_for_lll else u
+        v_joint = v.detach() if detach_for_lll else v
+        joint = club.log_prob(u_joint, v_joint, lengths=lengths, time_reduce=time_reduce)
+
+        # marg: E_{p(u)p(v)} log q(u|v)  (K-shuffle 평균)
+        B = v.size(0)
+        marg_acc = 0.0
+        for _ in range(num_neg):
+            perm = torch.randperm(B, device=v.device)
+            v_shuf = v[perm]
+            u_m = u.detach() if detach_for_lll else u
+            v_m = v_shuf.detach() if detach_for_lll else v_shuf
+            marg_acc = marg_acc + club.log_prob(u_m, v_m, lengths=lengths, time_reduce=time_reduce)
+        marg = marg_acc / float(num_neg)
+
+        mi_upper_raw = joint - marg
         lll = -joint
-        if self.mi_clamp_min0:
-            mi_upper = mi_upper.clamp_min(0.0)
-        return mi_upper, lll
+
+        # clamp는 로깅용으로만 두는 게 안전
+        mi_upper_log = mi_upper_raw.clamp_min(0.0) if self.mi_clamp_min0 else mi_upper_raw
+
+        return mi_upper_raw, mi_upper_log, lll
 
     def forward(
         self,
         enc_out: torch.Tensor,                 # (B,T,in_dim)
         enc_len: Optional[torch.Tensor] = None, # (B,)
         speaker_ids: Optional[torch.Tensor] = None,
-        compute_loss: bool = False,
-        grl_lambda: float = 1.0,
+        compute_loss=False, grl_lambda=1.0, vclub_num_neg: int = 4, vclub_time_reduce: str = "mean"
     ) -> DisenLossOut:
         # map to latent
         z = self.in_proj(enc_out)  # (B,T,latent)
@@ -822,50 +884,67 @@ class DisentanglementBottleneck(nn.Module):
         }
 
         if compute_loss:
-            mi_total = torch.zeros([], device=z.device)
-            lll_total = torch.zeros([], device=z.device)
+            mi_enc_total = torch.zeros([], device=z.device)   # encoder 업데이트용 (raw)
+            mi_log_total = torch.zeros([], device=z.device)   # 로깅용 (clamp)
+            lll_club_total = torch.zeros([], device=z.device) # club 업데이트용
 
-            # pairs: ts,tp,ps where t=dynamic(z_text), s=spk_emb, p=pros_emb
+            def add_pair(name, club, u_dyn, v_stat):
+                nonlocal mi_enc_total, mi_log_total, lll_club_total
+
+                # (A) encoder용 MI: detach_for_lll=False (즉 u,v에 gradient 허용)
+                mi_raw, mi_log, _ = self._vclub_mi_upper_and_lll(
+                    club, u_dyn, v_stat, enc_len,
+                    num_neg=vclub_num_neg,
+                    time_reduce=vclub_time_reduce,
+                    detach_for_lll=False,
+                )
+                mi_enc_total = mi_enc_total + mi_raw
+                mi_log_total = mi_log_total + mi_log
+                aux[f"mi_{name}_raw"] = mi_raw
+                aux[f"mi_{name}_log"] = mi_log
+
+                # (B) club용 LLL: u,v detach해서 club만 학습하게
+                _, _, lll = self._vclub_mi_upper_and_lll(
+                    club, u_dyn, v_stat, enc_len,
+                    num_neg=1,  # LLL은 negative 필요 없음
+                    time_reduce=vclub_time_reduce,
+                    detach_for_lll=True,
+                )
+                lll_club_total = lll_club_total + lll
+                aux[f"lll_{name}"] = lll
+
             if "ts" in self.mi_pairs:
-                mi_ts, lll_ts = self._vclub_mi_upper_and_lll(self.club_ts, z_text_latent, spk_emb, enc_len)
-                mi_total = mi_total + mi_ts
-                lll_total = lll_total + lll_ts
-                aux["mi_ts"] = mi_ts
-                aux["lll_ts"] = lll_ts
-
+                add_pair("ts", self.club_ts, z_text_latent, spk_emb)
             if "tp" in self.mi_pairs:
-                mi_tp, lll_tp = self._vclub_mi_upper_and_lll(self.club_tp, z_text_latent, pros_emb, enc_len)
-                mi_total = mi_total + mi_tp
-                lll_total = lll_total + lll_tp
-                aux["mi_tp"] = mi_tp
-                aux["lll_tp"] = lll_tp
-
+                add_pair("tp", self.club_tp, z_text_latent, pros_emb)
             if "ps" in self.mi_pairs:
-                # ps는 static-static이라 ARClubGaussian이랑 구조가 100% 맞진 않음
-                # 그래도 "ps"를 유지하고 싶다면, p를 time 축으로 broadcast해서 억지로 맞추는 방식(간단)로 처리
-                # (기존 구현이 다르면 여기만 네 구현으로 교체)
                 B, T, _ = z_text_latent.shape
                 p_dyn = pros_emb[:, None, :].expand(B, T, self.latent_dim)
-                mi_ps, lll_ps = self._vclub_mi_upper_and_lll(self.club_ps, p_dyn, spk_emb, enc_len)
-                mi_total = mi_total + mi_ps
-                lll_total = lll_total + lll_ps
-                aux["mi_ps"] = mi_ps
-                aux["lll_ps"] = lll_ps
+                add_pair("ps", self.club_ps, p_dyn, spk_emb)
 
-            aux["mi_upper"] = mi_total
-            aux["lll"] = lll_total
+            aux["mi_upper_enc_raw"] = mi_enc_total     # 학습용 (clamp X)
+            aux["mi_upper_log"] = mi_log_total         # 로깅용 (clamp O 가능)
+            aux["lll_club"] = lll_club_total           # club 학습용
 
-            # optional adversarial speaker probe on z_text
+            # speaker probe: 지금 grl_lambda 인자가 죽어있음. 두 가지 모드 중 선택.
             if self.use_txt_spk_probe and (speaker_ids is not None):
                 speaker_ids = speaker_ids.long()
                 valid = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
                 if valid.any():
-                    spk_logits = self.txt_spk_probe(z_text_latent[valid].detach(), enc_len[valid] if enc_len is not None else None)
-                    aux["txt_spk_probe_ce"] = F.cross_entropy(spk_logits, speaker_ids[valid]) # TODO: 내가 logging하고 싶은거는 ce가 아니라 실제 acc임.
+                    # 1) "순수 probe(측정)"만: detach 유지
+                    probe_logits = self.txt_spk_probe(z_text_latent[valid].detach(),
+                                                    enc_len[valid] if enc_len is not None else None)
+                    aux["txt_spk_probe_ce"] = F.cross_entropy(probe_logits, speaker_ids[valid])
+                    aux["txt_spk_probe_acc"] = (probe_logits.argmax(-1) == speaker_ids[valid]).float().mean()
+
+                    # 2) "adversarial로 speaker 제거"까지 하고 싶으면: GRL 사용 (detach 제거)
+                    # adv_feat = GradReverseFn.apply(z_text_latent[valid], grl_lambda)
+                    # adv_logits = self.txt_spk_probe(adv_feat, enc_len[valid] if enc_len is not None else None)
+                    # aux["txt_spk_adv_ce"] = F.cross_entropy(adv_logits, speaker_ids[valid])
+                    # aux["txt_spk_adv_acc"] = (adv_logits.argmax(-1) == speaker_ids[valid]).float().mean()
                 else:
                     aux["txt_spk_probe_ce"] = torch.zeros([], device=z.device)
-            else:
-                aux["txt_spk_probe_ce"] = torch.zeros([], device=z.device)
+                    aux["txt_spk_probe_acc"] = torch.zeros([], device=z.device)
 
             
 
@@ -877,3 +956,8 @@ class DisentanglementBottleneck(nn.Module):
             z_text_latent=z_text_latent,
             aux=aux,
         )
+
+def toggle_club_grad(disen: DisentanglementBottleneck, flag: bool):
+    set_requires_grad(disen.club_ts, flag)
+    set_requires_grad(disen.club_tp, flag)
+    set_requires_grad(disen.club_ps, flag)
