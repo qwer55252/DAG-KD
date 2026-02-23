@@ -803,3 +803,45 @@ def head_manifest(src_path: str, dst_path: str, n_lines: int) -> str:
             if wrote >= n_lines:
                 break
     return dst_path, wrote
+
+def ensure_BCT(self, x, C_expected=None):
+    # x: (B,T,C) or (B,C,T) -> (B,C,T)
+    if x.dim() != 3:
+        raise ValueError("expected 3D")
+    if C_expected is not None:
+        if x.size(1) == C_expected:      # (B,C,T)
+            return x
+        if x.size(2) == C_expected:      # (B,T,C)
+            return x.transpose(1, 2)
+    # 기대 채널을 모르겠으면 마지막 축이 채널일 가능성이 높다고 가정
+    # (NeMo encoder output은 보통 마지막이 C)
+    return x.transpose(1, 2) if x.size(1) > x.size(2) else x
+
+def make_pad_mask(lengths: torch.Tensor, T: int) -> torch.Tensor:
+    """
+    lengths: (B,) int
+    return: (B, T) bool
+    """
+    device = lengths.device
+    ar = torch.arange(T, device=device)[None, :]
+    return ar < lengths[:, None]
+
+
+def masked_l1(pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor, eps=1e-8) -> torch.Tensor:
+    """
+    pred,tgt: (B,T) or (B,C,T)
+    mask:     (B,T) or (B,1,T)
+    """
+    loss = (pred - tgt).abs()
+    loss = loss * mask
+    denom = mask.sum().clamp_min(eps)
+    return loss.sum() / denom
+
+
+def masked_mse(pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor, eps=1e-8) -> torch.Tensor:
+    loss = (pred - tgt) ** 2
+    loss = loss * mask
+    denom = mask.sum().clamp_min(eps)
+    return loss.sum() / denom
+
+

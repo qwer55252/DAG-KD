@@ -7,16 +7,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import nemo.collections.asr as nemo_asr
+import torchaudio.functional as F_audio
 from typing import Optional, Dict
-
-class GradReverseFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, lambda_):
-        ctx.lambda_ = lambda_
-        return x.view_as(x)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.lambda_ * grad_output, None
+from utils import (ensure_BCT, make_pad_mask, masked_l1, masked_mse)
 
 class DiffKDModule(nn.Module):
     """간단한 Linear AE + 1D CNN denoiser 버전"""
@@ -173,6 +166,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.num_spk = getattr(cfg, "num_spk", 0)
         if self.num_spk > 1:
             # TDNN-like speaker backbone: (B, latent_dim, T) -> (B, latent_dim, T)
+            # TODO: spk_backbone 사이즈가 너무 큰게 아닌지?
             self.spk_backbone = nn.Sequential(
                 nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1, bias=False),
                 nn.GroupNorm(8, self.latent_dim),
@@ -204,12 +198,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # Reconstruction loss weight
         self.rec_txt_lambda = getattr(cfg, "rec_txt_lambda", 1.0)
         self.rec_spk_lambda = getattr(cfg, "rec_spk_lambda", 1.0)
+        self.rec_pros_lambda = getattr(cfg, "rec_pros_lambda", 1.0)
 
         # ===== Prosody (GST) =====
         n_mels = getattr(getattr(cfg, "preprocessor", type("x", (object,), {})()), "features", 80)
-        self.use_prosody = True
         self.pros_ref = GlobalProsodyReferenceEncoder(
-            n_mels=n_mels, channels=(32, 32, 64, 64, 128, 128), gru_dim=96
+            n_mels=n_mels, channels=(32, 64, 128), gru_dim=96
         )
         self.pros_gst = GlobalStyleTokenLayer(
             num_tokens=getattr(cfg, "disen_gst_tokens", 10),
@@ -218,18 +212,31 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             ref_dim=getattr(cfg, "disen_ref_dim", 96),
         )
         self.pros_proj = nn.Linear(getattr(cfg, "disen_gst_token_dim", 96), self.latent_dim)
-
+        
+        # ===== Prosody Supervision Heads =====
+        # 1. Mel Reconstruction Decoder (pros_emb -> mel_spectrogram)
+        # 매우 가벼운 구조 (파라미터 수 최소화)
+        self.mel_dec = nn.Sequential(
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(self.latent_dim, n_mels, kernel_size=1)
+        )
+        
+        # 2. Physical Quantity Predictor (F0, energy, voicing, duration)
+        # 4개의 물리량을 예측하는 가벼운 컨볼루션 헤드
+        self.prosody_predictor = nn.Sequential(
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, self.latent_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(self.latent_dim, 3, kernel_size=1) 
+        )
+        
         # ===== MI 추정기 (vCLUB) =====
         self.mi_weight = getattr(cfg, "disen_mi_weight", 1.0)        # λ_MI
         self.mi_pairs = getattr(cfg, "disen_mi_pairs", "ts,tp,ps")   # 사용 쌍
-
-        self.club_zs = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
-        self.club_zp = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
-        self.club_ps = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
-        
-        # ===== MI 추정기 (AR-vCLUB) =====
-        self.club_ts = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 96))
-        self.club_tp = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 96))
+        self.club_tp = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
+        self.club_ts = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 128))
+        self.club_ps = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 128))
 
         # LLL 가중치 (논문 식(7)에서 IvCLUB + LLL 같이 들어감)
         self.lll_weight = getattr(cfg, "disen_lll_weight", 1.0)
@@ -291,32 +298,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             self.txt_probe_backbone = None
             self.txt_spk_probe_cls = None        
-        
-        # === Student speaker adversary (GRL) ===
-        self.use_stu_spk_adv = bool(getattr(cfg, "use_stu_spk_adv", True))
-        self.stu_spk_adv_lambda_max = float(getattr(cfg, "stu_spk_adv_lambda_max", 0.1))
-        self.stu_spk_adv_warmup_steps = int(getattr(cfg, "stu_spk_adv_warmup_steps", 2000))
-
-        # 상위 레이어만 쓰고 싶으면 hook 기반으로 layer index 사용 (옵션)
-        self.stu_adv_layers = getattr(cfg, "stu_adv_layers", None)  # 예: [15,16] (1-based)
-
-        if self.num_spk > 1 and self.use_stu_spk_adv:
-            # 가벼운 head 권장 (너무 세면 CTC 망가짐)
-            self.stu_spk_adv_backbone = nn.Sequential(
-                nn.Conv1d(self.dim_s, self.dim_s, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm1d(self.dim_s),
-                nn.ReLU(inplace=True),
-            )
-            hidden = int(getattr(cfg, "stu_spk_adv_hidden", self.dim_s))
-            self.stu_spk_adv_cls = nn.Sequential(
-                nn.Linear(self.dim_s * 2, hidden),
-                nn.ReLU(inplace=True),
-                nn.Dropout(p=float(getattr(cfg, "stu_spk_adv_dropout", 0.2))),
-                nn.Linear(hidden, self.num_spk),
-            )
-        else:
-            self.stu_spk_adv_backbone = None
-            self.stu_spk_adv_cls = None
     
         train_manifest = self.cfg.train_ds.manifest_filepath
         self._load_manifest_speakers(train_manifest)
@@ -324,7 +305,370 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_list_for_disent = self._prepare_layer_indices(getattr(cfg, "layer_list_for_disent", [4,8,12,16]), L, default_low=True)  # 1-based index
         self.neg_K = int(getattr(cfg, "neg_K", 8))
 
-    # ------ Feature hooks ------
+    def forward(
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+    ):
+        # ------ Forward (Student path) ------
+        # hook buffer 초기화
+        self.stu_feats.clear()
+        # teacher hook은 _run_teacher에서 초기화
+
+        has_input = input_signal is not None and input_signal_length is not None
+        has_proc = processed_signal is not None and processed_signal_length is not None
+        if (has_input ^ has_proc) is False:
+            raise ValueError("Provide either raw input or processed input, not both.")
+
+        if not has_proc:
+            processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=input_signal, length=input_signal_length
+            )
+
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(
+                input_spec=processed_signal, length=processed_signal_length
+            )
+
+        # Student encode
+        s_enc, s_len = self.encoder(
+            audio_signal=processed_signal, length=processed_signal_length
+        )  # (B, T, C_s)
+        logp = self.decoder(encoder_output=s_enc)
+        greedy = logp.argmax(-1)
+
+        # 캐시
+        self._last_mel = processed_signal          # (B, n_mels, T)
+        self._last_enc = s_enc                     # (B, T, C_s)
+
+        return logp, s_len, greedy
+
+    def training_step(self, batch, batch_idx):
+        """
+        그림과 맞게 학습 순서:
+        1) Student forward
+        2) Teacher forward (_run_teacher)
+        3) Text/Speaker/Prosody factorization + MI, Rec, Speaker CE
+        4) Generative KD(FM/DF) : Student last vs Teacher Text feature
+        5) CTC, Logit KD 등 합산
+        """
+        # NeMo ASR default batch: (signal, signal_len, transcript, transcript_len)
+        if len(batch) == 5:
+            signal, sig_len, y, ylen, sample_ids = batch
+            sample_ids = sample_ids.long()
+            
+            # sample_id -> speaker_id lookup
+            speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
+        elif len(batch) == 4:
+            signal, sig_len, y, ylen = batch
+            speaker_ids = None
+        else:
+            raise ValueError(f"Unexpected batch length: {len(batch)}")
+        
+        if speaker_ids is not None:
+            assert speaker_ids.min().item() >= -1
+            assert speaker_ids.max().item() < self.num_spk
+        
+        # 1) Student forward
+        logp, enc_len, _ = self.forward(
+            input_signal=signal, input_signal_length=sig_len
+        )
+
+        # 2) Teacher forward (한 번만)
+        self._run_teacher(signal, sig_len)
+
+        total = torch.tensor(0.0, device=logp.device)
+        
+        # 3) Factorization embeddings + MI/Rec/Speaker CE
+        if self.use_disent:
+            phys_targets = self._get_phys_targets(signal, self._last_mel)   # self._last_mel 은 forward에서 캐싱해둔 (B, n_mels, T)
+            embs = self._make_embeddings(speaker_ids, phys_targets=phys_targets)
+            
+            # MI term
+            mi_upper, lll = self._mi_loss(txt_emb=embs["txt_emb"], pros_emb=embs["pros_emb"], spk_stat=embs["spk_stat"])
+            mi_upper = torch.clamp(mi_upper, min=0.0)
+            self.log("train/mi_upper", mi_upper, on_epoch=True)
+            self.log("train/lll", lll, on_epoch=True)
+            total = total + self.mi_weight * mi_upper + self.lll_weight * lll
+
+            # Reconstruction loss
+            rec_txt = embs["rec_txt"]
+            rec_spk = embs["rec_spk"]
+            rec_pros = embs["rec_pros"]
+            self.log("train/rec_txt", rec_txt, on_epoch=True)
+            self.log("train/rec_spk", rec_spk, on_epoch=True)
+            self.log("train/rec_pros", rec_pros, on_epoch=True)
+            total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk + self.rec_pros_lambda * rec_pros
+
+            # Speaker CE & ACC
+            spk_ce = embs["spk_ce"]
+            spk_acc = embs.get("spk_acc", None)
+
+            if spk_ce is not None and torch.is_tensor(spk_ce):
+                self.log("train/spk_ce", spk_ce, on_step=False, on_epoch=True)
+                total = total + self.disen_spk_ce_lambda * spk_ce
+
+            if spk_acc is not None and torch.is_tensor(spk_acc):
+                self.log("train/spk_acc", spk_acc, on_epoch=True)
+        else:
+            self._txt_emb = None
+
+        # 4) Generative KD (FM / DF)
+        if self.use_flow or self.use_diffkd:
+            if self._txt_emb is None or not self.use_flow or not self.use_diffkd or self._last_enc is None:
+                flow_loss = torch.tensor(0.0, device=self.device)
+                diff_loss = torch.tensor(0.0, device=self.device)
+            else: 
+                stu_feat = ensure_BCT(self._last_enc, C_expected=self.dim_s)
+                tch_feat = ensure_BCT(self._txt_emb.detach(), C_expected=self.latent_dim)
+                flow_loss = self.flow(stu_feat, tch_feat)
+                diff_loss = self.diffkd(stu_feat, tch_feat)
+            self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
+            self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
+            total = total + flow_loss + diff_loss
+
+        # 5) CTC
+        if self.use_ctc:
+            ctc = self._ctc_loss(logp, enc_len, y, ylen)
+            self.log("train/ctc", ctc, on_step=False, on_epoch=True)
+            total = total + ctc
+
+        # 6) Logit KD
+        if self.use_logit_kd:
+            kd_logit = self._logit_kd(logp)
+            self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
+            total = total + self.kd_alpha * kd_logit
+
+        # 7) Layer-wise metric KD
+        if self.use_layer_kd:
+            kd_layer = self._layer_metric_kd()
+            self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
+            total = total + self.layer_kd_alpha * kd_layer
+
+        if self.use_disent and self.use_txt_spk_probe and (embs is not None):
+            probe_ce = embs.get("txt_probe_ce", None)
+            probe_acc = embs.get("txt_probe_acc", None)
+
+            if probe_ce is not None:
+                self.log("probe/txt_spk_ce", probe_ce, on_step=False, on_epoch=True)
+                total = total + self.txt_probe_lambda * probe_ce
+
+            if probe_acc is not None:
+                self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
+        
+        self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
+        return total
+        
+    def _make_embeddings(self, speaker_ids, phys_targets=None):
+        """
+        ===== Teacher Text/Speaker/Prosody embedding 생성 =====
+        반환: dict(
+          txt_emb   = text embedding (B, E),
+          spk_emb   = speaker embedding (B, E),
+          pros_emb  = prosody embedding (B, E),
+          spk_ce    = speaker CE loss,
+          rec_txt   = text rec loss,
+          rec_spk   = speaker rec loss,
+        )
+        """
+        if self._tch_last is None:
+            return None
+
+        B, C_t, T_t = self._tch_last.shape
+        last = self._tch_last                       # X_L^T  (B, C_t, T)
+        
+        # layer 리스트 기반 speaker/text representation 추출
+        spk_rep, txt_rep = self._get_spk_txt_reps_from_layers()
+        if spk_rep is None or txt_rep is None:
+            # hook이 비어 있는 이상한 상황이면 그냥 last로 fallback
+            spk_rep = last
+            txt_rep = last
+
+        # ----- Text Encoder -----
+        txt_emb = self.txt_enc(txt_rep)     # (B, 196, T) -> (B, 96, T)
+        txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, 196, T)
+        rec_txt = F.mse_loss(txt_rec, txt_rep)
+        
+        # === text speaker probe ===
+        txt_probe_ce, txt_probe_acc = self._text_spk_probe(txt_emb, speaker_ids)
+
+        # Generative KD용 Text feature 캐시 (B, C_t, T)
+        self._txt_emb = txt_emb
+
+        # ----- Speaker Encoder -----
+        spk_emb = self.spk_enc(spk_rep)     # (B, 196, T) -> (B, 96, T)
+        spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
+        rec_spk = F.mse_loss(spk_rec, spk_rep)         # Speaker Encoder도 X_L^T를 재구성하도록 학습 (그림의 Rec loss)
+
+        # ====== Speaker static (B,96) 만들기 ======
+        # backbone 통과 후 stats pooling 추천
+        # TODO: backbone이 아니라 그냥 바로 spk_emb에서 스피커 예측하도록 하는게 좋을 듯?
+        spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb  # (B,96,T)
+        spk_mean = spk_feat.mean(dim=-1)   # (B,96)
+        spk_std  = self.safe_std(spk_feat, dim=-1)    # (B,96)
+        spk_stat = torch.cat([spk_mean, spk_std], dim=-1)  # (B,192) # TODO: 이게 맞아? 이게 필요할까? MI를 왜 이걸로? 어차피 static인데 
+        spk_stat = self.spk_stat_proj(spk_stat)            # (B,96)
+        
+        # ----- Prosody (frame-level GST) -----
+        # TODO: utterance-level prosody를 다루지 않을거임. frame-wise한 prosody embedding을 만들고, text embedding과 MI 측정할 예정
+        T = txt_emb.size(-1)
+        
+        mel = self._last_mel.to(self.device) # (B, n_mels, T_mel)
+        ref_seq = self.pros_ref(mel, return_seq=True) # (B, T', gru_dim)                # 1. Frame-level Reference Sequence (return_seq=True)
+        style_seq = self.pros_gst(ref_seq) # (B, T', token_dim)                         # 2. Frame-level Style Tokens
+        pros_emb = self.pros_proj(style_seq).transpose(1, 2)                            # 3. Projection & Transpose -> (B, latent_dim, T')
+        pros_emb = F.interpolate(pros_emb, size=T, mode='linear', align_corners=False)  # 4. Target 시간 축(T_target)에 맞게 보간(Interpolate)
+        
+        pros_stat = pros_emb.mean(dim=-1)  # (B, 96) pros_stat for MI (utterance-level)
+
+        # ===== Prosody Positive Supervision =====
+        # 1. Mel Reconstruction Loss
+        mel_target = self._last_mel # (B, n_mels=80, T_mel)
+        mel_pred = self.mel_dec(pros_emb)
+        mel_rec_loss = F.mse_loss(mel_pred, mel_target)
+
+        # 2. Physical Quantity Loss
+        phys_loss = torch.tensor(0.0, device=self.device)
+        if phys_targets is not None:
+            phys_pred = self.prosody_predictor(pros_emb)    # pros_emb에서 직접 (B, 3, T) 형태의 물리량 측정
+            phys_loss = F.mse_loss(phys_pred, phys_targets.to(phys_pred.device))
+
+        # 총 Prosody Reconstruction Loss 합산
+        rec_pros = mel_rec_loss + phys_loss
+
+        # ----- Speaker CE & ACC -----
+        spk_ce = torch.tensor(0.0, device=txt_emb.device)
+        spk_acc = None
+        if self.spk_cls is not None:
+            valid_mask = (speaker_ids is not None) & (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+            if valid_mask.any():
+                # spk_emb: (B, latent_dim, T)
+
+                # (1) TDNN-style backbone 통과
+                if self.spk_backbone is not None:
+                    spk_feat = self.spk_backbone(spk_emb)      # (B, latent_dim, T)
+                else:
+                    spk_feat = spk_emb
+
+                # (2) stats pooling: mean + std → utterance-level embedding
+                spk_mean = spk_feat.mean(dim=-1)              # (B, latent_dim)
+                spk_std  = self.safe_std(spk_feat, dim=-1)               # (B, latent_dim)
+                spk_utt  = torch.cat([spk_mean, spk_std], dim=-1)  # (B, 2*latent_dim)
+
+                spk_utt_valid = spk_utt[valid_mask]           # (B_valid, 2*latent_dim)
+                target_valid = speaker_ids[valid_mask]
+                target_valid = target_valid.clamp(min=0).long()   # ★ int64 로 변환 ★
+                
+                # (선택) 디버그용 안전 체크
+                if torch.any(target_valid < 0) or torch.any(target_valid >= self.num_spk):
+                    raise RuntimeError(
+                        f"[BUG] speaker_ids out of range: "
+                        f"min={int(target_valid.min())}, max={int(target_valid.max())}, "
+                        f"num_spk={self.num_spk}"
+                    )
+                
+                # (3) classifier: (B_valid, num_spk)
+                logits_utt = self.spk_cls(spk_utt_valid)      # (B_valid, num_spk)
+
+                # (4) CE loss
+                spk_ce = F.cross_entropy(logits_utt, target_valid)
+
+                # (5) accuracy (전체 배치 기준)
+                all_logits = self.spk_cls(spk_utt)            # (B, num_spk)
+                preds = all_logits.argmax(dim=-1)             # (B,) long
+                spk_acc = (preds[valid_mask] == target_valid).float().mean()
+        
+        # XAI: 시각화
+        if self.vis_enable:
+            self._xai_visualize(
+                txt_emb=txt_emb.detach(),
+                spk_emb=spk_emb.detach(),
+                pros_emb=pros_emb.detach(),
+                txt_rep=txt_rep.detach(),
+                spk_rep=spk_rep.detach(),
+                rec_txt=rec_txt.detach(),
+                rec_spk=rec_spk.detach(),
+            )
+        
+        return {
+            "txt_emb": txt_emb,         # (B,96,T)
+            "spk_emb": spk_emb,         # (B,96)
+            "pros_emb": pros_emb,       # (B,96,T)
+
+            "spk_stat": spk_stat,       # (B,96) static (MI용)
+            "pros_stat": pros_stat,     # (B,96) static (MI용)
+
+            "spk_ce": spk_ce,
+            "spk_acc": spk_acc,
+            
+            "rec_txt": rec_txt,
+            "rec_spk": rec_spk,
+            "rec_pros": rec_pros,
+            
+            "txt_probe_ce": txt_probe_ce,
+            "txt_probe_acc": txt_probe_acc,
+            
+            "pros_stat": pros_stat,     # (B,96) static (MI용)
+            
+        }
+    
+    def _mi_loss(self, txt_emb, pros_emb, spk_stat):
+        """
+        return:
+        mi_upper_avg: 평균 MI upper (식 4 추정치)
+        lll_avg: 평균 LLL (식 5)
+        """
+        txt = txt_emb       # (B,96,T) dynamic
+        pros = pros_emb     # (B,96,T) dynamic
+        spk = spk_stat      # (B,96) static
+
+        pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
+
+        lll_sum = torch.tensor(0.0, device=self.device) # LLL: CLUB(q) 네트워크 학습용 (u,v는 detach)
+        mi_sum  = torch.tensor(0.0, device=self.device) # MI upper: 표현(txt,spk)이 덜 얽히게 만드는 loss
+            # 이때 CLUB 파라미터는 고정하고(gradient 막고) txt/spk 쪽으로만 gradient 흐르게
+        
+        if "tp" in pairs: # dynamic-dynamic pair ClubGaussian
+            lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach())
+            self._freeze_params(self.club_tp, True)
+            mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros)
+            self._freeze_params(self.club_tp, False)
+        
+        if "ts" in pairs: # dynamic-static pair ARClubGaussian
+            lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach())
+            self._freeze_params(self.club_ts, True)
+            mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk)
+            self._freeze_params(self.club_ts, False)
+        
+        if "ps" in pairs: # dynamic-static pair ARClubGaussian
+            lll_sum = lll_sum + self.club_ps.ll_loss(pros.detach(), spk.detach())
+            self._freeze_params(self.club_ps, True)
+            mi_sum = mi_sum + self.club_ps.mi_upper(pros, spk)
+            self._freeze_params(self.club_ps, False)
+
+        mi_sum  = mi_sum / len(pairs)
+        lll_sum = lll_sum / len(pairs)
+
+        return mi_sum, lll_sum
+
+    def _run_teacher(self, signal, sig_len):
+        """그림 기준 왼쪽 Teacher Encoder + Decoder 한 번만 실행."""
+        self.tch_feats.clear()
+        with torch.no_grad():
+            t_proc, t_len = self.teacher.preprocessor(
+                input_signal=signal, length=sig_len
+            )
+            t_enc, t_enc_len = self.teacher.encoder(
+                audio_signal=t_proc, length=t_len
+            )  # (B, T, C_t)
+            self.t_enc_len = t_enc_len
+            t_logp = self.teacher.decoder(encoder_output=t_enc)
+        # 캐시
+        self._tch_logp = t_logp
+        self._tch_last = self._to_BCT(t_enc)       # (B, C_t, T)
+
     def _to_BCT(self, x: torch.Tensor) -> torch.Tensor:
         if isinstance(x, (tuple, list)):
             x = x[0]
@@ -399,64 +743,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         txt_rep = txt_stack.mean(dim=0)  # (B,176,T)
         return spk_rep, txt_rep
     
-    # ------ Forward (Student path) ------
-    def forward(
-        self,
-        input_signal=None,
-        input_signal_length=None,
-        processed_signal=None,
-        processed_signal_length=None,
-    ):
-        # hook buffer 초기화
-        self.stu_feats.clear()
-        # teacher hook은 _run_teacher에서 초기화
-
-        has_input = input_signal is not None and input_signal_length is not None
-        has_proc = processed_signal is not None and processed_signal_length is not None
-        if (has_input ^ has_proc) is False:
-            raise ValueError("Provide either raw input or processed input, not both.")
-
-        if not has_proc:
-            processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal, length=input_signal_length
-            )
-
-        if self.spec_augmentation is not None and self.training:
-            processed_signal = self.spec_augmentation(
-                input_spec=processed_signal, length=processed_signal_length
-            )
-
-        # Student encode
-        s_enc, s_len = self.encoder(
-            audio_signal=processed_signal, length=processed_signal_length
-        )  # (B, T, C_s)
-        logp = self.decoder(encoder_output=s_enc)
-        greedy = logp.argmax(-1)
-
-        # 캐시
-        self._last_mel = processed_signal          # (B, n_mels, T)
-        self._last_enc = s_enc                     # (B, T, C_s)
-
-        return logp, s_len, greedy
-
-    # ------ Teacher one-pass (encoder + decoder) ------
-    def _run_teacher(self, signal, sig_len):
-        """그림 기준 왼쪽 Teacher Encoder + Decoder 한 번만 실행."""
-        self.tch_feats.clear()
-        with torch.no_grad():
-            t_proc, t_len = self.teacher.preprocessor(
-                input_signal=signal, length=sig_len
-            )
-            t_enc, t_enc_len = self.teacher.encoder(
-                audio_signal=t_proc, length=t_len
-            )  # (B, T, C_t)
-            self.t_enc_len = t_enc_len
-            t_logp = self.teacher.decoder(encoder_output=t_enc)
-        # 캐시
-        self._tch_logp = t_logp
-        self._tch_last = self._to_BCT(t_enc)       # (B, C_t, T)
-
-    # ------ Loss helpers ------
     def _ctc_loss(self, logp, enc_len, y, ylen):
         return self.loss(
             log_probs=logp,
@@ -491,7 +777,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
     def _generative_kd(self):
         """
-        그림 기준:
         - Student 마지막 레이어 feature (encoder 출력)
         - Teacher Text Encoder로 얻은 Text feature
         사이에 Flow Matching / DiffKD 적용.
@@ -507,10 +792,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # Student last: (B, T, C_s) -> (B, C_s, T)
         s_raw = self._last_enc
-        s = self._ensure_BCT(s_raw, C_expected=self.dim_s)   # (B,C_s,T)
+        s = ensure_BCT(s_raw, C_expected=self.dim_s)   # (B,C_s,T)
         # Teacher text feature: (B, C_t, T)
         t_raw = self._txt_emb.detach()
-        t = self._ensure_BCT(t_raw, C_expected=self.latent_dim)  # (B,96,T) or (B,dim_t,T) depending on what you store
+        t = ensure_BCT(t_raw, C_expected=self.latent_dim)  # (B,96,T) or (B,dim_t,T) depending on what you store
 
         flow_loss = torch.tensor(0.0, device=self.device)
         diff_loss = torch.tensor(0.0, device=self.device)
@@ -520,567 +805,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             diff_loss = self.diffkd(s, t)
         
         return flow_loss, diff_loss
-
-    # ===== Teacher Text/Speaker/Prosody embedding 생성 =====
-    def _make_embeddings(self, speaker_ids):
-        """
-        반환: dict(
-          txt_emb   = text embedding (B, E),
-          spk_emb   = speaker embedding (B, E),
-          pros_emb  = prosody embedding (B, E),
-          spk_ce    = speaker CE loss,
-          rec_txt   = text rec loss,
-          rec_spk   = speaker rec loss,
-        )
-        """
-        if self._tch_last is None:
-            return None
-
-        B, C_t, T_t = self._tch_last.shape
-        last = self._tch_last                       # X_L^T  (B, C_t, T)
-        
-        # layer 리스트 기반 speaker/text representation 추출
-        spk_rep, txt_rep = self._get_spk_txt_reps_from_layers()
-        if spk_rep is None or txt_rep is None:
-            # hook이 비어 있는 이상한 상황이면 그냥 last로 fallback
-            spk_rep = last
-            txt_rep = last
-
-        # ----- Text Encoder -----
-        txt_emb = self.txt_enc(txt_rep)     # (B, 196, T) -> (B, 96, T)
-        txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, 196, T)
-        rec_txt = F.mse_loss(txt_rec, txt_rep)
-        
-        # === text speaker probe ===
-        txt_probe_ce, txt_probe_acc = self._text_spk_probe(txt_emb, speaker_ids)
-
-        # Generative KD용 Text feature 캐시 (B, C_t, T)
-        self._txt_emb = txt_emb
-
-        # ----- Speaker Encoder -----
-        spk_emb = self.spk_enc(spk_rep)     # (B, 196, T) -> (B, 96, T)
-        spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
-        rec_spk = F.mse_loss(spk_rec, spk_rep)         # Speaker Encoder도 X_L^T를 재구성하도록 학습 (그림의 Rec loss)
-
-        # ====== Speaker static (B,96) 만들기 ======
-        # backbone 통과 후 stats pooling 추천
-        spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb  # (B,96,T)
-        spk_mean = spk_feat.mean(dim=-1)   # (B,96)
-        spk_std  = self.safe_std(spk_feat, dim=-1)    # (B,96)
-        spk_stat = torch.cat([spk_mean, spk_std], dim=-1)  # (B,192) # TODO: 이게 맞아? 
-        spk_stat = self.spk_stat_proj(spk_stat)            # (B,96)
-        
-        # ----- Prosody (GST) -----
-        T = txt_emb.size(-1)
-        if self.use_prosody and (self._last_mel is not None):   # (B, mel_dim=80, T)
-            # utterance-level의 style로 구현한 상태
-            # 1) 멜에서 글로벌 ref 추출: (B, 96)
-            ref = self.pros_ref(self._last_mel)          # (B, ref_dim=96)
-            # 2) GST로 스타일 토큰 조합: (B, token_dim=96)
-            p_raw = self.pros_gst(ref)                   # (B, token_dim=96)
-            # 3) latent_dim으로 proj: (B, 96)
-            pros_stat = self.pros_proj(p_raw)            # (B, latent_dim=96) <-- 이게 진짜 static
-            # 4) frame-wise로 broadcast: (B,96,T)
-            pros_emb = pros_stat.unsqueeze(-1).expand(-1, -1, T)
-
-        else:
-            pros_stat = torch.zeros((txt_emb.size(0), self.latent_dim), device=txt_emb.device)
-            pros_emb = torch.zeros_like(txt_emb) # (B, 96, T)
-
-        # ----- Speaker CE & ACC -----
-        spk_ce = torch.tensor(0.0, device=txt_emb.device)
-        spk_acc = None
-        if self.spk_cls is not None:
-            valid_mask = (speaker_ids is not None) & (speaker_ids >= 0) & (speaker_ids < self.num_spk)
-            if valid_mask.any():
-                # spk_emb: (B, latent_dim, T)
-
-                # (1) TDNN-style backbone 통과
-                if self.spk_backbone is not None:
-                    spk_feat = self.spk_backbone(spk_emb)      # (B, latent_dim, T)
-                else:
-                    spk_feat = spk_emb
-
-                # (2) stats pooling: mean + std → utterance-level embedding
-                spk_mean = spk_feat.mean(dim=-1)              # (B, latent_dim)
-                spk_std  = self.safe_std(spk_feat, dim=-1)               # (B, latent_dim)
-                spk_utt  = torch.cat([spk_mean, spk_std], dim=-1)  # (B, 2*latent_dim)
-
-                spk_utt_valid = spk_utt[valid_mask]           # (B_valid, 2*latent_dim)
-                target_valid = speaker_ids[valid_mask]
-                target_valid = target_valid.clamp(min=0).long()   # ★ int64 로 변환 ★
-                
-                # (선택) 디버그용 안전 체크
-                if torch.any(target_valid < 0) or torch.any(target_valid >= self.num_spk):
-                    raise RuntimeError(
-                        f"[BUG] speaker_ids out of range: "
-                        f"min={int(target_valid.min())}, max={int(target_valid.max())}, "
-                        f"num_spk={self.num_spk}"
-                    )
-                
-                # (3) classifier: (B_valid, num_spk)
-                logits_utt = self.spk_cls(spk_utt_valid)      # (B_valid, num_spk)
-
-                # (4) CE loss
-                spk_ce = F.cross_entropy(logits_utt, target_valid)
-
-                # (5) accuracy (전체 배치 기준)
-                all_logits = self.spk_cls(spk_utt)            # (B, num_spk)
-                preds = all_logits.argmax(dim=-1)             # (B,) long
-                spk_acc = (preds[valid_mask] == target_valid).float().mean()
-        
-        # XAI: 시각화
-        if self.vis_enable:
-            self._xai_visualize(
-                txt_emb=txt_emb.detach(),
-                spk_emb=spk_emb.detach(),
-                pros_emb=pros_emb.detach(),
-                txt_rep=txt_rep.detach(),
-                spk_rep=spk_rep.detach(),
-                rec_txt=rec_txt.detach(),
-                rec_spk=rec_spk.detach(),
-            )
-        
-        return {
-            "txt_emb": txt_emb,         # (B,96,T) dynamic
-            "spk_emb": spk_emb,         # (B,96,T) 기존 유지(CE/XAI용)
-            "pros_emb": pros_emb,       # (B,96,T) 기존 유지(XAI용)
-
-            "spk_stat": spk_stat,       # (B,96) static (MI용)
-            "pros_stat": pros_stat,     # (B,96) static (MI용)
-
-            "spk_ce": spk_ce,
-            "spk_acc": spk_acc,
-            "rec_txt": rec_txt,
-            "rec_spk": rec_spk,
-            "txt_probe_ce": txt_probe_ce,
-            "txt_probe_acc": txt_probe_acc,
-        }
-    '''
-    def _mi_loss(self, embs):
-        """
-        vCLUB 상한 합: I(z;s)+I(z;p)+I(p;s)
-        """
-        if embs is None:
-            return torch.tensor(0.0, device=self.device)
-        txt_emb, spk_emb, pros_emb = embs["txt_emb"], embs["spk_emb"], embs["pros_emb"]
-        pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
-        mi = torch.tensor(0.0, device=txt_emb.device)
-        cnt = 0
-
-        if "ts" in pairs:
-            mi = mi + self.club_zs.mi_upper(u=txt_emb, v=spk_emb); cnt += 1
-        if "tp" in pairs:
-            mi = mi + self.club_zp.mi_upper(u=txt_emb, v=pros_emb); cnt += 1
-        if "ps" in pairs:
-            mi = mi + self.club_ps.mi_upper(u=pros_emb, v=spk_emb); cnt += 1
-
-        if cnt > 0:
-            mi = mi / cnt
-        return mi
-    '''
     
-    def _mi_loss(self, embs):
-        """
-        return:
-        mi_upper_avg: 평균 MI upper (식 4 추정치)
-        lll_avg: 평균 LLL (식 5)
-        """
-        if embs is None:
-            z = torch.tensor(0.0, device=self.device)
-            return z, z
-
-        txt = embs["txt_emb"]        # (B,96,T) dynamic
-        spk = embs["spk_stat"]       # (B,96)   static
-        pros = embs["pros_stat"]     # (B,96)   static
-
-        pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
-
-        mi_sum  = torch.tensor(0.0, device=txt.device)
-        lll_sum = torch.tensor(0.0, device=txt.device)
-        cnt = 0
-
-        # --- ts: I(txt_{1:T} ; spk_static) ---
-        if "ts" in pairs:
-            # (5) LLL: CLUB(q) 네트워크 학습용 (u,v는 detach)
-            lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach())
-
-            # (4) MI upper: 표현(txt,spk)이 덜 얽히게 만드는 loss
-            # 이때 CLUB 파라미터는 고정하고(gradient 막고) txt/spk 쪽으로만 gradient 흐르게
-            self._freeze_params(self.club_ts, True)
-            mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk)
-            self._freeze_params(self.club_ts, False)
-
-            cnt += 1
-
-        # --- tp: I(txt_{1:T} ; pros_static) ---
-        if "tp" in pairs:
-            lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach())
-
-            self._freeze_params(self.club_tp, True)
-            mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros)
-            self._freeze_params(self.club_tp, False)
-
-            cnt += 1
-
-        if cnt > 0:
-            mi_sum  = mi_sum / cnt
-            lll_sum = lll_sum / cnt
-
-        return mi_sum, lll_sum
-
-    def training_step(self, batch, batch_idx):
-        """
-        그림과 맞게 학습 순서:
-        1) Student forward
-        2) Teacher forward (_run_teacher)
-        3) Text/Speaker/Prosody factorization + MI, Rec, Speaker CE
-        4) Generative KD(FM/DF) : Student last vs Teacher Text feature
-        5) CTC, Logit KD 등 합산
-        """
-        # NeMo ASR default batch: (signal, signal_len, transcript, transcript_len)
-        if len(batch) == 5:
-            signal, sig_len, y, ylen, sample_ids = batch
-            sample_ids = sample_ids.long()
-            
-            # sample_id -> speaker_id lookup
-            speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
-        elif len(batch) == 4:
-            signal, sig_len, y, ylen = batch
-            speaker_ids = None
-        else:
-            raise ValueError(f"Unexpected batch length: {len(batch)}")
-        
-        if speaker_ids is not None:
-            assert speaker_ids.min().item() >= -1
-            assert speaker_ids.max().item() < self.num_spk
-        
-        # 1) Student forward
-        logp, enc_len, _ = self.forward(
-            input_signal=signal, input_signal_length=sig_len
-        )
-
-        # 2) Teacher forward (한 번만)
-        self._run_teacher(signal, sig_len)
-
-        total = torch.tensor(0.0, device=logp.device)
-        
-        # (추가) Student speaker adversary
-        if self.use_stu_spk_adv and (self.num_spk > 1):
-            adv_ce_total = torch.tensor(0.0, device=logp.device)
-            adv_acc_total = torch.tensor(0.0, device=logp.device)
-            for stu_feat in self.stu_feats:
-                adv_ce, adv_acc = self._student_spk_adv_loss(stu_feat, speaker_ids)    
-                adv_acc_total += adv_acc
-                adv_ce_total += adv_ce            
-            adv_acc_mean = adv_acc_total / len(self.stu_feats)
-            adv_ce_mean = adv_ce_total / len(self.stu_feats)
-            if adv_ce_mean is not None:
-                self.log("adv/stu_spk_ce_mean", adv_ce_mean, on_step=False, on_epoch=True)
-                self.log("adv/stu_spk_acc_mean", adv_acc_mean, on_step=False, on_epoch=True)
-                self.log("adv/grl_lambda", torch.tensor(self._grl_lambda(), device=logp.device),
-                        on_step=False, on_epoch=True)
-
-                # GRL이 이미 lam을 적용하므로 보통은 그냥 더함
-                # 필요하면 cfg로 loss_weight 따로 두고 작게(예: 0.1) 곱해라
-                total = total + adv_ce_mean
-
-        # 3) Factorization embeddings + MI/Rec/Speaker CE
-        if self.use_disent:
-            embs = self._make_embeddings(speaker_ids)              # {'txt_emb','spk_emb','pros_emb','spk_ce','rec_*'}
-            # MI term
-            mi_upper, lll = self._mi_loss(embs)
-            mi_upper = torch.clamp(mi_upper, min=0.0)
-            self.log("train/mi_upper", mi_upper, on_epoch=True)
-            self.log("train/lll", lll, on_epoch=True)
-            total = total + self.mi_weight * mi_upper + self.lll_weight * lll
-
-
-            # Reconstruction loss
-            rec_txt = embs["rec_txt"]
-            rec_spk = embs["rec_spk"]
-            self.log("train/rec_txt", rec_txt, on_epoch=True)
-            self.log("train/rec_spk", rec_spk, on_epoch=True)
-            total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
-
-            # Speaker CE & ACC
-            spk_ce = embs["spk_ce"]
-            spk_acc = embs.get("spk_acc", None)
-
-            if spk_ce is not None and torch.is_tensor(spk_ce):
-                self.log("train/spk_ce", spk_ce, on_step=False, on_epoch=True)
-                total = total + self.disen_spk_ce_lambda * spk_ce
-
-            if spk_acc is not None and torch.is_tensor(spk_acc):
-                self.log("train/spk_acc", spk_acc, on_epoch=True)
-        elif self.use_layerwise_disent:
-            step = int(getattr(self, "global_step", 0))
-            warmup = int(getattr(self.cfg, "mi_warmup_steps", 5000))
-            ramp   = int(getattr(self.cfg, "mi_ramp_steps", 20000))
-
-            mi_lambda_max  = float(getattr(self.cfg, "mi_lambda_max", 0.01))
-            lll_lambda_max = float(getattr(self.cfg, "lll_lambda_max", 0.01))
-
-            # ---- 핵심: warmup에서는 CLUB(LLL)만 학습, MI penalty는 0 ----
-            if step < warmup:
-                est_only = True
-                mi_lambda  = 0.0
-                # warmup 동안 estimator를 실제로 학습시켜야 하므로 0이 되면 안 됨
-                # 보통은 1.0 권장(또는 lll_lambda_max를 그대로 사용해도 됨)
-                lll_lambda = 1.0
-                r_post = 0.0
-            else:
-                est_only = False
-                # warmup 이후에만 ramp: 0 -> 1
-                if ramp <= 0:
-                    r_post = 1.0
-                else:
-                    r_post = min(1.0, max(0.0, (step - warmup) / float(ramp)))
-
-                mi_lambda = mi_lambda_max * r_post
-                # LLL은 계속 estimator를 붙잡아주려면 "상수"로 두는 게 보통 더 안정적
-                lll_lambda = lll_lambda_max   # 또는 lll_lambda_max * r_post (원하면)
-
-            layer_embs = self._make_layerwise_embeddings_all(speaker_ids, self.layer_list_for_disent)
-            mi_upper, lll = self._mi_loss_layerwise_all(layer_embs)
-
-            self.log("sched/mi_lambda", torch.tensor(mi_lambda, device=self.device), on_step=False, on_epoch=True)
-            self.log("sched/lll_lambda", torch.tensor(lll_lambda, device=self.device), on_step=False, on_epoch=True)
-            self.log("sched/estimator_only", torch.tensor(float(est_only), device=self.device), on_step=False, on_epoch=True)
-            self.log("sched/r_post", torch.tensor(float(r_post), device=self.device), on_step=False, on_epoch=True)
-
-            self.log("train/mi_upper", mi_upper, on_step=False, on_epoch=True)
-            self.log("train/lll", lll, on_step=False, on_epoch=True)
-
-            # warmup: LLL만
-            if est_only:
-                total = total + lll_lambda * lll
-            else:
-                total = total + mi_lambda * mi_upper + lll_lambda * lll
-
-            # rec: all-layer 평균
-            rec_txt = sum(d["rec_txt"] for d in layer_embs) / len(layer_embs)
-            rec_spk = sum(d["rec_spk"] for d in layer_embs) / len(layer_embs)
-            self.log("train/rec_txt", rec_txt, on_step=False, on_epoch=True)
-            self.log("train/rec_spk", rec_spk, on_step=False, on_epoch=True)
-            total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk
-
-            # spk_ce: all-layer 평균
-            if self.spk_cls is not None:
-                spk_ce = sum(d["spk_ce"] for d in layer_embs) / len(layer_embs)
-                total = total + self.disen_spk_ce_lambda * spk_ce
-                self.log("train/spk_ce", spk_ce, on_step=False, on_epoch=True)
-
-                accs = [d["spk_acc"] for d in layer_embs if d["spk_acc"] is not None]
-                if len(accs) > 0:
-                    spk_acc = sum(accs) / len(accs)
-                    self.log("train/spk_acc", spk_acc, on_step=False, on_epoch=True)
-        else:
-            self._txt_emb = None
-
-        
-        # 4) Generative KD (FM / DF)
-        if self.use_flow or self.use_diffkd:
-            flow_loss, diff_loss = self._generative_kd()
-            self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
-            self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
-            total = total + flow_loss + diff_loss
-        elif self.use_layerwise_flow or self.use_layerwise_diffkd:
-            layer_embs = self._make_layerwise_embeddings_all(speaker_ids, self.layer_list_for_disent)
-            flow_loss, diff_loss = self._generative_kd_layerwise(layer_embs, self.layer_list_for_disent)
-            self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
-            self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
-            total = total + flow_loss + diff_loss
-
-        # 5) CTC
-        if self.use_ctc:
-            ctc = self._ctc_loss(logp, enc_len, y, ylen)
-            self.log("train/ctc", ctc, on_step=False, on_epoch=True)
-            total = total + ctc
-
-        # 6) Logit KD
-        if self.use_logit_kd:
-            kd_logit = self._logit_kd(logp)
-            self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
-            total = total + self.kd_alpha * kd_logit
-
-        # 7) Layer-wise metric KD
-        if self.use_layer_kd:
-            kd_layer = self._layer_metric_kd()
-            self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
-            total = total + self.layer_kd_alpha * kd_layer
-
-        if self.use_disent and self.use_txt_spk_probe and (embs is not None):
-            probe_ce = embs.get("txt_probe_ce", None)
-            probe_acc = embs.get("txt_probe_acc", None)
-
-            if probe_ce is not None:
-                self.log("probe/txt_spk_ce", probe_ce, on_step=False, on_epoch=True)
-                total = total + self.txt_probe_lambda * probe_ce
-
-            if probe_acc is not None:
-                self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
-        
-        self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
-        return total
-        
-    def _compute_prosody_stat(self, device):
-        # (B,96) static prosody
-        if self.use_prosody and (self._last_mel is not None):
-            ref = self.pros_ref(self._last_mel)      # (B,96)
-            p_raw = self.pros_gst(ref)               # (B,96)
-            pros_stat = self.pros_proj(p_raw)        # (B,96)
-        else:
-            B = self._last_enc.size(0) if self._last_enc is not None else 1
-            pros_stat = torch.zeros((B, self.latent_dim), device=device)
-        return pros_stat
-
-    def _make_layerwise_embeddings_all(self, speaker_ids, layer_list):
-        """
-        return: layer_embs: List[dict] for ALL teacher layers
-        each dict has:
-            txt_emb (B,96,T), spk_emb (B,96,T), spk_stat (B,96),
-            rec_txt, rec_spk,
-            spk_ce(optional), spk_acc(optional),
-        plus:
-            pros_stat (B,96) shared
-        """
-        if (not self.tch_feats) or (self._tch_last is None):
-            return None
-
-        pros_stat = self._compute_prosody_stat(device=self.device)  # (B,96)
-
-        layer_embs = []
-        for layer_idx in layer_list:
-            feat = self.tch_feats[layer_idx]   # (B,Ct,T)
-            # txt
-            txt_emb = self.txt_enc(feat)      # (B,96,T)
-            txt_rec = self.txt_dec(txt_emb)   # (B,Ct,T)
-            rec_txt = F.mse_loss(txt_rec, feat)
-
-            # spk
-            spk_emb = self.spk_enc(feat)      # (B,96,T)
-            spk_rec = self.spk_dec(spk_emb)   # (B,Ct,T)
-            rec_spk = F.mse_loss(spk_rec, feat)
-
-            # spk_stat (B,96)
-            spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb
-            spk_mean = spk_feat.mean(dim=-1)
-            spk_std  = self.safe_std(spk_feat, dim=-1)
-            spk_stat = self.spk_stat_proj(torch.cat([spk_mean, spk_std], dim=-1))
-
-            # (옵션) speaker CE를 레이어마다 걸고 싶으면:
-            spk_ce = torch.tensor(0.0, device=self.device)
-            spk_acc = None
-            if (self.spk_cls is not None) and (speaker_ids is not None):
-                valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
-                if valid_mask.any():
-                    target = speaker_ids.clamp(min=0).long()
-                    logits = self.spk_cls(torch.cat([spk_mean, spk_std], dim=-1))  # (B,num_spk)
-                    spk_ce = F.cross_entropy(logits[valid_mask], target[valid_mask])
-                    preds = logits.argmax(dim=-1)
-                    spk_acc = (preds[valid_mask] == target[valid_mask]).float().mean()
-
-            layer_embs.append({
-                "txt_emb": txt_emb,
-                "spk_emb": spk_emb,
-                "spk_stat": spk_stat,
-                "pros_stat": pros_stat,
-                "rec_txt": rec_txt,
-                "rec_spk": rec_spk,
-                "spk_ce": spk_ce,
-                "spk_acc": spk_acc,
-            })
-
-        # generative KD 타겟으로 쓸 teacher txt feature도 “전 레이어 동일 적용”이면
-        # 여기선 그냥 top layer txt_emb(마지막)로 두거나 평균으로 두면 됨.
-        self._txt_emb = layer_embs[-1]["txt_emb"]   # 단순/명확
-        # 또는 평균: self._txt_emb = sum(d["txt_emb"] for d in layer_embs) / len(layer_embs)
-
-        return layer_embs
-    
-    def _mi_loss_layerwise_all(self, layer_embs):
-        """
-        return:
-        mi_upper_avg, lll_avg, ps_mi_avg
-        """
-        if layer_embs is None:
-            z = torch.tensor(0.0, device=self.device)
-            return z, z, z
-
-        pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
-
-        mi_sum  = torch.tensor(0.0, device=self.device)
-        lll_sum = torch.tensor(0.0, device=self.device)
-
-        L = len(layer_embs)
-        eps = 1e-8
-
-        for layer_emb in layer_embs:
-            txt  = layer_emb["txt_emb"]     # (B,96,T)
-            spk  = layer_emb["spk_stat"]    # (B,96)
-            pros = layer_emb["pros_stat"]   # (B,96)
-
-            T = txt.size(-1)
-            mask = (torch.arange(T, device=txt.device)[None, :] < self.t_enc_len[:, None]).float()  # (B,T)
-            
-            # ts
-            if "ts" in pairs:
-                # estimator training term
-                lll_sum = lll_sum + self.club_ts.ll_loss(txt.detach(), spk.detach(), reduce_time="mean", mask=mask)
-                # representation disentangle term (freeze estimator params)
-                self._freeze_params(self.club_ts, True)
-                mi_sum = mi_sum + self.club_ts.mi_upper(txt, spk, K=self.neg_K, reduce_time="mean", mask=mask)
-                self._freeze_params(self.club_ts, False)
-
-            # tp
-            if "tp" in pairs:
-                lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach(), reduce_time="mean", mask=mask)
-
-                self._freeze_params(self.club_tp, True)
-                mi_sum = mi_sum + self.club_tp.mi_upper(txt, pros, K=self.neg_K, reduce_time="mean", mask=mask)
-                self._freeze_params(self.club_tp, False)
-
-        # 레이어 평균
-        mi_avg  = mi_sum  / (L + eps)
-        lll_avg = lll_sum / (L + eps)
-        return mi_avg, lll_avg
-
-    def _generative_kd_layerwise(self, layer_embs, layer_list):
-        """
-        모든 레이어에 대해 generative KD 적용:
-        student layer feat (self.stu_feats[i])  <->  teacher txt_emb from same layer (layer_embs[i]["txt_emb"])
-        return: (flow_loss_avg, diff_loss_avg)
-        """
-
-        if (layer_embs is None) or (not self.stu_feats):
-            z = torch.tensor(0.0, device=self.device)
-            return z, z
-
-        L = min(len(layer_list), len(layer_embs))
-        if L <= 0:
-            z = torch.tensor(0.0, device=self.device)
-            return z, z
-
-        flow_sum = torch.tensor(0.0, device=self.device)
-        diff_sum = torch.tensor(0.0, device=self.device)
-        
-        # layer_list = [4,8,12,16]
-        for idx, layer_emb in zip(layer_list, layer_embs):
-            s_feat = self.stu_feats[idx]                             # (B,Cs,T)
-            s_feat = self._ensure_BCT(s_feat, C_expected=self.dim_s)      # (B,Cs,T)
-            t_txt  = layer_emb["txt_emb"].detach()                       # (B,96,T)
-            t_txt  = self._ensure_BCT(t_txt, C_expected=self.latent_dim) # (B,96,T)
-            if self.use_layerwise_flow and (self.flow is not None):
-                flow_sum = flow_sum + self.flow(s_feat, t_txt)
-
-            if self.use_layerwise_diffkd and (self.diffkd is not None):
-                diff_sum = diff_sum + self.diffkd(s_feat, t_txt)
-
-        flow_avg = flow_sum / float(L)
-        diff_avg = diff_sum / float(L)
-        return flow_avg, diff_avg
-
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         if len(batch) == 4:
             signal, sig_len, y, ylen = batch
@@ -1274,19 +999,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         for p in module.parameters():
             p.requires_grad = (not freeze)
     
-    def _ensure_BCT(self, x, C_expected=None):
-        # x: (B,T,C) or (B,C,T) -> (B,C,T)
-        if x.dim() != 3:
-            raise ValueError("expected 3D")
-        if C_expected is not None:
-            if x.size(1) == C_expected:      # (B,C,T)
-                return x
-            if x.size(2) == C_expected:      # (B,T,C)
-                return x.transpose(1, 2)
-        # 기대 채널을 모르겠으면 마지막 축이 채널일 가능성이 높다고 가정
-        # (NeMo encoder output은 보통 마지막이 C)
-        return x.transpose(1, 2) if x.size(1) > x.size(2) else x
-    
     def _grl_lambda(self):
         # 0 -> lambda_max 선형 warmup
         if self.stu_spk_adv_warmup_steps <= 0:
@@ -1302,7 +1014,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         - stu_adv_layers가 있으면 hook된 self.stu_feats에서 layer 평균 사용
         """
         # 기본: last output
-        rep = self._ensure_BCT(s_enc, C_expected=self.dim_s)  # (B,C,T)
+        rep = ensure_BCT(s_enc, C_expected=self.dim_s)  # (B,C,T)
 
         if self.stu_adv_layers is None:
             return rep
@@ -1316,42 +1028,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         rep = stack.mean(dim=0)  # (B,C,T)
         return rep
 
-    def _student_spk_adv_loss(self, stu_feat, speaker_ids):
-        if (self.stu_spk_adv_cls is None) or (speaker_ids is None):
-            return None, None
-
-        valid_mask = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
-        if not valid_mask.any():
-            return None, None
-
-        lam = self._grl_lambda()
-        
-        stu_feat = self._ensure_BCT(stu_feat, C_expected=self.dim_s)  # (B,C,T)
-    
-
-        # GRL 적용: speaker CE가 student rep를 "speaker 못맞추게" 업데이트하도록
-        rep_grl = GradReverseFn.apply(stu_feat, lam)
-        if self.stu_spk_adv_backbone is not None:
-            rep_grl = self.stu_spk_adv_backbone(rep_grl)  # (B,C,T)
-
-        mean = rep_grl.mean(dim=-1)  # (B,C)
-        std  = self.safe_std(rep_grl, dim=-1)   # (B,C)
-        utt  = torch.cat([mean, std], dim=-1)  # (B,2C)
-
-        logits = self.stu_spk_adv_cls(utt)  # (B,num_spk)
-        target = speaker_ids.clamp(min=0).long()
-
-        ce = F.cross_entropy(logits[valid_mask], target[valid_mask])
-        preds = logits.argmax(dim=-1)
-        acc = (preds[valid_mask] == target[valid_mask]).float().mean()
-        return ce, acc
-
     def _load_manifest_speakers(self, manifest_path: str):
         spk = []
         with open(manifest_path, "r", encoding="utf-8") as f:
             for line in f:
                 obj = json.loads(line)
-                spk.append(int(obj.get("speaker", -1)))
+                spk.append(int(obj.get("spk_idx", -1)))
         # (N,) 텐서로 들고 있기
         self.manifest_speakers = torch.tensor(spk, dtype=torch.long)  # CPU에 둬도 OK
 
@@ -1370,7 +1052,50 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         x = (step - warmup) / float(ramp)
         return float(min(1.0, max(0.0, x)))
 
-    
+    def _get_phys_targets(self, signal, mel):
+        """
+        오디오 신호와 Mel 스펙트로그램에서 F0, Voicing, Energy를 실시간 추출합니다.
+        반환 형태: (B, 3, T_mel)
+        """
+        B, n_mels, T_mel = mel.shape
+        device = mel.device
+        
+        # 1. Energy 추출: Mel 스펙트로그램의 프레임별 평균(또는 L2 Norm) 사용
+        # mel은 보통 log-mel 이므로 exp를 취해 원래 에너지 스케일로 근사
+        energy = mel.exp().mean(dim=1)  # (B, T_mel)
+        
+        # 2. F0 & Voicing 추출: torchaudio의 kaldi_pitch 사용
+        # 파라미터는 사용하는 preprocessor(보통 16kHz, 25ms 윈도우, 10ms hop)에 맞춰야 함
+        # 주의: compute_kaldi_pitch는 버전에 따라 CPU 텐서만 지원할 수 있으므로 안전하게 이동
+        signal_cpu = signal.detach().cpu()
+        
+        # kaldi_pitch 반환 차원: (B, T_pitch, 2) -> [NCCF(Voicing 확률), Pitch(F0)]
+        pitch_features = F_audio.compute_kaldi_pitch(
+            signal_cpu, 
+            sample_rate=16000, # 사용하는 sr로 맞춰주세요 (예: 16000)
+            frame_shift=10.0,
+            frame_length=25.0
+        ).to(device)
+        
+        voicing = pitch_features[..., 0]  # (B, T_pitch)
+        f0 = pitch_features[..., 1]       # (B, T_pitch)
+        
+        # 3. 차원 병합: (B, 3, T_pitch)
+        phys_targets = torch.stack([f0, energy, voicing], dim=1) # (B, 3, T_pitch)
+        
+        # 4. Mel 프레임 길이(T_mel)와 미세하게 다를 수 있으므로 길이를 맞춰줌(Interpolation)
+        if phys_targets.size(-1) != T_mel:
+            phys_targets = torch.nn.functional.interpolate(
+                phys_targets, size=T_mel, mode='linear', align_corners=False
+            )
+            
+        # 5. (선택 사항) 정규화: F0와 Energy 스케일이 너무 크면 MSE Loss가 튈 수 있으므로 Z-score 정규화 추천
+        # 여기서는 배치 내 프레임 축(dim=-1)을 기준으로 간단히 정규화
+        mean = phys_targets.mean(dim=-1, keepdim=True)
+        std = phys_targets.std(dim=-1, keepdim=True) + 1e-5
+        phys_targets = (phys_targets - mean) / std
+
+        return phys_targets.detach() # 타깃이므로 gradient 흐름 차단
 
 class GlobalStyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):
@@ -1379,50 +1104,68 @@ class GlobalStyleTokenLayer(nn.Module):
         self.token_dim = token_dim
         self.num_heads = num_heads
 
-        # 스타일 토큰 뱅크 (N_tokens, D)
         self.tokens = nn.Parameter(torch.randn(num_tokens, token_dim))
-
-        # ref_emb (B, ref_dim) → query
         self.query_proj = nn.Linear(ref_dim, token_dim, bias=False)
-        # tokens (N, token_dim) → key
         self.key_proj   = nn.Linear(token_dim, token_dim, bias=False)
-
-        # head별 스칼라 점수 v_h
         self.v = nn.Linear(token_dim, num_heads, bias=False)
 
-        # XAI용: 마지막 attention 저장 (B, N_tokens, H)
+        # XAI: (B, N, H) - time-mean attention (기존 호환)
         self.last_attn = None
+        # XAI/debug: (B, T', N, H) - frame-level attention
+        self.last_attn_seq = None
 
-    def forward(self, ref_emb):  # ref_emb: (B, ref_dim=96)
-        # 1) query / key 생성
-        q = torch.tanh(self.query_proj(ref_emb))      # (B, token_dim)
-        k = torch.tanh(self.key_proj(self.tokens))    # (N, token_dim)
+    def forward(self, ref_emb):
+        """
+        ref_emb:
+          - (B, ref_dim)          : global query 1개 → (B, token_dim)
+          - (B, T', ref_dim)      : frame-level queries → (B, T', token_dim)
+        """
+        k = torch.tanh(self.key_proj(self.tokens))  # (N, D)
+        N, D = k.size()
 
-        B, D = q.size()
-        N = k.size(0)
+        if ref_emb.dim() == 2:
+            # ----- 기존 global GST -----
+            q = torch.tanh(self.query_proj(ref_emb))          # (B, D)
+            B = q.size(0)
 
-        # 2) additive attention (global, time 축 없음)
-        # (B,1,D) + (1,N,D) → (B,N,D)
-        q_exp = q.unsqueeze(1).expand(B, N, D)
-        k_exp = k.unsqueeze(0).expand(B, N, D)
-        s = torch.tanh(q_exp + k_exp)                 # (B,N,D)
+            q_exp = q.unsqueeze(1).expand(B, N, D)            # (B, N, D)
+            k_exp = k.unsqueeze(0).expand(B, N, D)            # (B, N, D)
+            s = torch.tanh(q_exp + k_exp)                     # (B, N, D)
 
-        # (B,N,D) → (B,N,H)
-        logits = self.v(s)                            # (B, N, H)
-        attn = torch.softmax(logits, dim=1)           # (B, N, H)
+            logits = self.v(s)                                # (B, N, H)
+            attn = torch.softmax(logits, dim=1)               # (B, N, H)
 
-        # XAI: token×head attention 저장
-        self.last_attn = attn.detach().cpu()          # (B,N,H)
+            self.last_attn = attn.detach().cpu()
+            self.last_attn_seq = None
 
-        # 3) 토큰 가중합 → head-wise 스타일 벡터
-        # tokens: (N,D), attn: (B,N,H)
-        style = torch.einsum("bnh,nd->bdh", attn, self.tokens)  # (B,D,H)
-        style = style.mean(dim=-1)  # head 평균 → (B,D=token_dim)
+            style = torch.einsum("bnh,nd->bdh", attn, self.tokens)  # (B, D, H)
+            style = style.mean(dim=-1)                               # (B, D)
+            return style
 
-        return style  # (B, token_dim)
+        if ref_emb.dim() == 3:
+            # ----- frame-level GST -----
+            # ref_emb: (B, T', ref_dim)
+            q = torch.tanh(self.query_proj(ref_emb))          # (B, T', D)
+            B, Tp, _ = q.size()
+
+            # (B, T', 1, D) + (1, 1, N, D) -> (B, T', N, D)
+            s = torch.tanh(q[:, :, None, :] + k[None, None, :, :])   # (B, T', N, D)
+
+            logits = self.v(s)                                # (B, T', N, H)
+            attn = torch.softmax(logits, dim=2)               # softmax over tokens N
+
+            # 저장: frame-level & time-mean
+            self.last_attn_seq = attn.detach().cpu()          # (B, T', N, H)
+            self.last_attn = attn.mean(dim=1).detach().cpu()  # (B, N, H)  (기존 호환)
+
+            style = torch.einsum("btnh,nd->btdh", attn, self.tokens) # (B, T', D, H)
+            style = style.mean(dim=-1)                                # (B, T', D)
+            return style
+
+        raise ValueError(f"ref_emb must be 2D or 3D, got {ref_emb.dim()}D")
 
 class GlobalProsodyReferenceEncoder(nn.Module):
-    def __init__(self, n_mels=80, channels=(32,32,64,64,128,128), gru_dim=96):
+    def __init__(self, n_mels=80, channels=(32,64,128), gru_dim=96):
         super().__init__()
         self.n_mels = n_mels
         self.channels = channels
@@ -1432,54 +1175,47 @@ class GlobalProsodyReferenceEncoder(nn.Module):
         in_ch = 1
         for out_ch in channels:
             convs += [
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True),
             ]
             in_ch = out_ch
         self.conv = nn.Sequential(*convs)
 
-        # n_mels 방향 축소량 계산 (stride=2, k=3, pad=1 기준) → F'
-        def shrink(L, k=3, s=2, p=1, n=self.K):
-            for _ in range(n):
-                L = (L - k + 2*p)//s + 1
-            return L
-        self.mels_after = shrink(n_mels)  # F'
-
-        # GRU는 (time', C*F')를 입력받아서 마지막 hidden을 스타일 ref로 사용
         self.gru = nn.GRU(
-            input_size=channels[-1] * self.mels_after,  # C * F'
-            hidden_size=gru_dim,                        # ref_dim = 96
+            input_size=channels[-1] * self.n_mels,
+            hidden_size=gru_dim,
             batch_first=True
         )
 
-        # XAI용: 마지막 글로벌 ref 벡터 저장 (B, gru_dim)
-        self.last_out = None
+        # XAI
+        self.last_out = None   # (B, gru_dim)
+        self.last_seq = None   # (B, gru_dim, T')
 
-    def forward(self, mel):  # mel: (B, n_mels, T)
+    def forward(self, mel, return_seq: bool = False):
         """
-        출력: ref_emb (B, gru_dim=96)
-        - T는 conv+GRU 안에서 요약되고, time 축은 사라짐 (글로벌 prosody)
+        mel: (B, n_mels, T)
+        return:
+          - return_seq=False: global ref (B, gru_dim)
+          - return_seq=True : frame-level ref seq (B, T', gru_dim)
         """
         B, n_mels, T = mel.shape
 
-        # 1) 2D conv: time × freq → downsample된 time' × freq'
         x = mel.transpose(1, 2).unsqueeze(1)      # (B,1,T,n_mels)
         z = self.conv(x)                          # (B,C,T',F')
         B, C, Tp, Fp = z.shape
 
-        # 2) (B,T',C*F')로 reshape 해서 GRU 인풋으로 사용
         z = z.permute(0, 2, 1, 3).contiguous()    # (B,T',C,F')
         z = z.view(B, Tp, C * Fp)                 # (B,T',C*F')
 
-        # 3) GRU 마지막 hidden을 ref로 사용 (global prosody)
-        _, h = self.gru(z)                        # h: (1,B,gru_dim)
-        ref_emb = h[-1]                           # (B,gru_dim=96)
+        out_seq, h = self.gru(z)                  # out_seq: (B,T',gru_dim), h: (1,B,gru_dim)
+        ref_global = h[-1]                        # (B,gru_dim)
 
         # XAI 저장
-        self.last_out = ref_emb.detach().cpu()
+        self.last_out = ref_global.detach().cpu()
+        self.last_seq = out_seq.transpose(1, 2).detach().cpu()   # (B,gru_dim,T')
 
-        return ref_emb                            # (B,96)
+        return out_seq if return_seq else ref_global
 
 class ClubGaussian(nn.Module):
     """
@@ -1507,6 +1243,10 @@ class ClubGaussian(nn.Module):
         ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
         return ll.mean(dim=-1)  # (B, T, latent_dim=96)
 
+    def ll_loss(self, u, v, reduce_time="mean", mask=None):
+        # LLL = - E[log q(u|v)]
+        return -self.log_q(u, v, reduce_time=reduce_time, mask=mask).mean()
+    
     def mi_upper(self, u, v):
         # positive
         log_q_pos = self.log_q(u, v).mean()
@@ -1528,7 +1268,7 @@ class ARClubGaussian(nn.Module):
     LLL (식 5):
       LLL = - E_{p(u,v)}[log q(u|v)]
     """
-    def __init__(self, u_dim=96, v_dim=96, hidden=256):
+    def __init__(self, u_dim=96, v_dim=96, hidden=128):
         super().__init__()
         self.v_to_h0 = nn.Sequential(
             nn.Linear(v_dim, hidden),
@@ -1625,73 +1365,3 @@ class ARClubGaussian(nn.Module):
 
         return pos - neg
 
-'''
-class ClubGaussian(nn.Module): # 지금 스피커에서 텍스트 뽑고 있음.... # v: speaker, u: text
-    """
-    I(U;V) ≤ E_{p(u,v)}[ log q(u|v) ] - E_{p(u)p(v)}[ log q(u|v) ]
-    q(u|v) = N(u | mu(v), diag(sigma^2(v)))
-    """
-    def __init__(self, u_dim=96, v_dim=96, hidden=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(v_dim, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
-        )
-        self.mu = nn.Linear(hidden, u_dim) # <- 가우시안으로 두면 이거 필요없이 mean 취하면 됨.
-        self.logvar = nn.Linear(hidden, u_dim)
-
-    def log_q(self, u, v): # 텍스트에서 스피커를 뽑아내는게 더 자연스러움
-        # u,v shape: (B, latent_dim=96, T)
-        v = v.transpose(1, 2)
-        u = u.transpose(1, 2)
-        # u: (B,Du), v:(B,Dv)  → log N(u|μ(v), Σ(v))
-        h = self.net(v) # <- 이런식으로 과거 정보도 넣어줘야 함
-        mu = self.mu(h) # <- 이거 필요 없이 mean 취한게...
-        logvar = self.logvar(h).clamp(min=-8.0, max=8.0) #<- 이것도 직접 측정해야지 왜 네트워크 씀
-        # 로그우도(대각가우시안)
-        ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
-        return ll.sum(dim=-1)  # (B, T, latent_dim=96)
-
-    def mi_upper(self, u, v):
-        # positive
-        log_q_pos = self.log_q(u, v).mean()
-        # negative with shuffled v
-        v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
-        log_q_neg = self.log_q(u, v_shuffle).mean()
-        return (log_q_pos - log_q_neg)
-
-
-class ClubMonteCarlo(nn.Module): # 지금 스피커에서 텍스트 뽑고 있음.... # v: speaker, u: text
-    """
-    I(U;V) ≤ E_{p(u,v)}[ log q(u|v) ] - E_{p(u)p(v)}[ log q(u|v) ]
-    q(u|v) = N(u | mu(v), diag(sigma^2(v)))
-    """
-    def __init__(self, u_dim=96, v_dim=96, hidden=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(v_dim, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
-        )
-        self.mu = nn.Linear(hidden, u_dim) # <- 가우시안으로 두면 이거 필요없이 mean 취하면 됨.
-        self.logvar = nn.Linear(hidden, u_dim)
-
-    def log_q(self, u, v): # 텍스트에서 스피커를 뽑아내는게 더 자연스러움
-        # u,v shape: (B, latent_dim=96, T)
-        v = v.transpose(1, 2)
-        u = u.transpose(1, 2)
-        # u: (B,Du), v:(B,Dv)  → log N(u|μ(v), Σ(v))
-        h = self.net(v, u[:t]) # <- 이런식으로 과거 정보도 넣어줘야 함
-        mu = self.mu(h) # <- 이거 필요 없이 mean 취한게...
-        logvar = self.logvar(h).clamp(min=-8.0, max=8.0) #<- 이것도 직접 측정해야지 왜 네트워크 씀
-        # 로그우도(대각가우시안)
-        ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
-        return ll.sum(dim=-1)  # (B, T, latent_dim=96)
-
-    def mi_upper(self, u, v):
-        # positive
-        log_q_pos = self.log_q(u, v).mean()
-        # negative with shuffled v
-        v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
-        log_q_neg = self.log_q(u, v_shuffle).mean()
-        return (log_q_pos - log_q_neg)
-'''    

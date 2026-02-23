@@ -35,9 +35,13 @@ from omegaconf import OmegaConf
 from nemo.collections import asr as nemo_asr
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
+from nemo.utils.app_state import AppState
 from datasets import load_dataset, DownloadConfig, config as hf_config
 
-from models import DistilDAGKDCTCModelBPE
+from models_ver2 import (
+    TeacherASRWithDisent,
+    StudentASRWithDisentKD
+)
 from utils import (
     scan_speakers, 
     build_manifest_from_hf_with_meta,
@@ -47,7 +51,10 @@ from utils import (
     compute_speaker_durations,
     int_list_arg,
     save_speaker_mapping,
-    save_mel_examples_from_manifest
+    save_mel_examples_from_manifest,
+    materialize_nemo_artifacts_in_cfg,
+    load_speaker_table_from_manifest,
+    rotate_last_ckpts,
 )
 
 def main():
@@ -105,19 +112,34 @@ def main():
     
     # text speaker probe
     p.add_argument("--use_txt_spk_probe", type=str2bool, default=True)
-    p.add_argument("--txt_probe_lambda", type=float, default=1.0)
-    p.add_argument("--txt_probe_lr", type=float, default=1e-3)
     
+    p.add_argument("--use_stu_spk_adv", type=str2bool, default=False)
+    p.add_argument("--stu_spk_adv_lambda_max", type=float, default=0.1)
+    p.add_argument("--stu_spk_adv_warmup_steps", type=int, default=2000)
+    
+    p.add_argument("--use_layerwise_disent", type=str2bool, default=False)
+    p.add_argument("--use_layerwise_flow", type=str2bool, default=False)
+    p.add_argument("--use_layerwise_diffkd", type=str2bool, default=False)
+    p.add_argument("--layer_list_for_disent", type=int_list_arg, default=[4,8,12,16])
     p.add_argument("--neg_K", type=int, default=8)
+    
     p.add_argument("--mi_warmup_steps", type=int, default=5000)      # CLUB만 학습하는 구간
     p.add_argument("--mi_ramp_steps", type=int, default=20000)       # penalty를 올리는 구간
     p.add_argument("--mi_lambda_max", type=float, default=0.01)      # 최종 MI 가중치
     p.add_argument("--lll_lambda_max", type=float, default=0.01)     # 최종 LLL 가중치 (원하면 분리)
     p.add_argument("--mi_clamp_min0", type=str2bool, default=True)   # mi_upper <0 클램프
 
+    p.add_argument("--teacher_ckpt_path", type=str, default="", help="학습된 teacher ckpt 경로(버전2)")
+    p.add_argument("--freeze_teacher_encdec", type=str2bool, default=False)
+    p.add_argument("--freeze_student_encdec", type=str2bool, default=False)
 
+    p.add_argument("--gen_kd_type", type=str, default="flow", choices=["mse", "flow", "diff"]) ### flow, diff 같이 사용할 수도 있어야 함
+    p.add_argument("--gen_kd_weight", type=float, default=1.0)
+    
     args = p.parse_args()
 
+    # -------------------- Stage 0: Load Dataset --------------------
+    print("\n===== Stage 0: Load Dataset =====")
     # Output & manifests
     os.makedirs(args.out, exist_ok=True)
     manifest_dir = os.path.join(args.data_dir, args.data_cfg, "manifests")
@@ -164,7 +186,7 @@ def main():
     print(f"[INFO] scanning speakers from train split...")
     spk2idx, idx2spk = scan_speakers(train_ds)
     num_spk = len(spk2idx)
-    print(f"[SCAN] num_speakers={num_spk}")
+    
     # id -> idx 매핑 파일 저장
     spk_map_path = os.path.join(manifest_dir, "speaker_id_mapping.json")
     if not os.path.isfile(spk_map_path):
@@ -213,7 +235,7 @@ def main():
         build_manifest_from_hf_with_meta(train_ds, test_mode_train_manifest, cache_dir, spk2idx)
         build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx)
         build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx)
-    
+    print(f"[SCAN] num_speakers={num_spk}")
     
     # W&B
     wandb = WandbLogger(project=args.wandb_project, name=args.wandb_run, save_dir=args.out)
@@ -229,19 +251,194 @@ def main():
         callbacks=[ckpt_cb],
     )
 
-    # Teacher
-    teacher = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+    # -------------------- Stage 1: Teacher training --------------------
+    print("\n===== Stage 1: Teacher training =====")
+    # 1) pretrained NeMo teacher (weights source)
+    # .nemo unpack (for safety with ASR DL construction)
+    nemo_teacher = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
         model_name=args.teacher_name,
         map_location="cuda:0" if torch.cuda.is_available() else "cpu",
         trainer=trainer,
     )
-    teacher.eval()
-    for p_ in teacher.parameters():
-        p_.requires_grad = False
+    release_nemoAPI(nemo_teacher, out_folder=os.path.join(args.out, "nemo_archive"))
+    
+    # 2) teacher_cfg는 nemo_teacher.cfg 복제 후 dataloader/옵션 주입
+    teacher_cfg = deepcopy(nemo_teacher.cfg)
+    archive_dir = os.path.abspath(os.path.join(args.out, "nemo_archive"))
+    teacher_cfg = materialize_nemo_artifacts_in_cfg(teacher_cfg, archive_dir)
 
-    # .nemo unpack (for safety with ASR DL construction)
-    release_nemoAPI(teacher, out_folder=os.path.join(args.out, "nemo_archive"))
+    OmegaConf.set_struct(teacher_cfg, False)
+    teacher_cfg.train_ds.is_tarred = False
+    teacher_cfg.train_ds.manifest_filepath = train_manifest if not args.test_mode else test_mode_train_manifest
+    teacher_cfg.train_ds.sample_rate = args.sample_rate
+    teacher_cfg.train_ds.batch_size = args.batch_size
+    teacher_cfg.validation_ds.is_tarred = False
+    teacher_cfg.validation_ds.manifest_filepath = dev_clean_manifest if not args.test_mode else test_mode_val_manifest
+    teacher_cfg.validation_ds.sample_rate = args.sample_rate
+    teacher_cfg.validation_ds.batch_size = args.batch_size
+    teacher_cfg.test_ds.is_tarred = False
+    teacher_cfg.test_ds.manifest_filepath = test_clean_manifest  if not args.test_mode else test_mode_test_manifest
+    teacher_cfg.test_ds.sample_rate = args.sample_rate
+    teacher_cfg.test_ds.batch_size = args.batch_size
+    teacher_cfg.train_ds.return_sample_id = True
+    teacher_cfg.validation_ds.return_sample_id = False
+    teacher_cfg.test_ds.return_sample_id = False
 
+    # disent cfg 주입
+    teacher_cfg.latent_dim = 96
+    teacher_cfg.num_spk = num_spk
+    teacher_cfg.disen_mi_pairs = args.disen_mi_pairs
+    teacher_cfg.use_txt_spk_probe = args.use_txt_spk_probe
+    teacher_cfg.txt_probe_lambda = args.txt_probe_lambda
+    teacher_cfg.mi_clamp_min0 = args.mi_clamp_min0
+
+    # 3) teacher는 DistilDAGKDCTCModelBPE로 선언
+    teacher = TeacherASRWithDisent(
+        cfg=teacher_cfg,
+        trainer=trainer,
+        disen_mi_weight=args.disen_mi_weight,
+        disen_lll_weight=args.disen_lll_weight,
+        freeze_pretrained_encoder=args.freeze_teacher_encdec,
+        freeze_pretrained_decoder=args.freeze_teacher_encdec,
+    )
+    release_nemoAPI(teacher, out_folder=os.path.join(args.out, "teacher_archive")) ### 이거 그냥 두면 된나?
+    
+    # 4) pretrained weights 로드 (encoder/decoder/ctc head 등)
+    missing, unexpected = teacher.load_from_pretrained_nemo(nemo_teacher, strict=False)
+    print("[Teacher init] missing keys:", len(missing), "unexpected keys:", len(unexpected))
+    
+    teacher_ckpt_dir = os.path.join(args.out, "checkpoints_teacher")
+    teacher_ckpt_cb = ModelCheckpoint(
+        dirpath=teacher_ckpt_dir,
+        filename="teacher-{epoch}-{step}",
+        save_last="link",   # last.ckpt를 최신 ckpt로 심볼릭 링크
+        save_top_k=-1,
+    )
+
+    teacher_trainer = pl.Trainer(
+        devices=args.gpus,
+        accelerator="gpu",
+        max_epochs=args.epochs,
+        default_root_dir=args.out,
+        logger=wandb,
+        callbacks=[teacher_ckpt_cb],
+    )    
+    
+    if args.train_teacher:
+        teacher_trainer.fit(teacher)
+        rotate_last_ckpts(teacher_ckpt_dir, keep=30)
+        teacher_ckpt_path = os.path.join(teacher_ckpt_dir, "last.ckpt")
+    else:
+        teacher_ckpt_path = args.teacher_ckpt_path
+        if not teacher_ckpt_path:
+            raise ValueError("train_teacher=False면 --teacher_ckpt_path를 줘야 합니다.")
+        
+    # -------------------- Stage 2: Teacher Evaluation --------------------
+    # if args.train_teacher:
+    #     print("\n===== Stage 2: Teacher Evaluation =====")
+    #     teacher_eval = teacher.eval()
+    #     for p_ in teacher_eval.parameters():
+    #         p_.requires_grad = False
+
+    #     # 평가할 split들 (manifest 존재하는 것만)
+    #     eval_targets = [
+    #         ("dev_clean",  dev_clean_manifest),
+    #         ("dev_other",  dev_other_manifest),
+    #         ("test_clean", test_clean_manifest),
+    #         ("test_other", test_other_manifest),
+    #     ]
+
+    #     for split_name, manifest in eval_targets:
+    #         if not os.path.isfile(manifest):
+    #             print(f"[WARN] manifest not found for {split_name}: {manifest}, skip")
+    #             continue
+
+    #         print(f"\n===== [Teacher] Evaluating on {split_name} =====")
+
+    #         # 1) Lightning test (loss / 평균 WER)
+    #         test_cfg = deepcopy(teacher_eval.cfg.test_ds)
+    #         OmegaConf.set_struct(test_cfg, False)
+    #         test_cfg.manifest_filepath = manifest
+    #         test_cfg.shuffle = False
+    #         test_cfg.batch_size = args.batch_size
+    #         # sample_id는 평가에 필요 없으니 꺼두는 게 안전
+    #         if hasattr(test_cfg, "return_sample_id"):
+    #             test_cfg.return_sample_id = False
+
+    #         teacher_eval.setup_test_data(test_cfg)
+    #         dl = teacher_eval.test_dataloader()
+
+    #         results = teacher_trainer.test(model=teacher_eval, dataloaders=[dl], verbose=True)
+    #         if results and isinstance(results, list):
+    #             res = results[0]
+    #             wer = res.get("test_wer", res.get("wer", None))
+    #             loss = res.get("test_loss", res.get("loss", None))
+    #             if loss is not None and wer is not None:
+    #                 print(f"→ [Teacher] {split_name}: loss={loss:.4f} | wer={wer:.2%}")
+    #                 key = f"teacher/{split_name}/wer".replace('.', '_')
+    #                 wandb.log_metrics({key: float(wer)}, step=teacher_trainer.current_epoch)
+
+    #         # 2) per-sample WER mean ± std + 분포 플롯 저장
+    #         with open(manifest, "r", encoding="utf-8") as f:
+    #             entries = [json.loads(line) for line in f]
+
+    #         audio_files = [e["audio_filepath"] for e in entries]
+    #         ref_texts   = [e["text"] for e in entries]
+
+    #         hyps = teacher_eval.transcribe(
+    #             audio=audio_files,
+    #             batch_size=args.batch_size,
+    #             return_hypotheses=False,
+    #             num_workers=0,
+    #             verbose=False,
+    #         )
+
+    #         sample_wers = compute_sample_wers(ref_texts, hyps)
+    #         sample_wers_pct = [w * 100.0 for w in sample_wers]
+
+    #         wer_mean = float(statistics.mean(sample_wers_pct)) if len(sample_wers_pct) > 0 else 0.0
+    #         wer_std  = float(statistics.stdev(sample_wers_pct)) if len(sample_wers_pct) > 1 else 0.0
+    #         print(f"→ [Teacher] {split_name}: per-sample WER = {wer_mean:.2f}% ± {wer_std:.2f}%")
+
+    #         # plots 저장: <out>/xai/wer_plots_teacher
+    #         plot_dir = os.path.join(args.out, "xai/wer_plots_teacher")
+    #         os.makedirs(plot_dir, exist_ok=True)
+
+    #         wers_np = np.array(sample_wers_pct, dtype=float)
+
+    #         # (1) 히스토그램
+    #         plt.figure()
+    #         bins = [0, 10, 20, 30, 50, 100, 200]
+    #         plt.hist(wers_np, bins=bins, edgecolor="black")
+    #         plt.xlabel("Per-sample WER (%)")
+    #         plt.ylabel("Count")
+    #         plt.title(f"[Teacher] WER Histogram - {split_name}\nmean={wer_mean:.2f}%, std={wer_std:.2f}%")
+    #         plt.tight_layout()
+    #         hist_path = os.path.join(plot_dir, f"teacher_wer_hist_{split_name}.png")
+    #         plt.savefig(hist_path)
+    #         plt.close()
+
+    #         # (2) Boxplot
+    #         plt.figure()
+    #         plt.boxplot(wers_np, vert=True, showfliers=True)
+    #         plt.ylabel("Per-sample WER (%)")
+    #         plt.title(f"[Teacher] WER Boxplot - {split_name}")
+    #         plt.tight_layout()
+    #         box_path = os.path.join(plot_dir, f"teacher_wer_box_{split_name}.png")
+    #         plt.savefig(box_path)
+    #         plt.close()
+
+    #         # W&B 로깅
+    #         wandb.log_metrics(
+    #             {
+    #                 f"teacher/{split_name}/wer_mean": wer_mean,
+    #                 f"teacher/{split_name}/wer_std": wer_std,
+    #             },
+    #             step=teacher_trainer.current_epoch,
+    #         )
+
+    # -------------------- Stage 3: Student training --------------------
+    print("\n===== Stage 3: Student training =====")
     # Student cfg: teacher cfg 복제 후 hidden/head 절반
     stu_cfg = deepcopy(teacher.cfg)
     stu_cfg.train_ds.is_tarred = False
@@ -295,65 +492,78 @@ def main():
     # text porbe 설정
     stu_cfg.use_txt_spk_probe = args.use_txt_spk_probe if hasattr(args, "use_txt_spk_probe") else True
     stu_cfg.txt_probe_lambda = args.txt_probe_lambda if hasattr(args, "txt_probe_lambda") else 1.0
-    stu_cfg.txt_probe_lr = args.txt_probe_lr if hasattr(args, "txt_probe_lr") else 1e-3
     
+    stu_cfg.use_stu_spk_adv = args.use_stu_spk_adv if hasattr(args, "use_stu_spk_adv") else True
+    stu_cfg.stu_spk_adv_lambda_max = args.stu_spk_adv_lambda_max if hasattr(args, "stu_spk_adv_lambda_max") else 0.1
+    stu_cfg.stu_spk_adv_warmup_steps = args.stu_spk_adv_warmup_steps if hasattr(args, "stu_spk_adv_warmup_steps") else 2000
+    stu_cfg.stu_spk_adv_hidden = 96
+    stu_cfg.stu_spk_adv_dropout = 0.2
+    stu_cfg.use_layerwise_disent = args.use_layerwise_disent
     stu_cfg.use_layerwise_flow = args.use_layerwise_flow  # flow/disdiffkd도 동일하게 맞춤
     stu_cfg.use_layerwise_diffkd = args.use_layerwise_diffkd
     stu_cfg.layer_list_for_disent = args.layer_list_for_disent  # 1-based index
-    
-    stu_cfg.neg_K = args.neg_K
+
     stu_cfg.mi_warmup_steps = args.mi_warmup_steps
     stu_cfg.mi_ramp_steps   = args.mi_ramp_steps
     stu_cfg.mi_lambda_max   = args.mi_lambda_max
     stu_cfg.lll_lambda_max  = args.lll_lambda_max
     stu_cfg.mi_clamp_min0   = args.mi_clamp_min0
-    stu_cfg.club_hidden = 128
-
-    model = DistilDAGKDCTCModelBPE(
+    
+    # teacher 로드 + freeze
+    teacher_cfg.num_spk = num_spk
+    teacher_loaded = TeacherASRWithDisent.load_from_checkpoint(
+        teacher_ckpt_path,
+        cfg=teacher_cfg,
+        disen_mi_weight=args.disen_mi_weight,
+        disen_lll_weight=args.disen_lll_weight,
+    )
+    teacher_loaded.eval()
+    for p_ in teacher_loaded.parameters():
+        p_.requires_grad = False
+    
+    student_model = StudentASRWithDisentKD(
         cfg=stu_cfg,
         trainer=trainer,
-        teacher_model=teacher,
-        use_ctc=args.use_ctc,
+        teacher=teacher_loaded,
         use_logit_kd=args.use_logit_kd,
         kd_alpha=args.kd_alpha,
         kd_temperature=args.kd_temperature,
-        use_layer_kd=args.use_layer_kd,
-        layer_kd_alpha=args.layer_kd_alpha,
-        use_flow=args.use_flow,
-        flow_steps=args.flow_steps,
-        flow_weight=args.flow_weight,
-        use_diffkd=args.use_diffkd,
-        diffkd_steps=args.diffkd_steps,
-        use_disent=args.use_disent,
-        disent_spk_layers=args.disent_spk_layers,
-        disent_txt_layers=args.disent_txt_layers,
+        use_gen_kd=True,
+        gen_kd_type=args.gen_kd_type,
+        gen_kd_weight=args.gen_kd_weight,
+        disen_mi_weight=args.disen_mi_weight,
+        disen_lll_weight=args.disen_lll_weight,
+        freeze_pretrained_encoder=args.freeze_student_encdec,
+        freeze_pretrained_decoder=args.freeze_student_encdec,
     )
     
     # ====== 멜 스펙트로그램 예시 저장 ======
     mel_dir = os.path.join(args.out, "xai/mel_examples")
     save_mel_examples_from_manifest(
         manifest_path=train_manifest,
-        model=model,
+        model=student_model,
         out_dir=mel_dir,
         num_examples=4,
         split_name="train",
     )
-
+    
     # 사용자 인자 처리
-    ckpt_path = args.resume_ckpt_path
-    # 편의상 --resume_from last 라고 주면 자동으로 last.ckpt 사용
+    student_ckpt_dir = os.path.join(args.out, "checkpoints_student")
+    student_ckpt_cb = ModelCheckpoint(dirpath=student_ckpt_dir, filename="student_last", save_top_k=0, save_last=True)
 
-    if ckpt_path and os.path.isfile(ckpt_path):
-        print(f"[INFO] Resuming training from checkpoint: {ckpt_path}")
-        trainer.fit(model, ckpt_path=ckpt_path)
-    else:
-        if ckpt_path:
-            print(f"[WARN] Checkpoint not found at {ckpt_path}, start training from scratch.")
-        else:
-            print("[INFO] No resume_from specified, start training from scratch.")
-        trainer.fit(model)
+    student_trainer = pl.Trainer(
+        devices=args.gpus,
+        accelerator="gpu",
+        max_epochs=args.epochs,
+        default_root_dir=args.out,
+        logger=wandb,
+        callbacks=[student_ckpt_cb],
+    )
+    student_trainer.fit(student_model)
 
-    # 평가
+    # -------------------- Stage 4: Student Evaluation --------------------
+    print("\n===== Stage 4: Student Evaluation =====") 
+    ### TODO: librispeech 뿐만 아니라, GigaSpeech testset도 추가적으로 평가할 수 있도록
     eval_targets = [
         ("dev_clean",  dev_clean_manifest),
         ("dev_other",  dev_other_manifest),
@@ -368,12 +578,12 @@ def main():
         print(f"\n===== Evaluating on {split_name} =====")
 
         # 1) Lightning test (loss / 평균 WER)
-        test_cfg = deepcopy(model.cfg.test_ds)
+        test_cfg = deepcopy(student_model.cfg.test_ds)
         test_cfg.manifest_filepath = manifest
         test_cfg.shuffle = False
-        model.setup_test_data(test_cfg)
-        dl = model.test_dataloader()
-        results = trainer.test(model=model, dataloaders=[dl], verbose=True)
+        student_model.setup_test_data(test_cfg)
+        dl = student_model.test_dataloader()
+        results = student_trainer.test(model=student_model, dataloaders=[dl], verbose=True)
 
         if results and isinstance(results, list):
             res = results[0]
@@ -390,7 +600,7 @@ def main():
         audio_files = [e["audio_filepath"] for e in entries]
         ref_texts   = [e["text"] for e in entries]
 
-        hyps = model.transcribe(
+        hyps = student_model.transcribe(
             audio=audio_files,
             batch_size=args.batch_size,
             return_hypotheses=False,

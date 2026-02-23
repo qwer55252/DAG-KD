@@ -184,10 +184,11 @@ def main():
 
     teacher_ckpt_cb = ModelCheckpoint(
         dirpath=teacher_ckpt_dir,
-        filename="teacher-{epoch}-{step}",
-        save_last="link",
-        save_top_k=-1,
+        filename="teacher-last",
+        save_last=True,
+        save_top_k=0,
     )
+
 
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     devices = args.gpus if accelerator == "gpu" else 1
