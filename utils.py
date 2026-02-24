@@ -1,11 +1,13 @@
 import re, os, json, uuid, glob, torch, argparse, librosa, unicodedata
+import numpy as np
 import regex as re_u
 import soundfile as sf
 import matplotlib.pyplot as plt
-from typing import Optional, Dict, Any
 from pathlib import Path
+from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 from collections import defaultdict
+from typing import Optional, Dict, Any
 from torch.utils.data import ConcatDataset
 from nemo.collections import asr as nemo_asr
 from nemo.utils.app_state import AppState
@@ -718,7 +720,6 @@ def extract_speaker_ids_from_batch(batch, spk_table: torch.Tensor, device):
     spk_table = spk_table.to(device, non_blocking=True)
     return spk_table[sample_id]  # (B,)
 
-
 def load_speaker_table_from_manifest(manifest_path: str, key_candidates=("spk_idx", "speaker", "spk_id")):
     table = []
     with open(manifest_path, "r", encoding="utf-8") as f:
@@ -844,4 +845,166 @@ def masked_mse(pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor, eps=1e
     denom = mask.sum().clamp_min(eps)
     return loss.sum() / denom
 
+def compute_pitch_features_librosa(
+    signal: torch.Tensor,
+    sample_rate: int = 16000,
+    frame_shift_ms: float = 10.0, # HOP_MS
+    frame_length_ms: float = 25.0, # WIN_MS
+    fmin: float = 50.0,
+    fmax: float = 400.0,
+    device=None,
+):
+    """
+    Returns: Tensor [num_frames, 2] where
+      - [:,0] = f0 in Hz (0 if unvoiced)
+      - [:,1] = voiced_prob in [0,1]
+    """
+    import librosa
 
+    device = device or signal.device
+
+    # signal: (T,) float tensor
+    y = signal.detach().float().cpu().numpy()
+
+    hop_length = int(round(sample_rate * frame_shift_ms / 1000.0))      # e.g. 160
+    win_length = int(round(sample_rate * frame_length_ms / 1000.0))     # e.g. 400
+
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y,
+        fmin=fmin,
+        fmax=fmax,
+        sr=sample_rate,
+        frame_length=win_length,
+        hop_length=hop_length,
+        center=True,
+    )
+
+    # f0: (num_frames,) with np.nan for unvoiced
+    f0 = np.nan_to_num(f0, nan=0.0).astype(np.float32)
+    voiced_prob = np.nan_to_num(voiced_prob, nan=0.0).astype(np.float32)
+
+    feats = np.stack([f0, voiced_prob], axis=-1)  # [N,2]
+    return torch.from_numpy(feats).to(device)
+
+def compute_phys_for_wav(wav_path: str, SR=16000, HOP_MS=10.0, WIN_MS=25.0) -> Dict[str, np.ndarray]:
+    wav, sr = sf.read(wav_path, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != SR:
+        # 여기서는 속도/의존성 최소화를 위해 resample을 생략. SR mismatch면 경고 후 그대로 진행.
+        # 실제 실험에선 librosa.resample이나 torchaudio resample 권장.
+        print(f"[WARN] sample_rate mismatch: {wav_path} sr={sr} (expected {SR})")
+
+    # ===== F0/VUV (librosa 기반) =====
+    # utils.compute_pitch_features_librosa(wav, ...) 가 (T,2) [vuv_prob, f0] 형태라고 가정
+    # (너 코드 기준: pitch_features[...,0]=voicing, [...,1]=f0)
+    pitch = compute_pitch_features_librosa(
+        torch.from_numpy(wav).unsqueeze(0),   # (1, N) torch CPU
+        sample_rate=SR,
+        frame_shift_ms=HOP_MS,
+        frame_length_ms=WIN_MS,
+        device="cpu",
+    ).squeeze(0).cpu().numpy()  # (T_pitch, 2)
+
+    vuv = pitch[:, 0].astype(np.float32)  # (T,)
+    f0  = pitch[:, 1].astype(np.float32)  # (T,)
+
+    # ===== Energy =====
+    # mel을 여기서 다시 만들려면 비용이 큼. 대신 waveform 기반 energy proxy로도 OK.
+    # hop/window 기반으로 프레임 에너지 계산(간단 RMS)
+    hop = int(SR * (HOP_MS / 1000.0))
+    win = int(SR * (WIN_MS / 1000.0))
+    T = int(np.ceil(len(wav) / hop))
+    energy = np.zeros((T,), dtype=np.float32)
+    for t in range(T):
+        s = t * hop
+        e = min(len(wav), s + win)
+        frame = wav[s:e]
+        if frame.size == 0:
+            energy[t] = 0.0
+        else:
+            energy[t] = float(np.sqrt(np.mean(frame * frame) + 1e-8))
+
+    # f0/vuv 길이와 energy 길이 맞추기(보간)
+    if len(f0) != len(energy):
+        x_src = np.linspace(0, 1, num=len(f0), dtype=np.float32)
+        x_tgt = np.linspace(0, 1, num=len(energy), dtype=np.float32)
+        f0  = np.interp(x_tgt, x_src, f0).astype(np.float32)
+        vuv = np.interp(x_tgt, x_src, vuv).astype(np.float32)
+
+    return f0, vuv, energy
+
+def build_phys_cache_for_manifest(
+    manifest_path: str,
+    split_name: str,
+    max_items=None,
+    phys_cache_root: Path = None,
+    HOP_MS: float = 10.0,
+    WIN_MS: float = 25.0,
+    SR: int = 16000,
+):
+    """
+    저장 포맷: <phys_cache_root>/<split_name>/<manifest_id>.npy
+    manifest_id = manifest line index + 1 (NeMo item['id']와 동일 컨벤션)
+    배열 shape: (3, T)  [f0, energy, vuv]
+    dtype: float16 (IO 감소)
+    """
+    phys_cache_root = Path(phys_cache_root)
+    out_dir = phys_cache_root / split_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 총 라인 수(진행률 정확히)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        total = sum(1 for _ in f)
+
+    if max_items is not None:
+        total = min(total, int(max_items))
+
+    n_new, n_skip, n_fail = 0, 0, 0
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        pbar = tqdm(
+            enumerate(f),
+            total=total,
+            desc=f"[phys-cache] {split_name}",
+            unit="utt",
+            dynamic_ncols=True,
+        )
+
+        for line_idx, line in pbar:
+            if max_items is not None and line_idx >= max_items:
+                break
+
+            manifest_id = line_idx + 1
+            out_path = out_dir / f"{manifest_id}.npy"
+            if out_path.exists():
+                n_skip += 1
+                pbar.set_postfix(new=n_new, skip=n_skip, fail=n_fail)
+                continue
+
+            try:
+                obj = json.loads(line)
+                wav_path = obj["audio_filepath"]
+
+                # 반환: f0 (T,), vuv (T,), energy (T,)
+                phys_dict = compute_phys_for_wav(
+                    wav_path,
+                    SR=SR,
+                    HOP_MS=HOP_MS,
+                    WIN_MS=WIN_MS,
+                )
+                f0 = phys_dict["f0"]
+                vuv = phys_dict["vuv"]
+                energy = phys_dict["energy"]
+
+                phys = np.stack([f0, energy, vuv], axis=0).astype(np.float16)  # (3,T)
+                np.save(out_path, phys)
+
+                n_new += 1
+                pbar.set_postfix(new=n_new, skip=n_skip, fail=n_fail)
+            except Exception as e:
+                n_fail += 1
+                # 너무 길어지지 않게 예외 메시지 짧게
+                pbar.set_postfix(new=n_new, skip=n_skip, fail=n_fail, err=str(e)[:60])
+
+    print(f"[phys-cache] {split_name}: created={n_new}, skipped={n_skip}, failed={n_fail}, out_dir={out_dir}")

@@ -2,21 +2,12 @@
 """
 목표
 - Teacher/Student는 동일한 layer 수를 갖되 Student의 head 수와 hidden dim이 절반.
-- ASR에서 상/하위층 표현의 성질(하위: acoustic/speaker/prosody, 상위: linguistic)을 고려하여
+- ASR에서 상/하위층 표현의 성질(하위: speaker/prosody, 상위: linguistic)을 고려하여
   1) Generative KD (Flow Matching 또는 DiffKD)로 layer feature를 정렬
   2) Logit KD (CTC 로짓 KL)
   3) Layerwise Metric KD (MSE)
   4) Disentanglement (언어/화자 적대 분류기 + GRL)로 content 보존 유도
 을 결합.
-
-데이터 가정
-- NeMo manifest(JSONL) 항목에 최소 {audio_filepath, duration, text}가 있고,
-  가능하면 {lang, speaker} 필드를 추가하면 Disentanglement loss가 활성화됩니다.
-- lang/speaker가 없으면 해당 loss는 0으로 처리됩니다.
-
-주의
-- 본 코드는 연구용 레퍼런스 구현이며, 실제 실험에서는 학습 안정화를 위해 loss 가중치, 샘플링 스케줄,
-  라우터/GRL 스케줄, augmentation 등을 조정하세요.
 """
 
 import os
@@ -27,8 +18,8 @@ import argparse
 import statistics
 import numpy as np
 import lightning as pl
-import soundfile as sf
 from copy import deepcopy
+from pathlib import Path
 import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 # import Nemo.nemo.collections.asr as nemo_asr
@@ -47,7 +38,8 @@ from utils import (
     compute_speaker_durations,
     int_list_arg,
     save_speaker_mapping,
-    save_mel_examples_from_manifest
+    save_mel_examples_from_manifest,
+    build_phys_cache_for_manifest
 )
 
 def main():
@@ -214,6 +206,38 @@ def main():
         build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx)
         build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx)
     
+    # 정해진 데이터셋에 librosa F0 등 _get_phys_targets 함수의 역할을 미리 추출하여 파일로 저장
+    # 이미 저장되어 있으면 패스
+    # 저장장소: manifest_dir
+    # ===================== Prosody phys-target cache (offline) =====================
+    # 목표: 학습 step에서 librosa/pyin 기반 F0 추출을 제거하고, 미리 계산해서 캐시로 저장.
+    # 캐시 포맷: <manifest_dir>/phys_cache/<split_name>/<sample_id>.npz
+    # npz keys: f0 (T,), vuv (T,), energy (T,), hop_ms (float), sr (int)
+
+    phys_cache_root = Path(manifest_dir) / "phys_cache"
+    phys_cache_root.mkdir(parents=True, exist_ok=True)
+
+    # preprocessor hop/윈도우 설정이 모델과 같아야 함 (NeMo default는 보통 10ms hop / 25ms win)
+    # 필요하면 cfg에서 읽어서 쓰는 게 더 정확함.
+    HOP_MS = 10.0
+    WIN_MS = 25.0
+    SR = args.sample_rate
+    
+    # ---- 실행: train/val/test(+extra) 캐시 생성 ----
+    # test_mode면 데이터가 작으니 빠르게 완성됨.
+    max_cache_items = 300 if args.test_mode else None
+
+    build_phys_cache_for_manifest(train_manifest if not args.test_mode else test_mode_train_manifest, "train", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    build_phys_cache_for_manifest(dev_clean_manifest if not args.test_mode else test_mode_val_manifest, "dev_clean", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    build_phys_cache_for_manifest(test_clean_manifest if not args.test_mode else test_mode_test_manifest, "test_clean", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+
+    if os.path.isfile(dev_other_manifest):
+        build_phys_cache_for_manifest(dev_other_manifest, "dev_other", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    if os.path.isfile(test_other_manifest):
+        build_phys_cache_for_manifest(test_other_manifest, "test_other", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    
+    
+    
     
     # W&B
     wandb = WandbLogger(project=args.wandb_project, name=args.wandb_run, save_dir=args.out)
@@ -297,10 +321,6 @@ def main():
     stu_cfg.txt_probe_lambda = args.txt_probe_lambda if hasattr(args, "txt_probe_lambda") else 1.0
     stu_cfg.txt_probe_lr = args.txt_probe_lr if hasattr(args, "txt_probe_lr") else 1e-3
     
-    stu_cfg.use_layerwise_flow = args.use_layerwise_flow  # flow/disdiffkd도 동일하게 맞춤
-    stu_cfg.use_layerwise_diffkd = args.use_layerwise_diffkd
-    stu_cfg.layer_list_for_disent = args.layer_list_for_disent  # 1-based index
-    
     stu_cfg.neg_K = args.neg_K
     stu_cfg.mi_warmup_steps = args.mi_warmup_steps
     stu_cfg.mi_ramp_steps   = args.mi_ramp_steps
@@ -308,6 +328,12 @@ def main():
     stu_cfg.lll_lambda_max  = args.lll_lambda_max
     stu_cfg.mi_clamp_min0   = args.mi_clamp_min0
     stu_cfg.club_hidden = 128
+    
+    stu_cfg.phys_cache_root = str(phys_cache_root)
+    stu_cfg.phys_cache_hop_ms = HOP_MS
+    stu_cfg.phys_cache_sr = SR
+    stu_cfg.phys_cache_ext = ".npy"
+    stu_cfg.phys_cache_lru = 2048
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
