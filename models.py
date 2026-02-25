@@ -369,9 +369,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             else:
                 # fallback(필터링 없다는 가정)
                 speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
-            
-            # sample_id -> speaker_id lookup
-            speaker_ids = self.manifest_speakers.to(sample_ids.device)[sample_ids]
+
         elif len(batch) == 4:
             signal, sig_len, y, ylen = batch
             speaker_ids = None
@@ -423,13 +421,19 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
             if spk_acc is not None and torch.is_tensor(spk_acc):
                 self.log("train/spk_acc", spk_acc, on_epoch=True)
+
+            # Prosody physical quantity supervision
+            phys_loss = embs.get("phys_loss", None)
+            if phys_loss is not None and torch.is_tensor(phys_loss):
+                self.log("train/phys_loss", phys_loss, on_step=True, on_epoch=True, prog_bar=False)
+                total = total + self.rec_pros_lambda * phys_loss
         else:
             self._txt_emb = None
 
         # 4) Generative KD (FM / DF)
         flow_loss = torch.tensor(0.0, device=self.device)
         diff_loss = torch.tensor(0.0, device=self.device)
-        if self._txt_emb is None or not self.use_flow or not self.use_diffkd or self._last_enc is None:
+        if self._txt_emb is not None and self._last_enc is not None:
             stu_feat = ensure_BCT(self._last_enc, C_expected=self.dim_s)
             tch_feat = ensure_BCT(self._txt_emb.detach(), C_expected=self.latent_dim)
             if self.use_flow:
@@ -538,9 +542,9 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ===== Prosody Positive Supervision =====
         # 1. Mel Reconstruction Loss
         mel_target = self._last_mel # (B, 80, T_mel)
-        pros_emb_for_mel = torch.nn.functional.interpolate(pros_emb, size=mel_target.size(-1), mode='linear', align_corners=False)
+        pros_emb_for_mel = F.interpolate(pros_emb, size=mel_target.size(-1), mode='linear', align_corners=False)
         mel_pred = self.mel_dec(pros_emb_for_mel)
-        mel_rec_loss = torch.nn.functional.mse_loss(mel_pred, mel_target)
+        rec_pros = F.mse_loss(mel_pred, mel_target)
 
         # 2. Physical Quantity Loss
         phys_loss = torch.tensor(0.0, device=pros_emb.device)
@@ -549,12 +553,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             
             # target 길이를 맞춰줌 (보통 T와 T_mel이 같겠지만 만약을 대비)
             if phys_pred.size(-1) != phys_targets.size(-1):
-                 phys_pred = torch.nn.functional.interpolate(phys_pred, size=phys_targets.size(-1), mode='linear', align_corners=False)
+                 phys_pred = F.interpolate(phys_pred, size=phys_targets.size(-1), mode='linear', align_corners=False)
                  
-            phys_loss = torch.nn.functional.mse_loss(phys_pred, phys_targets)
-
-        # 총 Prosody Reconstruction Loss 합산
-        rec_pros = mel_rec_loss + phys_loss
+            phys_loss = F.mse_loss(phys_pred, phys_targets)
+            
 
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
@@ -629,7 +631,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "txt_probe_acc": txt_probe_acc,
             
             "pros_stat": pros_stat,     # (B,96) static (MI용)
-            
+            "phys_loss": phys_loss
         }
     
     def _mi_loss(self, txt_emb, pros_emb, spk_stat):
@@ -1142,7 +1144,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # GPU로 한 번에 올림
         out = out_cpu.to(self.device, non_blocking=True)
         return out
-
 
 class GlobalStyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):

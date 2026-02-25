@@ -109,14 +109,28 @@ def scan_speakers(ds):
 # >>>>>>>>>>>>>>>>>>>>>>>>>>
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<< HF -> NeMo manifest
-def build_manifest_from_hf_with_meta(ds, manifest_path: str, cache_dir: str,
-                                     spk2idx=None):
+def build_manifest_from_hf_with_meta(
+    ds, manifest_path: str, cache_dir: str,
+    spk2idx=None,
+    split_name: str | None = None,          # ✅ split 이름 받아서 key에 사용 (권장)
+    phys_cache_root: str | None = None,     # ✅ phys cache root(절대/상대 경로)
+):
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
     tmp_audio_dir = os.path.join(cache_dir, "tmp_audio", "hf2wav")
     os.makedirs(tmp_audio_dir, exist_ok=True)
 
+    # 기본값 처리
+    spk2idx = spk2idx or {}
+    split_name = split_name or os.path.splitext(os.path.basename(manifest_path))[0]
+    if phys_cache_root is None:
+        # manifest_dir/phys_cache 를 기본으로 쓰고 싶으면 train.py에서 넘겨주는 게 더 안정적
+        phys_cache_root = os.path.join(os.path.dirname(manifest_path), "phys_cache")
+
+    # split별 phys_cache 디렉토리도 미리 생성해두면 좋음
+    os.makedirs(os.path.join(phys_cache_root, split_name), exist_ok=True)
+
     with open(manifest_path, "w", encoding="utf-8") as fout:
-        for ex in ds:
+        for line_idx, ex in enumerate(ds):
             audio = ex["audio"]; arr = audio.get("array", None)
             sr = audio.get("sampling_rate", 16000)
             candidates = []
@@ -150,14 +164,35 @@ def build_manifest_from_hf_with_meta(ds, manifest_path: str, cache_dir: str,
                 spk_idx = spk2idx[spk_id]
             else:
                 spk_idx = -1 # unknown speaker (not in train set)
+            
+            # ✅ manifest_id = line_idx + 1 (NeMo item['id'] 컨벤션과 맞춤)
+            manifest_id = line_idx + 1
+
+            # ✅ 파일 경로: phys_cache_root/split/manifest_id.npy
+            prosody_physics_filepath = os.path.join(phys_cache_root, split_name, f"{manifest_id}.npy")
+
+            # ✅ 유니크 key (split 포함)
+            utterance_key = f"{split_name}-{manifest_id:09d}"
+
 
             item = {
+                # key info
+                "manifest_id": int(manifest_id),
+                "index": int(line_idx),
+                "utterance_key": utterance_key,
+
+                # data
                 "audio_filepath": wav_path,
                 "duration": duration,
                 "text": text,
+                
+                # meta
                 "full_id": str(full_id),
-                "spk_id": int(spk_id),
+                "spk_id": int(spk_id) if spk_id is not None else -1,
                 "spk_idx": int(spk_idx),
+                
+                # prosody phys cache path
+                "prosody_physics_filepath": prosody_physics_filepath,
             }
             fout.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -805,7 +840,7 @@ def head_manifest(src_path: str, dst_path: str, n_lines: int) -> str:
                 break
     return dst_path, wrote
 
-def ensure_BCT(self, x, C_expected=None):
+def ensure_BCT(x, C_expected=None):
     # x: (B,T,C) or (B,C,T) -> (B,C,T)
     if x.dim() != 3:
         raise ValueError("expected 3D")
@@ -937,7 +972,6 @@ def compute_phys_for_wav(wav_path: str, SR=16000, HOP_MS=10.0, WIN_MS=25.0) -> D
 def build_phys_cache_for_manifest(
     manifest_path: str,
     split_name: str,
-    max_items=None,
     phys_cache_root: Path = None,
     HOP_MS: float = 10.0,
     WIN_MS: float = 25.0,
@@ -957,9 +991,6 @@ def build_phys_cache_for_manifest(
     with open(manifest_path, "r", encoding="utf-8") as f:
         total = sum(1 for _ in f)
 
-    if max_items is not None:
-        total = min(total, int(max_items))
-
     n_new, n_skip, n_fail = 0, 0, 0
 
     with open(manifest_path, "r", encoding="utf-8") as f:
@@ -972,30 +1003,22 @@ def build_phys_cache_for_manifest(
         )
 
         for line_idx, line in pbar:
-            if max_items is not None and line_idx >= max_items:
-                break
-
-            manifest_id = line_idx + 1
-            out_path = out_dir / f"{manifest_id}.npy"
+            obj = json.loads(line)
+            out_path = Path(obj["prosody_physics_filepath"])
+            wav_path = obj["audio_filepath"]
             if out_path.exists():
                 n_skip += 1
                 pbar.set_postfix(new=n_new, skip=n_skip, fail=n_fail)
                 continue
 
             try:
-                obj = json.loads(line)
-                wav_path = obj["audio_filepath"]
-
                 # 반환: f0 (T,), vuv (T,), energy (T,)
-                phys_dict = compute_phys_for_wav(
+                f0, vuv, energy = compute_phys_for_wav(
                     wav_path,
                     SR=SR,
                     HOP_MS=HOP_MS,
                     WIN_MS=WIN_MS,
                 )
-                f0 = phys_dict["f0"]
-                vuv = phys_dict["vuv"]
-                energy = phys_dict["energy"]
 
                 phys = np.stack([f0, energy, vuv], axis=0).astype(np.float16)  # (3,T)
                 np.save(out_path, phys)

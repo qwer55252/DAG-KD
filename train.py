@@ -171,16 +171,18 @@ def main():
     test_other_manifest = os.path.join(manifest_dir, "test_other.json")
 
     # manifest들 생성
+    phys_cache_root = Path(manifest_dir) / "phys_cache"
+    phys_cache_root.mkdir(parents=True, exist_ok=True)
     if not os.path.isfile(train_manifest):
-        build_manifest_from_hf_with_meta(train_ds, train_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(train_ds, train_manifest, cache_dir, spk2idx, "train", phys_cache_root)
     if not os.path.isfile(dev_clean_manifest):
-        build_manifest_from_hf_with_meta(val_ds, dev_clean_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(val_ds, dev_clean_manifest, cache_dir, spk2idx, "dev_clean", phys_cache_root)
     if not os.path.isfile(test_clean_manifest):
-        build_manifest_from_hf_with_meta(test_ds, test_clean_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(test_ds, test_clean_manifest, cache_dir, spk2idx, "test_clean", phys_cache_root)
     if "dev.other" in extra_splits and not os.path.isfile(dev_other_manifest):
-        build_manifest_from_hf_with_meta(extra_splits["dev.other"], dev_other_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(extra_splits["dev.other"], dev_other_manifest, cache_dir, spk2idx, "dev_other", phys_cache_root)
     if "test.other" in extra_splits and not os.path.isfile(test_other_manifest):
-        build_manifest_from_hf_with_meta(extra_splits["test.other"], test_other_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(extra_splits["test.other"], test_other_manifest, cache_dir, spk2idx, "test_other", phys_cache_root)
 
     # speaker별 발화 시간 총합 계산 (train split 기준)
     print(f"[INFO] calculating speaker durations from train manifest...")
@@ -202,9 +204,9 @@ def main():
         test_mode_train_manifest = os.path.join(manifest_dir, "test_mode_train.json")
         test_mode_val_manifest = os.path.join(manifest_dir, "test_mode_val.json")
         test_mode_test_manifest = os.path.join(manifest_dir, "test_mode_test.json")
-        build_manifest_from_hf_with_meta(train_ds, test_mode_train_manifest, cache_dir, spk2idx)
-        build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx)
-        build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx)
+        build_manifest_from_hf_with_meta(train_ds, test_mode_train_manifest, cache_dir, spk2idx, "test_mode_train", phys_cache_root)
+        build_manifest_from_hf_with_meta(val_ds, test_mode_val_manifest, cache_dir, spk2idx, "test_mode_val", phys_cache_root)
+        build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx, "test_mode_test", phys_cache_root)
     
     # 정해진 데이터셋에 librosa F0 등 _get_phys_targets 함수의 역할을 미리 추출하여 파일로 저장
     # 이미 저장되어 있으면 패스
@@ -213,10 +215,6 @@ def main():
     # 목표: 학습 step에서 librosa/pyin 기반 F0 추출을 제거하고, 미리 계산해서 캐시로 저장.
     # 캐시 포맷: <manifest_dir>/phys_cache/<split_name>/<sample_id>.npz
     # npz keys: f0 (T,), vuv (T,), energy (T,), hop_ms (float), sr (int)
-
-    phys_cache_root = Path(manifest_dir) / "phys_cache"
-    phys_cache_root.mkdir(parents=True, exist_ok=True)
-
     # preprocessor hop/윈도우 설정이 모델과 같아야 함 (NeMo default는 보통 10ms hop / 25ms win)
     # 필요하면 cfg에서 읽어서 쓰는 게 더 정확함.
     HOP_MS = 10.0
@@ -226,18 +224,19 @@ def main():
     # ---- 실행: train/val/test(+extra) 캐시 생성 ----
     # test_mode면 데이터가 작으니 빠르게 완성됨.
     max_cache_items = 300 if args.test_mode else None
-
-    build_phys_cache_for_manifest(train_manifest if not args.test_mode else test_mode_train_manifest, "train", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-    build_phys_cache_for_manifest(dev_clean_manifest if not args.test_mode else test_mode_val_manifest, "dev_clean", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-    build_phys_cache_for_manifest(test_clean_manifest if not args.test_mode else test_mode_test_manifest, "test_clean", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-
-    if os.path.isfile(dev_other_manifest):
-        build_phys_cache_for_manifest(dev_other_manifest, "dev_other", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-    if os.path.isfile(test_other_manifest):
-        build_phys_cache_for_manifest(test_other_manifest, "test_other", max_items=max_cache_items, phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-    
-    
-    
+    print(f"[INFO] creating phys_cache_root: {phys_cache_root}")
+    if args.test_mode:
+        build_phys_cache_for_manifest(test_mode_train_manifest, "test_mode_train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        build_phys_cache_for_manifest(test_mode_val_manifest, "test_mode_val", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        build_phys_cache_for_manifest(test_mode_test_manifest, "test_mode_test", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    else:
+        build_phys_cache_for_manifest(train_manifest, "train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        build_phys_cache_for_manifest(dev_clean_manifest, "dev_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        build_phys_cache_for_manifest(test_clean_manifest, "test_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    # if os.path.isfile(dev_other_manifest):
+    #     build_phys_cache_for_manifest(dev_other_manifest, "dev_other", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    # if os.path.isfile(test_other_manifest):
+    #     build_phys_cache_for_manifest(test_other_manifest, "test_other", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
     
     # W&B
     wandb = WandbLogger(project=args.wandb_project, name=args.wandb_run, save_dir=args.out)
