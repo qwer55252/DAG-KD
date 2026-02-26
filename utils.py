@@ -941,8 +941,8 @@ def compute_phys_for_wav(wav_path: str, SR=16000, HOP_MS=10.0, WIN_MS=25.0) -> D
         device="cpu",
     ).squeeze(0).cpu().numpy()  # (T_pitch, 2)
 
-    vuv = pitch[:, 0].astype(np.float32)  # (T,)
-    f0  = pitch[:, 1].astype(np.float32)  # (T,)
+    f0 = pitch[:, 0].astype(np.float32)  # (T,)
+    vuv = pitch[:, 1].astype(np.float32)  # (T,)
 
     # ===== Energy =====
     # mel을 여기서 다시 만들려면 비용이 큼. 대신 waveform 기반 energy proxy로도 OK.
@@ -967,7 +967,7 @@ def compute_phys_for_wav(wav_path: str, SR=16000, HOP_MS=10.0, WIN_MS=25.0) -> D
         f0  = np.interp(x_tgt, x_src, f0).astype(np.float32)
         vuv = np.interp(x_tgt, x_src, vuv).astype(np.float32)
 
-    return f0, vuv, energy
+    return f0, energy, vuv
 
 def build_phys_cache_for_manifest(
     manifest_path: str,
@@ -1013,7 +1013,7 @@ def build_phys_cache_for_manifest(
 
             try:
                 # 반환: f0 (T,), vuv (T,), energy (T,)
-                f0, vuv, energy = compute_phys_for_wav(
+                f0, energy, vuv = compute_phys_for_wav(
                     wav_path,
                     SR=SR,
                     HOP_MS=HOP_MS,
@@ -1031,3 +1031,5 @@ def build_phys_cache_for_manifest(
                 pbar.set_postfix(new=n_new, skip=n_skip, fail=n_fail, err=str(e)[:60])
 
     print(f"[phys-cache] {split_name}: created={n_new}, skipped={n_skip}, failed={n_fail}, out_dir={out_dir}")
+
+

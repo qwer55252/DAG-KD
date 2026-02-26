@@ -209,12 +209,11 @@ def main():
         build_manifest_from_hf_with_meta(test_ds, test_mode_test_manifest, cache_dir, spk2idx, "test_mode_test", phys_cache_root)
     
     # 정해진 데이터셋에 librosa F0 등 _get_phys_targets 함수의 역할을 미리 추출하여 파일로 저장
-    # 이미 저장되어 있으면 패스
     # 저장장소: manifest_dir
     # ===================== Prosody phys-target cache (offline) =====================
     # 목표: 학습 step에서 librosa/pyin 기반 F0 추출을 제거하고, 미리 계산해서 캐시로 저장.
-    # 캐시 포맷: <manifest_dir>/phys_cache/<split_name>/<sample_id>.npz
-    # npz keys: f0 (T,), vuv (T,), energy (T,), hop_ms (float), sr (int)
+    # 캐시 포맷: <manifest_dir>/phys_cache/<split_name>/<sample_id>.npy
+    # npy keys: f0 (T,), vuv (T,), energy (T,), hop_ms (float), sr (int)
     # preprocessor hop/윈도우 설정이 모델과 같아야 함 (NeMo default는 보통 10ms hop / 25ms win)
     # 필요하면 cfg에서 읽어서 쓰는 게 더 정확함.
     HOP_MS = 10.0
@@ -223,7 +222,6 @@ def main():
     
     # ---- 실행: train/val/test(+extra) 캐시 생성 ----
     # test_mode면 데이터가 작으니 빠르게 완성됨.
-    max_cache_items = 300 if args.test_mode else None
     print(f"[INFO] creating phys_cache_root: {phys_cache_root}")
     if args.test_mode:
         build_phys_cache_for_manifest(test_mode_train_manifest, "test_mode_train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)

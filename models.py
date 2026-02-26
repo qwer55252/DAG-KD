@@ -396,7 +396,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             embs = self._make_embeddings(speaker_ids, phys_targets=phys_targets)
             
             # MI term
-            mi_upper, lll = self._mi_loss(txt_emb=embs["txt_emb"], pros_emb=embs["pros_emb"], spk_stat=embs["spk_stat"])
+            mi_upper, lll, mi_terms, lll_terms = self._mi_loss(
+                txt_emb=embs["txt_emb"],
+                pros_emb=embs["pros_emb"],
+                spk_stat=embs["spk_stat"],
+                enc_len=getattr(self, "t_enc_len", None),  # ✅ teacher length 사용
+            )
             mi_upper = torch.clamp(mi_upper, min=0.0)
             self.log("train/mi_upper", mi_upper, on_epoch=True)
             self.log("train/lll", lll, on_epoch=True)
@@ -409,6 +414,10 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/rec_txt", rec_txt, on_epoch=True)
             self.log("train/rec_spk", rec_spk, on_epoch=True)
             self.log("train/rec_pros", rec_pros, on_epoch=True)
+            for k, v in mi_terms.items():
+                self.log(f"train/mi_{k}", v, on_epoch=True)
+            for k, v in lll_terms.items():
+                self.log(f"train/lll_{k}", v, on_epoch=True)
             total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk + self.rec_pros_lambda * rec_pros
 
             # Speaker CE & ACC
@@ -557,7 +566,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                  
             phys_loss = F.mse_loss(phys_pred, phys_targets)
             
-
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
         spk_acc = None
@@ -610,6 +618,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 spk_rep=spk_rep.detach(),
                 rec_txt=rec_txt.detach(),
                 rec_spk=rec_spk.detach(),
+                speaker_ids=speaker_ids.detach() if speaker_ids is not None else None,
+                enc_len=getattr(self, "t_enc_len", None),
             )
         
         return {
@@ -634,49 +644,186 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "phys_loss": phys_loss
         }
     
-    def _mi_loss(self, txt_emb, pros_emb, spk_stat):
+    def _mi_loss(self, txt_emb, pros_emb, spk_stat, enc_len=None):
         """
+        txt_emb: (B,D,T) dynamic
+        pros_emb:(B,D,T) dynamic
+        spk_stat:(B,D)   static
+        enc_len : (B,)   valid length for T (teacher length 권장)
+
         return:
-        mi_upper_avg: 평균 MI upper (식 4 추정치)
-        lll_avg: 평균 LLL (식 5)
+          mi_sum, lll_sum, mi_terms, lll_terms
         """
-        txt = txt_emb       # (B,96,T) dynamic
-        pros = pros_emb     # (B,96,T) dynamic
-        spk = spk_stat      # (B,96) static
+        txt = txt_emb
+        pros = pros_emb
+        spk = spk_stat
+
         pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
-        lll_sum = torch.tensor(0.0, device=self.device) # LLL: CLUB(q) 네트워크 학습용 (u,v는 detach)
-        mi_sum  = torch.tensor(0.0, device=self.device) # MI upper: 표현(txt,spk)이 덜 얽히게 만드는 loss 
-        # 이때 CLUB 파라미터는 고정하고(gradient 막고) txt/spk 쪽으로만 gradient 흐르게
-        
-        if "tp" in pairs: # dynamic-dynamic pair ClubGaussian
-            # 1) CLUB(tp) 학습 (u,v detach -> CLUB만 업데이트)
-            lll_sum = lll_sum + self.club_tp.ll_loss(txt.detach(), pros.detach())
-            
-            # 2) 표현(txt/pros) disentangle penalty (CLUB freeze)
+
+        lll_terms = {}
+        mi_terms = {}
+
+        lll_sum = torch.tensor(0.0, device=self.device)
+        mi_sum  = torch.tensor(0.0, device=self.device)
+
+        # ---- length mask 생성 ----
+        mask = None
+        if enc_len is None:
+            enc_len = getattr(self, "t_enc_len", None)
+        if enc_len is not None:
+            T = txt.size(-1)
+            mask = self._make_len_mask(enc_len, T, device=txt.device, dtype=torch.float32)  # (B,T)
+
+        # reduce_dim: 학습용은 일단 "mean" 유지 권장(스케일 안정)
+        reduce_dim = "mean"
+
+        # tp: dynamic-dynamic (ClubGaussian)  ✅ K negative 지원
+        if "tp" in pairs:
+            lll_terms["tp"] = self.club_tp.ll_loss(
+                txt.detach(), pros.detach(),
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            lll_sum = lll_sum + lll_terms["tp"]
+
             self._freeze_params(self.club_tp, True)
-            mi_upper_txt_pros = self.club_tp.mi_upper(txt, pros)
-            mi_sum = mi_sum + mi_upper_txt_pros
+            mi_terms["tp"] = self.club_tp.mi_upper(
+                txt, pros,
+                K=self.neg_K,            # ✅ tp도 K negative
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            mi_sum = mi_sum + mi_terms["tp"]
             self._freeze_params(self.club_tp, False)
-        
-        if "ts" in pairs: # dynamic-static pair ARClubGaussian
-            ll_loss_txt_spk = self.club_ts.ll_loss(txt.detach(), spk.detach())
-            lll_sum = lll_sum + ll_loss_txt_spk
+
+        # ts: dynamic-static (ARClubGaussian)
+        if "ts" in pairs:
+            lll_terms["ts"] = self.club_ts.ll_loss(
+                txt.detach(), spk.detach(),
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            lll_sum = lll_sum + lll_terms["ts"]
+
             self._freeze_params(self.club_ts, True)
-            mi_upper_txt_spk = self.club_ts.mi_upper(txt, spk)
-            mi_sum = mi_sum + mi_upper_txt_spk
+            mi_terms["ts"] = self.club_ts.mi_upper(
+                txt, spk,
+                K=self.neg_K,
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            mi_sum = mi_sum + mi_terms["ts"]
             self._freeze_params(self.club_ts, False)
-        
-        if "ps" in pairs: # dynamic-static pair ARClubGaussian
-            ll_loss_pros_spk = self.club_ps.ll_loss(pros.detach(), spk.detach())
-            lll_sum = lll_sum + ll_loss_pros_spk
+
+        # ps: dynamic-static (ARClubGaussian)
+        if "ps" in pairs:
+            lll_terms["ps"] = self.club_ps.ll_loss(
+                pros.detach(), spk.detach(),
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            lll_sum = lll_sum + lll_terms["ps"]
+
             self._freeze_params(self.club_ps, True)
-            mi_upper_pros_spk = self.club_ps.mi_upper(pros, spk)
-            mi_sum = mi_sum + mi_upper_pros_spk
+            mi_terms["ps"] = self.club_ps.mi_upper(
+                pros, spk,
+                K=self.neg_K,
+                mask=mask,
+                reduce_dim=reduce_dim
+            )
+            mi_sum = mi_sum + mi_terms["ps"]
             self._freeze_params(self.club_ps, False)
 
-         # TODO: mi_upper_txt_pros, mi_upper_txt_spk, mi_upper_pros_spk, ll_loss_txt_spk, ll_loss_pros_spk 각각 로그 남기기 (디버깅용)
-        return mi_sum, lll_sum
+        return mi_sum, lll_sum, mi_terms, lll_terms
 
+    def _get_phys_targets(self, sample_ids: torch.Tensor, T_mel: int, split_name: str = "train"):
+        """
+        sample_ids: (B,) long  (NeMo return_sample_id=True일 때 dataset index)
+        returns: (B,3,T_mel) float32 (f0, energy, vuv)
+        """
+        if sample_ids is None:
+            return None
+
+        root = Path(getattr(self.cfg, "phys_cache_root", ""))
+        if not root.exists():
+            return None
+
+        # dataset index -> manifest_id(1-based)로 변환 (필터링 대응)
+        if getattr(self, "sampleid_to_manifest_id", None) is not None:
+            manifest_ids = self.sampleid_to_manifest_id.to(sample_ids.device)[sample_ids]  # (B,)
+        else:
+            # fallback: 필터링 없다고 가정
+            manifest_ids = sample_ids + 1
+
+        B = int(sample_ids.numel())
+
+        # (중요) GPU 텐서를 루프에서 개별 대입하면 작은 H2D copy가 B번 생김
+        # => CPU에서 만들고 한 번에 GPU로 올리는 게 보통 더 빠름
+        out_cpu = torch.zeros((B, 3, T_mel), dtype=torch.float32, device="cpu")
+
+        for b in range(B):
+            mid = int(manifest_ids[b].item())
+            key = (split_name, mid)
+
+            arr = self._phys_lru_get(key)
+            if arr is None:
+                p = root / split_name / f"{mid}{self.phys_cache_ext}"
+                if not p.exists():
+                    continue
+
+                if self.phys_cache_ext == ".npy":
+                    # mmap 가능
+                    arr = np.load(p, mmap_mode="r")  # (3,T_src) float16
+                else:
+                    # (구형 npz를 유지한다면) 여기서 np.load(p) 후 key로 읽기
+                    data = np.load(p)
+                    f0 = data["f0"].astype(np.float32)
+                    eng = data["energy"].astype(np.float32)
+                    vuv = data["vuv"].astype(np.float32)
+                    arr = np.stack([f0, eng, vuv], axis=0).astype(np.float32)
+
+                self._phys_lru_put(key, arr)
+
+            # numpy(memmap) -> torch
+            phys = torch.from_numpy(np.array(arr, copy=False))  # float16 or float32
+            if phys.dtype != torch.float32:
+                phys = phys.float()
+
+            # 길이 맞추기 (T_src -> T_mel)
+            # torch interpolate로 1번에 처리 (np.interp 3번보다 보통 낫습니다)
+            T_src = phys.size(-1)
+            if T_src != T_mel:
+                phys = F.interpolate(
+                    phys.unsqueeze(0),  # (1,3,T_src)
+                    size=T_mel,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0)
+
+            out_cpu[b] = phys
+
+        # TODO: 정규화 한 버전 vs 안 한 버전 비교하기
+        # (선택) 정규화: 기존과 동일하게 frame축 기준 z-score
+        # mean = out_cpu.mean(dim=-1, keepdim=True)
+        # std = out_cpu.std(dim=-1, keepdim=True).clamp_min(1e-5)
+        # out_cpu = (out_cpu - mean) / std
+
+        # GPU로 한 번에 올림
+        out = out_cpu.to(self.device, non_blocking=True)
+        return out
+
+    def _phys_lru_get(self, key):
+        if key not in self._phys_lru:
+            return None
+        val = self._phys_lru.pop(key)
+        self._phys_lru[key] = val
+        return val
+
+    def _phys_lru_put(self, key, val):
+        self._phys_lru[key] = val
+        if len(self._phys_lru) > self.phys_cache_lru:
+            self._phys_lru.popitem(last=False)
+    
     def _run_teacher(self, preprocessed_signal, processed_signal_length):
         """그림 기준 왼쪽 Teacher Encoder + Decoder 한 번만 실행."""
         self.tch_feats.clear()
@@ -990,6 +1137,98 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             xlabel="time",
             ylabel="channel",
         )
+        # 5) 2D projection (PCA / TSNE) + label coloring ===============
+        # mask로 pooling
+        T = txt_emb.size(-1)
+        if enc_len is None:
+            enc_len = getattr(self, "t_enc_len", None)
+        mask = None
+        if enc_len is not None:
+            mask = self._make_len_mask(enc_len, T, device=txt_emb.device, dtype=torch.float32)  # (B,T)
+
+        def masked_mean_BCT(x):
+            # x: (B,C,T)
+            if mask is None:
+                return x.mean(dim=-1)
+            denom = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            return (x * mask[:, None, :]).sum(dim=-1) / denom[:, None]
+
+        # utterance-level stats for projection
+        txt_stat  = masked_mean_BCT(txt_emb).detach()
+        spk_stat  = masked_mean_BCT(spk_emb).detach()   # (B,C)  (spk_stat을 따로 넘기면 더 좋지만, 여기선 mean 사용)
+        pros_stat = masked_mean_BCT(pros_emb).detach()
+
+        # subsample for plotting if huge batch
+        max_pts = int(getattr(self.cfg, "disen_vis_proj_max_points", 256))
+        if B > max_pts:
+            idx = torch.randperm(B, device=txt_stat.device)[:max_pts]
+            txt_stat, spk_stat, pros_stat = txt_stat[idx], spk_stat[idx], pros_stat[idx]
+            if speaker_ids is not None:
+                speaker_ids = speaker_ids[idx]
+            B = max_pts
+
+        # projection method
+        method = str(getattr(self.cfg, "disen_vis_proj_method", "pca")).lower()
+
+        def proj2d(X, method="pca"):
+            # X: (N,D) torch
+            X = X.float()
+            X = X - X.mean(dim=0, keepdim=True)
+            if X.size(0) < 2:
+                return X.new_zeros((X.size(0), 2)).cpu().numpy()
+
+            if method == "tsne":
+                try:
+                    from sklearn.manifold import TSNE
+                    Xn = X.detach().cpu().numpy()
+                    # perplexity는 N에 맞춰야 함
+                    N = Xn.shape[0]
+                    perp = float(min(30, max(2, (N - 1) // 3)))
+                    Z = TSNE(
+                        n_components=2,
+                        init="pca",
+                        learning_rate="auto",
+                        perplexity=perp,
+                        random_state=0
+                    ).fit_transform(Xn)
+                    return Z
+                except Exception:
+                    method = "pca"
+
+            # PCA (torch SVD)
+            # X: (N,D) -> Vh: (k,D)
+            U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+            W = Vh[:2].T  # (D,2)
+            Z = (X @ W).detach().cpu().numpy()
+            return Z
+
+        Z_txt  = proj2d(txt_stat, method=method)
+        Z_spk  = proj2d(spk_stat, method=method)
+        Z_pros = proj2d(pros_stat, method=method)
+
+        # colors
+        if speaker_ids is not None:
+            c = speaker_ids.detach().cpu().numpy()
+        else:
+            c = np.arange(B)
+
+        fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+        scat0 = axes[0].scatter(Z_txt[:, 0],  Z_txt[:, 1],  c=c, s=14)
+        axes[0].set_title("txt_stat 2D (colored by speaker)")
+        axes[0].set_xticks([]); axes[0].set_yticks([])
+
+        axes[1].scatter(Z_spk[:, 0],  Z_spk[:, 1],  c=c, s=14)
+        axes[1].set_title("spk_stat 2D (colored by speaker)")
+        axes[1].set_xticks([]); axes[1].set_yticks([])
+
+        axes[2].scatter(Z_pros[:, 0], Z_pros[:, 1], c=c, s=14)
+        axes[2].set_title("pros_stat 2D (colored by speaker)")
+        axes[2].set_xticks([]); axes[2].set_yticks([])
+
+        # 공통 colorbar (speaker id가 많아도 대충 추세 확인 가능)
+        fig.colorbar(scat0, ax=axes, fraction=0.02, pad=0.02)
+        fig.suptitle(f"2D projection ({method}) @ step {step}")
+        self._save_fig(fig, f"step{step:06d}_proj_{method}_speaker.png")
 
     def _text_spk_probe(self, txt_emb, speaker_ids):
         if (self.txt_spk_probe_cls is None) or (speaker_ids is None):
@@ -1058,92 +1297,20 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.sampleid_to_manifest_id = None
             print(f"[WARN] could not build sampleid_to_manifest_id mapping: {e}")
 
-    def _phys_lru_get(self, key):
-        if key not in self._phys_lru:
-            return None
-        val = self._phys_lru.pop(key)
-        self._phys_lru[key] = val
-        return val
-
-    def _phys_lru_put(self, key, val):
-        self._phys_lru[key] = val
-        if len(self._phys_lru) > self.phys_cache_lru:
-            self._phys_lru.popitem(last=False)
-
-    def _get_phys_targets(self, sample_ids: torch.Tensor, T_mel: int, split_name: str = "train"):
+    @staticmethod
+    def _make_len_mask(lengths: torch.Tensor, T: int, device=None, dtype=torch.float32):
         """
-        sample_ids: (B,) long  (NeMo return_sample_id=True일 때 dataset index)
-        returns: (B,3,T_mel) float32 (f0, energy, vuv)
+        lengths: (B,)  각 샘플의 유효 길이
+        return : (B,T) 0/1 mask (1=valid)
         """
-        if sample_ids is None:
+        if lengths is None:
             return None
-
-        root = Path(getattr(self.cfg, "phys_cache_root", ""))
-        if not root.exists():
-            return None
-
-        # dataset index -> manifest_id(1-based)로 변환 (필터링 대응)
-        if getattr(self, "sampleid_to_manifest_id", None) is not None:
-            manifest_ids = self.sampleid_to_manifest_id.to(sample_ids.device)[sample_ids]  # (B,)
-        else:
-            # fallback: 필터링 없다고 가정
-            manifest_ids = sample_ids + 1
-
-        B = int(sample_ids.numel())
-
-        # (중요) GPU 텐서를 루프에서 개별 대입하면 작은 H2D copy가 B번 생김
-        # => CPU에서 만들고 한 번에 GPU로 올리는 게 보통 더 빠름
-        out_cpu = torch.zeros((B, 3, T_mel), dtype=torch.float32, device="cpu")
-
-        for b in range(B):
-            mid = int(manifest_ids[b].item())
-            key = (split_name, mid)
-
-            arr = self._phys_lru_get(key)
-            if arr is None:
-                p = root / split_name / f"{mid}{self.phys_cache_ext}"
-                if not p.exists():
-                    continue
-
-                if self.phys_cache_ext == ".npy":
-                    # mmap 가능
-                    arr = np.load(p, mmap_mode="r")  # (3,T_src) float16
-                else:
-                    # (구형 npz를 유지한다면) 여기서 np.load(p) 후 key로 읽기
-                    data = np.load(p)
-                    f0 = data["f0"].astype(np.float32)
-                    vuv = data["vuv"].astype(np.float32)
-                    eng = data["energy"].astype(np.float32)
-                    arr = np.stack([f0, eng, vuv], axis=0).astype(np.float32)
-
-                self._phys_lru_put(key, arr)
-
-            # numpy(memmap) -> torch
-            phys = torch.from_numpy(np.array(arr, copy=False))  # float16 or float32
-            if phys.dtype != torch.float32:
-                phys = phys.float()
-
-            # 길이 맞추기 (T_src -> T_mel)
-            # torch interpolate로 1번에 처리 (np.interp 3번보다 보통 낫습니다)
-            T_src = phys.size(-1)
-            if T_src != T_mel:
-                phys = F.interpolate(
-                    phys.unsqueeze(0),  # (1,3,T_src)
-                    size=T_mel,
-                    mode="linear",
-                    align_corners=False,
-                ).squeeze(0)
-
-            out_cpu[b] = phys
-
-        # (선택) 정규화: 기존과 동일하게 frame축 기준 z-score
-        mean = out_cpu.mean(dim=-1, keepdim=True)
-        std = out_cpu.std(dim=-1, keepdim=True).clamp_min(1e-5)
-        out_cpu = (out_cpu - mean) / std
-
-        # GPU로 한 번에 올림
-        out = out_cpu.to(self.device, non_blocking=True)
-        return out
+        if device is None:
+            device = lengths.device
+        lengths = lengths.to(device)
+        t = torch.arange(T, device=device).unsqueeze(0)  # (1,T)
+        mask = (t < lengths.unsqueeze(1)).to(dtype=dtype)  # (B,T)
+        return mask
 
 class GlobalStyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):
@@ -1269,11 +1436,15 @@ class GlobalProsodyReferenceEncoder(nn.Module):
 
 class ClubGaussian(nn.Module):
     """
-    I(U;V) ≤ E_{p(u,v)}[ log q(u|v) ] - E_{p(u)p(v)}[ log q(u|v) ]
-    q(u|v) = N(u | mu(v), diag(sigma^2(v)))
+    vCLUB for dynamic-dynamic: U_{1:T}, V_{1:T}
+    I(U;V) <= E_{p(u,v)}[log q(u|v)] - E_{p(u)p(v)}[log q(u|v)]
+
+    q(u_t | v_t) = N(u_t | mu(v_t), diag(sigma^2(v_t)))
     """
     def __init__(self, u_dim=96, v_dim=96, hidden=128):
         super().__init__()
+        self.u_dim = int(u_dim)
+        self.v_dim = int(v_dim)
         self.net = nn.Sequential(
             nn.Linear(v_dim, hidden), nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden), nn.ReLU(inplace=True)
@@ -1281,29 +1452,101 @@ class ClubGaussian(nn.Module):
         self.mu = nn.Linear(hidden, u_dim)
         self.logvar = nn.Linear(hidden, u_dim)
 
-    def log_q(self, u, v):
-        # u,v shape: (B, latent_dim=96, T)
-        v = v.transpose(1, 2)
-        u = u.transpose(1, 2)
-        # u: (B,Du), v:(B,Dv)  → log N(u|μ(v), Σ(v))
-        h = self.net(v)
-        mu = self.mu(h)
-        logvar = self.logvar(h).clamp(min=-8.0, max=8.0)
-        # 로그우도(대각가우시안)
-        ll = -0.5 * (math.log(2*math.pi) + logvar) - 0.5 * ((u - mu)**2) / logvar.exp()
-        return ll.mean(dim=-1)  # (B, T, latent_dim=96)
-    
-    def mi_upper(self, u, v):
-        # positive
-        log_q_pos = self.log_q(u, v).mean()
-        # negative with shuffled v
-        v_shuffle = v[torch.randperm(v.size(0), device=v.device)]
-        log_q_neg = self.log_q(u, v_shuffle).mean()
-        return (log_q_pos - log_q_neg)
+    def log_q(self, u, v, reduce_time="mean", mask=None, reduce_dim="mean"):
+        """
+        u: (B,Du,T), v: (B,Dv,T)
+        mask: (B,T) 0/1 (1=valid)
+        reduce_dim: "mean" or "sum"  (Du 차원 축약 방식)
+        return: (B,) aggregated log q(u|v)
+        """
+        if u.dim() != 3 or v.dim() != 3:
+            raise ValueError("u and v must be 3D tensors (B,D,T)")
+        if u.size(0) != v.size(0) or u.size(2) != v.size(2):
+            raise ValueError(f"shape mismatch: u={tuple(u.shape)}, v={tuple(v.shape)}")
 
-    def ll_loss(self, u, v):
-        # LLL = -E[log q(u|v)]
-        return -self.log_q(u, v).mean()
+        B, Du, T = u.shape
+        u_seq = u.transpose(1, 2)  # (B,T,Du)
+        v_seq = v.transpose(1, 2)  # (B,T,Dv)
+
+        h = self.net(v_seq)            # (B,T,H)
+        mu = self.mu(h)                # (B,T,Du)
+        logvar = self.logvar(h).clamp(-8.0, 8.0)  # (B,T,Du)
+
+        ll = -0.5 * (math.log(2 * math.pi) + logvar) - 0.5 * ((u_seq - mu) ** 2) / logvar.exp()
+        # ll: (B,T,Du)
+
+        # --- dim reduce ---
+        if reduce_dim == "sum":
+            ll = ll.sum(dim=-1)   # (B,T)
+        else:
+            ll = ll.mean(dim=-1)  # (B,T)
+
+        # --- time mask ---
+        if mask is not None:
+            mask_f = mask.to(ll.device).float()
+            if mask_f.shape != (B, T):
+                raise ValueError(f"mask must be (B,T), got {tuple(mask_f.shape)} vs {(B,T)}")
+            ll = ll * mask_f
+            denom = mask_f.sum(dim=1).clamp(min=1.0)  # (B,)
+        else:
+            denom = ll.new_full((B,), float(T))
+
+        # --- time reduce ---
+        if reduce_time == "sum":
+            out = ll.sum(dim=1)               # (B,)
+        else:  # mean
+            out = ll.sum(dim=1) / denom       # (B,)
+
+        return out
+
+    def ll_loss(self, u, v, reduce_time="mean", mask=None, reduce_dim="mean"):
+        # LLL = - E_{p(u,v)}[log q(u|v)]
+        return -self.log_q(u, v, reduce_time=reduce_time, mask=mask, reduce_dim=reduce_dim).mean()
+
+    def mi_upper(self, u, v, K=8, reduce_time="mean", mask=None, reduce_dim="mean"):
+        """
+        K-negative sampled vCLUB upper bound
+        u: (B,Du,T), v: (B,Dv,T)
+        mask: (B,T)
+        """
+        if u.size(0) < 2:
+            return u.new_tensor(0.0)
+
+        B, _, T = u.shape
+        device = u.device
+        K = max(1, int(K))
+
+        # positive (u_i, v_i)
+        pos = self.log_q(u, v, reduce_time=reduce_time, mask=mask, reduce_dim=reduce_dim).mean()
+
+        # negative: (u_i, v_j)
+        idx = torch.randint(0, B, (B, K), device=device)
+        i_idx = torch.arange(B, device=device).unsqueeze(1)
+        idx = torch.where(idx == i_idx, (idx + 1) % B, idx)  # avoid j==i
+
+        # v_neg: (B*K, Dv, T)
+        v_neg = v[idx.reshape(-1)]
+
+        # u_rep: (B*K, Du, T)
+        u_rep = u.unsqueeze(1).expand(B, K, u.size(1), T).reshape(-1, u.size(1), T)
+
+        # --- mask 교집합 (u_i length ∩ v_j length) ---
+        if mask is not None:
+            mask_u = mask.to(device).float()                 # (B,T)
+            mask_u_rep = mask_u.unsqueeze(1).expand(B, K, T).reshape(-1, T)  # (B*K,T)
+            mask_v_neg = mask_u[idx.reshape(-1)]             # (B*K,T)  (mask of v_j)
+            pair_mask = mask_u_rep * mask_v_neg              # intersection
+        else:
+            pair_mask = None
+
+        neg = self.log_q(
+            u_rep, v_neg,
+            reduce_time=reduce_time,
+            mask=pair_mask,
+            reduce_dim=reduce_dim
+        ).mean()
+
+        return pos - neg
 
 class ARClubGaussian(nn.Module):
     """
@@ -1338,19 +1581,15 @@ class ARClubGaussian(nn.Module):
         z0 = torch.zeros_like(u_seq[:, :1, :])
         return torch.cat([z0, u_seq[:, :-1, :]], dim=1)  # (B,T,Du)
 
-    def log_q(self, u, v, reduce_time="mean", mask=None):
+    def log_q(self, u, v, reduce_time="mean", mask=None, reduce_dim="mean"):
         """
         u: (B, Du, T)
         v: (B, Dv)   (static)
-        return: (B, T)  log q(u_t | u_{<t}, v) summed over Du
+        return: (B,) aggregated log q(u_{1:T} | v)
         """
-        # (B,Du,T) -> (B,T,Du)
-        u_seq = u.transpose(1, 2)
+        u_seq = u.transpose(1, 2)  # (B,T,Du)
 
-        # init hidden from v
         h0 = self.v_to_h0(v).unsqueeze(0)  # (1,B,H)
-
-        # GRU input is shifted u (so that at t, it has u_<t)
         causal_u = self._shift_right(u_seq)    # (B,T,Du)
         h, _ = self.gru(causal_u, h0)          # (B,T,H)
 
@@ -1358,60 +1597,61 @@ class ARClubGaussian(nn.Module):
         logvar = self.logvar(h).clamp(-8.0, 8.0)   # (B,T,Du)
 
         ll = -0.5 * (math.log(2 * math.pi) + logvar) - 0.5 * ((u_seq - mu) ** 2) / logvar.exp()
-        ll = ll.mean(dim=-1)  # (B,T)
-        
+        # ll: (B,T,Du)
+
+        # --- dim reduce ---
+        if reduce_dim == "sum":
+            ll = ll.sum(dim=-1)   # (B,T)
+        else:
+            ll = ll.mean(dim=-1)  # (B,T)
+
         # 길이 마스크
         if mask is not None:
-            ll = ll * mask                     # mask: (B,T), 0/1
-            denom = mask.sum(dim=1).clamp(min=1.0)  # (B,)
+            mask_f = mask.to(ll.device).float()      # (B,T)
+            ll = ll * mask_f
+            denom = mask_f.sum(dim=1).clamp(min=1.0)  # (B,)
         else:
             denom = ll.new_full((ll.size(0),), ll.size(1))  # (B,) = T
-        
-        # time reduce
+
         if reduce_time == "sum":
             out = ll.sum(dim=1)               # (B,)
-        else:  # "mean"
+        else:
             out = ll.sum(dim=1) / denom       # (B,)
-        
+
         return out
 
-    def ll_loss(self, u, v, reduce_time="mean", mask=None):
-        # LLL = - E[log q(u|v)]
-        return -self.log_q(u, v, reduce_time=reduce_time, mask=mask).mean()
+    def ll_loss(self, u, v, reduce_time="mean", mask=None, reduce_dim="mean"):
+        return -self.log_q(u, v, reduce_time=reduce_time, mask=mask, reduce_dim=reduce_dim).mean()
 
-    def mi_upper(self, u, v, K=8, reduce_time="mean", mask=None):
+    def mi_upper(self, u, v, K=8, reduce_time="mean", mask=None, reduce_dim="mean"):
         """
         u: (B,Du,T)
-        v: (B,Dv)
-        return: scalar
+        v: (B,Dv) static
+        mask: (B,T) for u
         """
         B = u.size(0)
+        if B < 2:
+            return u.new_tensor(0.0)
+
         device = u.device
+        K = max(1, int(K))
 
         # positive: (u_i, v_i)
-        pos = self.log_q(u, v, reduce_time=reduce_time, mask=mask).mean()  # scalar
+        pos = self.log_q(u, v, reduce_time=reduce_time, mask=mask, reduce_dim=reduce_dim).mean()
 
-        # negative: (u_j, v_i) with K samples per i
-        # idx: (B,K)
+        # negative: (u_j, v_i)
         idx = torch.randint(0, B, (B, K), device=device)
-
-        # (선택) j != i 강제 (원하면)
         i_idx = torch.arange(B, device=device).unsqueeze(1)
         idx = torch.where(idx == i_idx, (idx + 1) % B, idx)
 
-        # u_neg: (B,K,Du,T) -> (B*K,Du,T)
-        u_neg = u[idx.reshape(-1)]  # fancy indexing
+        u_neg = u[idx.reshape(-1)]  # (B*K,Du,T)
+        v_rep = v.unsqueeze(1).expand(B, K, v.size(1)).reshape(-1, v.size(1))  # (B*K,Dv)
 
-        # v_i를 K번 반복: (B,Dv) -> (B,K,Dv) -> (B*K,Dv)
-        v_rep = v.unsqueeze(1).expand(B, K, v.size(1)).reshape(-1, v.size(1))
-
-        # mask도 같이 반복해줘야 함 (mask: (B,T) 가정)
+        # mask는 반드시 u_neg에 맞춰야 함
         if mask is not None:
-            mask_rep = mask.unsqueeze(1).expand(B, K, mask.size(1)).reshape(-1, mask.size(1))
+            mask_neg = mask.to(device)[idx.reshape(-1)]  # (B*K,T)
         else:
-            mask_rep = None
+            mask_neg = None
 
-        neg = self.log_q(u_neg, v_rep, reduce_time=reduce_time, mask=mask_rep).mean()
-
+        neg = self.log_q(u_neg, v_rep, reduce_time=reduce_time, mask=mask_neg, reduce_dim=reduce_dim).mean()
         return pos - neg
-

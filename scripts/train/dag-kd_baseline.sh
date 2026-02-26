@@ -24,4 +24,4 @@ python train.py \
   --txt_probe_lr 0.001 \
   --disen_mi_pairs "ts,tp,ps" \
   --disen_lll_weight 1.0 \
-  --disen_mi_weight 0.01 
+  --disen_mi_weight 1.0 
