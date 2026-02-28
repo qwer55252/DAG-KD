@@ -1,4 +1,4 @@
-import re, os, json, uuid, glob, torch, argparse, librosa, unicodedata
+import re, os, sys, json, uuid, glob, torch, argparse, librosa, unicodedata, shutil
 import numpy as np
 import regex as re_u
 import soundfile as sf
@@ -1032,4 +1032,20 @@ def build_phys_cache_for_manifest(
 
     print(f"[phys-cache] {split_name}: created={n_new}, skipped={n_skip}, failed={n_fail}, out_dir={out_dir}")
 
+def snapshot_sources(out_dir: str):
+    out_dir = Path(out_dir)
+    snap_dir = out_dir / "source_snapshot"
+    snap_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1) train.py (현재 실행중인 파일)
+    train_path = Path(__file__).resolve()
+    shutil.copy2(train_path, snap_dir / "train.py")
+
+    # 2) models.py / utils.py (import된 모듈의 실제 파일)
+    import models, utils
+    shutil.copy2(Path(models.__file__).resolve(), snap_dir / "models.py")
+    shutil.copy2(Path(utils.__file__).resolve(), snap_dir / "utils.py")
+    
+    # 실제 실행 커맨드 원문은 쉘에서 넘겨준 argv로 복원 가능
+    (snap_dir / "cmd.txt").write_text(" ".join(map(str, sys.argv)) + "\n", encoding="utf-8")
+    

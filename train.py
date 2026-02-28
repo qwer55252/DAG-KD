@@ -6,13 +6,13 @@
   1) Generative KD (Flow Matching 또는 DiffKD)로 layer feature를 정렬
   2) Logit KD (CTC 로짓 KL)
   3) Layerwise Metric KD (MSE)
-  4) Disentanglement (언어/화자 적대 분류기 + GRL)로 content 보존 유도
 을 결합.
 """
 
 import os
 import json
 import torch
+import inspect
 import aiohttp
 import argparse
 import statistics
@@ -39,7 +39,8 @@ from utils import (
     int_list_arg,
     save_speaker_mapping,
     save_mel_examples_from_manifest,
-    build_phys_cache_for_manifest
+    build_phys_cache_for_manifest,
+    snapshot_sources
 )
 
 def main():
@@ -112,6 +113,7 @@ def main():
 
     # Output & manifests
     os.makedirs(args.out, exist_ok=True)
+    snapshot_sources(args.out)
     manifest_dir = os.path.join(args.data_dir, args.data_cfg, "manifests")
     os.makedirs(manifest_dir, exist_ok=True)
 

@@ -236,9 +236,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ===== MI 추정기 (vCLUB) =====
         self.mi_weight = getattr(cfg, "disen_mi_weight", 1.0)        # λ_MI
         self.mi_pairs = getattr(cfg, "disen_mi_pairs", "ts,tp,ps")   # 사용 쌍
-        self.club_tp = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
+        # self.club_tp = ClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim)
         self.club_ts = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 128))
         self.club_ps = ARClubGaussian(u_dim=self.latent_dim, v_dim=self.latent_dim, hidden=getattr(cfg, "club_hidden", 128))
+        club_hidden = int(getattr(cfg, "club_hidden", 128))
+        max_samp = int(getattr(cfg, "club_tp_max_samples", 2048))  # 새 cfg 옵션(없으면 2048)
+        self.club_tp = ClubGaussian(x_dim=self.latent_dim,y_dim=self.latent_dim,hidden_size=club_hidden, max_samples=max_samp)
 
         # LLL 가중치 (논문 식(7)에서 IvCLUB + LLL 같이 들어감)
         self.lll_weight = getattr(cfg, "disen_lll_weight", 1.0)
@@ -1434,6 +1437,7 @@ class GlobalProsodyReferenceEncoder(nn.Module):
 
         return out_seq if return_seq else ref_global
 
+'''
 class ClubGaussian(nn.Module):
     """
     vCLUB for dynamic-dynamic: U_{1:T}, V_{1:T}
@@ -1547,6 +1551,155 @@ class ClubGaussian(nn.Module):
         ).mean()
 
         return pos - neg
+'''
+
+class ClubGaussian(nn.Module):
+    """
+    Vector CLUB q(y|x) with Gaussian assumption.
+    - base API: forward(x_samples, y_samples), learning_loss(x_samples, y_samples)
+      expects x_samples,y_samples: (N, Dx/Dy)
+
+    Added for this project:
+    - mi_upper(u, v, K=..., mask=..., reduce_dim=...)
+    - ll_loss(u, v, mask=..., reduce_dim=...)
+      expects u,v: (B, D, T) for dynamic-dynamic (tp)
+      where we interpret q(u|v) => x=v, y=u
+    """
+    def __init__(self, x_dim, y_dim, hidden_size, max_samples=2048):
+        super().__init__()
+        self.x_dim = int(x_dim)
+        self.y_dim = int(y_dim)
+        self.max_samples = int(max_samples)
+
+        self.p_mu = nn.Sequential(
+            nn.Linear(self.x_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, self.y_dim),
+        )
+        self.p_logvar = nn.Sequential(
+            nn.Linear(self.x_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, self.y_dim),
+            nn.Tanh(),  # logvar in (-1,1) for stability (original impl)
+        )
+
+    def get_mu_logvar(self, x_samples):
+        mu = self.p_mu(x_samples)
+        logvar = self.p_logvar(x_samples)
+        return mu, logvar
+
+    # ---------- original CLUB style ----------
+    def forward(self, x_samples, y_samples):
+        """
+        returns scalar MI upper estimate (all-pairs negative, O(N^2))
+        NOTE: kept for compatibility; not used in training here (we use K-negative).
+        """
+        mu, logvar = self.get_mu_logvar(x_samples)
+
+        positive = - (mu - y_samples) ** 2 / 2.0 / logvar.exp()  # (N,Dy)
+
+        prediction_1 = mu.unsqueeze(1)          # (N,1,Dy)
+        y_samples_1  = y_samples.unsqueeze(0)   # (1,N,Dy)
+
+        negative = - ((y_samples_1 - prediction_1) ** 2).mean(dim=1) / 2.0 / logvar.exp()  # (N,Dy)
+
+        return (positive.sum(dim=-1) - negative.sum(dim=-1)).mean()
+
+    def loglikeli(self, x_samples, y_samples):
+        """
+        unnormalized loglikelihood (original)
+        """
+        mu, logvar = self.get_mu_logvar(x_samples)
+        return (-(mu - y_samples) ** 2 / logvar.exp() - logvar).sum(dim=1).mean(dim=0)
+
+    def learning_loss(self, x_samples, y_samples):
+        return -self.loglikeli(x_samples, y_samples)
+
+    # ---------- project helpers ----------
+    def _seq_to_samples(self, x, y, mask=None):
+        """
+        x,y: (B,D,T) or already (N,D)
+        mask: (B,T) float/bool, 1=valid (optional)
+
+        returns:
+          x_s, y_s : (N,D)
+        """
+        if x.dim() == 3:
+            # (B,D,T)->(B,T,D)->(N,D)
+            B, Dx, T = x.shape
+            x_s = x.transpose(1, 2).reshape(-1, Dx)
+            y_s = y.transpose(1, 2).reshape(-1, y.size(1))
+            if mask is not None:
+                m = mask.reshape(-1).bool()
+                x_s = x_s[m]
+                y_s = y_s[m]
+        elif x.dim() == 2:
+            x_s, y_s = x, y
+        else:
+            raise ValueError(f"expected x dim 2 or 3, got {x.dim()}")
+
+        # subsample to avoid explosion
+        N = x_s.size(0)
+        if self.max_samples and N > self.max_samples:
+            idx = torch.randperm(N, device=x_s.device)[: self.max_samples]
+            x_s = x_s[idx]
+            y_s = y_s[idx]
+
+        return x_s, y_s
+
+    def ll_loss(self, u, v, mask=None, reduce_dim="mean"):
+        """
+        LLL term: -E[log q(u|v)]  (train CLUB parameters)
+        u,v: (B,D,T) for tp (dynamic-dynamic)
+        """
+        # q(u|v) => x=v, y=u
+        x_s, y_s = self._seq_to_samples(v, u, mask=mask)
+        loss = self.learning_loss(x_s, y_s)  # scalar
+
+        # scale option (to align with your reduce_dim="mean" convention)
+        if reduce_dim == "mean":
+            loss = loss / float(self.y_dim)
+        return loss
+
+    def mi_upper(self, u, v, K=8, mask=None, reduce_dim="mean"):
+        """
+        MI upper estimate with K-negative sampling (O(N*K)).
+        u,v: (B,D,T)
+        """
+        x_s, y_s = self._seq_to_samples(v, u, mask=mask)  # q(u|v) => x=v, y=u
+        N = x_s.size(0)
+        if N < 2:
+            return x_s.new_tensor(0.0)
+
+        mu, logvar = self.get_mu_logvar(x_s)  # (N,Dy)
+        var = logvar.exp()
+
+        # positive: (x_i, y_i)
+        pos = - (mu - y_s) ** 2 / 2.0 / var  # (N,Dy)
+
+        # negative: (x_i, y_j)
+        K = max(1, int(K))
+        idx = torch.randint(0, N, (N, K), device=x_s.device)
+        i_idx = torch.arange(N, device=x_s.device).unsqueeze(1)
+        idx = torch.where(idx == i_idx, (idx + 1) % N, idx)
+
+        y_neg = y_s[idx]                 # (N,K,Dy)
+        mu_e  = mu.unsqueeze(1)          # (N,1,Dy)
+        var_e = var.unsqueeze(1)         # (N,1,Dy)
+
+        neg = - (y_neg - mu_e) ** 2 / 2.0 / var_e  # (N,K,Dy)
+        neg = neg.mean(dim=1)                      # (N,Dy)  평균 over K
+
+        # reduce over dim
+        if reduce_dim == "mean":
+            pos_r = pos.mean(dim=-1)   # (N,)
+            neg_r = neg.mean(dim=-1)   # (N,)
+        else:
+            pos_r = pos.sum(dim=-1)
+            neg_r = neg.sum(dim=-1)
+
+        return (pos_r - neg_r).mean()
+
 
 class ARClubGaussian(nn.Module):
     """
