@@ -91,6 +91,13 @@ def main():
     p.add_argument("--disen_lll_weight", type=float, default=1.0)
     p.add_argument("--disen_mi_weight", type=float, default=1e-3)
 
+    # Reconstruction: cross-reconstruction vs trivial AE
+    p.add_argument("--use_cross_recon", type=str2bool, default=False,
+                   help="True: txt_emb+spk_emb→teacher last layer (DRIT 방식), False: 기존 trivial AE")
+    # Physical quantity normalization
+    p.add_argument("--use_phys_norm", type=str2bool, default=False,
+                   help="True: f0/energy z-score + voicing BCE, False: 기존 MSE 전체")
+
     # W&B
     p.add_argument("--wandb_project", type=str, default=os.getenv("PRJ_NAME", "DAG-KD"))
     p.add_argument("--wandb_run", type=str, default=os.getenv("EXP_NAME", "dagkd_run"))
@@ -327,7 +334,9 @@ def main():
     stu_cfg.lll_lambda_max  = args.lll_lambda_max
     stu_cfg.mi_clamp_min0   = args.mi_clamp_min0
     stu_cfg.club_hidden = 128
-    
+    stu_cfg.use_cross_recon = args.use_cross_recon
+    stu_cfg.use_phys_norm   = args.use_phys_norm
+
     stu_cfg.phys_cache_root = str(phys_cache_root)
     stu_cfg.phys_cache_hop_ms = HOP_MS
     stu_cfg.phys_cache_sr = SR
