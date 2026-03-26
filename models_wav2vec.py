@@ -859,15 +859,19 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
 
         # Greedy decode → WER
         pred_ids = logits.argmax(dim=-1)  # (B, T)
-        # CTC blank/repeat collapse
-        pred_strs = self._ctc_decode_batch(pred_ids)
-
-        label_ids = labels.clone()
-        label_ids[label_ids == -100] = self._blank_id
-        ref_strs = self._ctc_decode_batch(label_ids, collapse=False)
-
-        from utils import compute_sample_wers
-        wers = compute_sample_wers(ref_strs, pred_strs)
+        processor = getattr(self, "processor", None)
+        if processor is not None:
+            # CTC collapse 후 processor.decode로 문자열 변환
+            pred_id_lists = self._ctc_decode_batch(pred_ids)
+            pred_strs = [processor.decode(ids) for ids in pred_id_lists]
+            ref_strs = [
+                processor.decode([t for t in row.tolist() if t != -100 and t != self._blank_id])
+                for row in labels
+            ]
+            from utils import compute_sample_wers
+            wers = compute_sample_wers(ref_strs, pred_strs)
+        else:
+            wers = []
         wer_mean = float(sum(wers) / len(wers)) if wers else 0.0
         self.log("val/wer", wer_mean, on_epoch=True, prog_bar=True, sync_dist=True)
         return {"val/wer": wer_mean}
