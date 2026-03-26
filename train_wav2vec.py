@@ -117,12 +117,11 @@ class DataCollatorCTCPadding:
 
         # ---- 텍스트 토크나이징 + 레이블 패딩 ----
         texts = [f["text"] for f in features]
-        with self.processor.as_target_processor():
-            label_batch = self.processor(
-                text=texts,
-                padding=True,
-                return_tensors="pt",
-            )
+        label_batch = self.processor.tokenizer(
+            texts,
+            padding=True,
+            return_tensors="pt",
+        )
         # padding 위치를 -100으로 (CTC ignore index)
         labels = label_batch["input_ids"].masked_fill(
             label_batch["attention_mask"].ne(1), -100
@@ -574,6 +573,9 @@ def main():
         # Audio
         sample_rate=args.sample_rate,
     )
+
+    # processor를 모델에 주입 (validation_step의 WER 디코딩에서 사용)
+    model.processor = processor
 
     # ---- DataModule ----
     dm = Wav2VecDataModule(
