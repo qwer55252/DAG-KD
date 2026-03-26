@@ -1,9 +1,10 @@
 #!/bin/bash
-# E4: No Physical Loss — F0/Energy/VUV supervision 제거, Mel Reconstruction만 남김
-# 가정: 물리량 감독 없이 멜 재구성만으로 prosody embedding이 충분한가?
+# E7: MI(txt↔spk) — Rec(txt) 없음, k=5 Conv1D projection 사용 (E1에서 txt rec 제거)
+# [Table 3] Rec(txt) ablation: E1 vs E7
+# 가정: ts MI에서 txt AE reconstruction이 없어도 k=5 projection만으로 동등한 성능이 나오는가?
 python train.py \
-  --wandb_run ablation-E4_no_phys \
-  --out outputs/exp_ablation_component/E4_no_phys \
+  --wandb_run ablation-E7_mi_ts_norec \
+  --out outputs/exp_ablation_component/E7_mi_ts_norec \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
   --train_split train.clean.100 \
@@ -22,14 +23,15 @@ python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-  --use_txt_spk_probe True \
+  --use_txt_spk_probe False \
   --txt_probe_lambda 1.0 \
   --txt_probe_lr 0.001 \
-  --disen_mi_pairs "ts,tp,ps" \
+  --disen_mi_pairs "ts" \
   --disen_lll_weight 1.0 \
   --disen_mi_weight 1.0 \
   --use_pros True \
   --use_mi True \
   --use_rec_loss True \
-  --use_phys_loss False \
+  --use_txt_rec_loss False \
+  --use_phys_loss True \
   --use_mse_kd False

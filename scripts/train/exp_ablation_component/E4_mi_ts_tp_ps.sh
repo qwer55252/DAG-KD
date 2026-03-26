@@ -1,11 +1,12 @@
 #!/bin/bash
-# E6: Minimal — Speaker emb + Speaker classifier + Text emb + MSE KD만 남김
-# Prosody 없음, MI 없음, Reconstruction 없음, Flow/DiffKD 없음, Phys 없음
-# 가장 단순한 구조: txt_emb(linear proj) → student last layer MSE + spk_ce + CTC + LogitKD
-# 가정: 복잡한 손실 없이 이 최소 구성만으로도 의미있는 성능이 나오는가?
+# E4: MI(txt↔spk, txt↔pros, pros↔spk) — 세 쌍 모두 사용
+# [Table 1] MI ablation: 전체 MI
+# [Table 2] Phys(SL) on baseline (E6와 비교)
+# [Table 3] Rec(txt) on baseline (E10과 비교)
+# 가정: 세 쌍 모두 독립성 강제가 최고 성능을 내는가?
 python train.py \
-  --wandb_run ablation-E6_minimal \
-  --out outputs/exp_ablation_component/E6_minimal \
+  --wandb_run ablation-E4_mi_ts_tp_ps \
+  --out outputs/exp_ablation_component/E4_mi_ts_tp_ps \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
   --train_split train.clean.100 \
@@ -15,8 +16,8 @@ python train.py \
   --use_ctc True \
   --use_logit_kd True \
   --use_layer_kd False \
-  --use_flow False \
-  --use_diffkd False \
+  --use_flow True \
+  --use_diffkd True \
   --use_disent True \
   --disent_spk_layers "4" \
   --disent_txt_layers "16" \
@@ -30,8 +31,9 @@ python train.py \
   --disen_mi_pairs "ts,tp,ps" \
   --disen_lll_weight 1.0 \
   --disen_mi_weight 1.0 \
-  --use_pros False \
-  --use_mi False \
-  --use_rec_loss False \
-  --use_phys_loss False \
-  --use_mse_kd True
+  --use_pros True \
+  --use_mi True \
+  --use_rec_loss True \
+  --use_txt_rec_loss True \
+  --use_phys_loss True \
+  --use_mse_kd False

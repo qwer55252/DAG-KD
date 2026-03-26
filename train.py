@@ -114,7 +114,9 @@ def main():
     p.add_argument("--use_mi", type=str2bool, default=True,
                    help="CLUB MI 손실 사용 여부")
     p.add_argument("--use_rec_loss", type=str2bool, default=True,
-                   help="Reconstruction 손실 사용 여부 (txt/spk/pros AE)")
+                   help="Reconstruction 손실 사용 여부 (spk/pros AE)")
+    p.add_argument("--use_txt_rec_loss", type=str2bool, default=True,
+                   help="Text Reconstruction 손실 사용 여부. False시 k=5 Conv1D projection으로 대체")
     p.add_argument("--use_phys_loss", type=str2bool, default=True,
                    help="Physical quantity supervision 사용 여부 (F0/Energy/VUV)")
     p.add_argument("--use_mse_kd", type=str2bool, default=False,
@@ -367,6 +369,7 @@ def main():
         use_pros=args.use_pros,
         use_mi=args.use_mi,
         use_rec_loss=args.use_rec_loss,
+        use_txt_rec_loss=args.use_txt_rec_loss,
         use_phys_loss=args.use_phys_loss,
         use_mse_kd=args.use_mse_kd,
     )

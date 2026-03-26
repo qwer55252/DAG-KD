@@ -118,11 +118,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         disent_txt_layers: list = [15,16],
 
         # Ablation flags
-        use_pros: bool = True,       # Prosody(GST) 사용 여부 — False시 MI ts쌍만 남음
-        use_mi: bool = True,         # CLUB MI 손실 사용 여부
-        use_rec_loss: bool = True,   # Reconstruction 손실 사용 여부
-        use_phys_loss: bool = True,  # Physical quantity supervision 사용 여부
-        use_mse_kd: bool = False,    # txt_emb vs student last layer 단순 MSE KD
+        use_pros: bool = True,         # Prosody(GST) 사용 여부 — False시 MI ts쌍만 남음
+        use_mi: bool = True,           # CLUB MI 손실 사용 여부
+        use_rec_loss: bool = True,     # spk/pros Reconstruction 손실 사용 여부
+        use_txt_rec_loss: bool = True, # txt Reconstruction 손실 사용 여부 (False시 conv1D proj 사용)
+        use_phys_loss: bool = True,    # Physical quantity supervision 사용 여부
+        use_mse_kd: bool = False,      # txt_emb vs student last layer 단순 MSE KD
 
         # 기타
     ):
@@ -144,6 +145,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.use_pros = use_pros
         self.use_mi = use_mi
         self.use_rec_loss = use_rec_loss
+        self.use_txt_rec_loss = use_txt_rec_loss
         self.use_phys_loss = use_phys_loss
         self.use_mse_kd = use_mse_kd
         self.latent_dim = cfg.latent_dim # 96
@@ -170,6 +172,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # Text Encoder (Conv1x1 → Conv1x1, Rec loss)
         self.txt_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
         self.txt_dec = nn.Conv1d(self.latent_dim, self.dim_t, kernel_size=1) # (B, 96, T)
+        # Text Projection (use_txt_rec_loss=False 시 사용: 주변 컨텍스트 보는 k=5 proj)
+        self.txt_proj_conv = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=5, padding=2)
 
         # Speaker Encoder (Conv1x1 → Conv1x1, Rec loss)
         self.spk_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
@@ -546,11 +550,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             txt_rep = last
 
         # ----- Text Encoder -----
-        txt_emb = self.txt_enc(txt_rep)     # (B, 196, T) -> (B, 96, T)
-        if self.use_rec_loss:
-            txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, 196, T)
+        if self.use_txt_rec_loss:
+            # AE 방식: k=1 Conv로 인코딩 후 디코딩하여 Reconstruction loss
+            txt_emb = self.txt_enc(txt_rep)     # (B, C_t, T) -> (B, 96, T)
+            txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, C_t, T)
             rec_txt = F.mse_loss(txt_rec, txt_rep)
         else:
+            # Projection 방식: k=5 Conv로 주변 컨텍스트 보며 차원만 맞춤, Rec loss 없음
+            txt_emb = self.txt_proj_conv(txt_rep)  # (B, C_t, T) -> (B, 96, T)
             rec_txt = torch.tensor(0.0, device=txt_emb.device)
 
         # === text speaker probe ===

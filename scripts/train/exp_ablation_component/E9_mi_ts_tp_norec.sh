@@ -1,9 +1,10 @@
 #!/bin/bash
-# E0: Full Baseline — 모든 컴포넌트 활성 (ablation 기준선)
-# Prosody(GST) + MI(ts,tp,ps) + Rec loss + Phys loss + Flow + DiffKD
+# E9: MI(txt↔spk, txt↔pros) — Rec(txt) 없음, k=5 Conv1D projection 사용 (E3에서 txt rec 제거)
+# [Table 3] Rec(txt) ablation: E3 vs E9
+# 가정: ts+tp MI에서 txt AE reconstruction이 없어도 k=5 projection만으로 동등한 성능이 나오는가?
 python train.py \
-  --wandb_run ablation-E0_full \
-  --out outputs/exp_ablation_component/E0_full \
+  --wandb_run ablation-E9_mi_ts_tp_norec \
+  --out outputs/exp_ablation_component/E9_mi_ts_tp_norec \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
   --train_split train.clean.100 \
@@ -22,14 +23,15 @@ python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-  --use_txt_spk_probe True \
+  --use_txt_spk_probe False \
   --txt_probe_lambda 1.0 \
   --txt_probe_lr 0.001 \
-  --disen_mi_pairs "ts,tp,ps" \
+  --disen_mi_pairs "ts,tp" \
   --disen_lll_weight 1.0 \
   --disen_mi_weight 1.0 \
   --use_pros True \
   --use_mi True \
   --use_rec_loss True \
+  --use_txt_rec_loss False \
   --use_phys_loss True \
   --use_mse_kd False

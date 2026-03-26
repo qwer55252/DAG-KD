@@ -1,10 +1,10 @@
 #!/bin/bash
-# E3: No Reconstruction Loss — AE 제약 제거, txt_emb는 단순 projection으로만 사용
-# txt_enc/spk_enc가 AE로 강제되지 않고 자유롭게 학습됨
-# 가정: Reconstruction 제약이 없어도 MI + Generative KD만으로 충분한가?
+# E6: MI(txt↔spk, txt↔pros, pros↔spk) — Phys(SL) 없음 (E4에서 물리량 손실 제거)
+# [Table 2] Phys(SL) ablation: E4 vs E6
+# 가정: 전체 MI 사용 시 F0/Energy/VUV 물리량 supervision이 실제로 필요한가?
 python train.py \
-  --wandb_run ablation-E3_no_rec \
-  --out outputs/exp_ablation_component/E3_no_rec \
+  --wandb_run ablation-E6_mi_ts_tp_ps_nophys \
+  --out outputs/exp_ablation_component/E6_mi_ts_tp_ps_nophys \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
   --train_split train.clean.100 \
@@ -23,7 +23,7 @@ python train.py \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1 \
-  --use_txt_spk_probe True \
+  --use_txt_spk_probe False \
   --txt_probe_lambda 1.0 \
   --txt_probe_lr 0.001 \
   --disen_mi_pairs "ts,tp,ps" \
@@ -31,6 +31,7 @@ python train.py \
   --disen_mi_weight 1.0 \
   --use_pros True \
   --use_mi True \
-  --use_rec_loss False \
-  --use_phys_loss True \
+  --use_rec_loss True \
+  --use_txt_rec_loss True \
+  --use_phys_loss False \
   --use_mse_kd False
