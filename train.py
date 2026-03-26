@@ -428,6 +428,9 @@ def main():
             key = f"{split_name}/wer".replace('.', '_')
             wandb.log_metrics({key: wer}, step=trainer.current_epoch)
 
+        # trainer.test() 후 GPU 메모리 해제 (미해제 시 transcribe에서 segfault 발생)
+        torch.cuda.empty_cache()
+
         # 2) per-sample WER mean ± std
         with open(manifest, "r", encoding="utf-8") as f:
             entries = [json.loads(line) for line in f]
