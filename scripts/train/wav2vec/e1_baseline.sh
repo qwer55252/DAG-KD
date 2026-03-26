@@ -19,6 +19,10 @@ python train_wav2vec.py \
   --use_flow False \
   --use_diffkd False \
   --use_disent False \
+  --tch_spk_layers "1,2" \
+  --tch_txt_layers "23,24" \
+  --stu_spk_layers "1,2" \
+  --stu_txt_layers "11,12" \
   --batch_size 8 \
   --epochs 100 \
   --gpus 1 \
