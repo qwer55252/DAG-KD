@@ -379,8 +379,12 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         diffkd_steps: int = 5,
         # Disentanglement
         use_disent: bool = True,
-        disent_spk_layers: list = None,
-        disent_txt_layers: list = None,
+        # Teacher 레이어 선택 (1-based, Factorization용)
+        tch_spk_layers: list = None,   # teacher에서 speaker rep 뽑을 레이어 (기본: 하위 2개)
+        tch_txt_layers: list = None,   # teacher에서 text rep 뽑을 레이어 (기본: 상위 2개)
+        # Student 레이어 선택 (1-based, S-DisKD용)
+        stu_spk_layers: list = None,   # student에서 speaker rep 뽑을 레이어 (기본: 하위 2개)
+        stu_txt_layers: list = None,   # student에서 text rep 뽑을 레이어 (기본: 상위 2개)
         # Hyper-params
         latent_dim: int = 96,
         disen_mi_weight: float = 1e-3,
@@ -422,10 +426,14 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
     ):
         super().__init__()
         # mutable default args
-        if disent_spk_layers is None:
-            disent_spk_layers = [1, 2]
-        if disent_txt_layers is None:
-            disent_txt_layers = [22, 23]
+        if tch_spk_layers is None:
+            tch_spk_layers = [1, 2]
+        if tch_txt_layers is None:
+            tch_txt_layers = [23, 24]
+        if stu_spk_layers is None:
+            stu_spk_layers = [1, 2]
+        if stu_txt_layers is None:
+            stu_txt_layers = [11, 12]
 
         self.save_hyperparameters()
 
@@ -473,8 +481,10 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.use_flow = use_flow
         self.use_diffkd = use_diffkd
         self.use_disent = use_disent
-        self.disent_spk_layers = disent_spk_layers
-        self.disent_txt_layers = disent_txt_layers
+        self.tch_spk_layers = tch_spk_layers
+        self.tch_txt_layers = tch_txt_layers
+        self.stu_spk_layers = stu_spk_layers
+        self.stu_txt_layers = stu_txt_layers
 
         # ---- Loss weights ----
         self.mi_weight = disen_mi_weight
@@ -778,8 +788,8 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         # 8) S-DisKD
         if (self.use_stu_txt_kd or self.use_stu_spk_kd) and self.stu_feats and embs is not None:
             L_stu = len(self.stu_feats)
-            spk_idxs = self._prepare_layer_indices(self.disent_spk_layers, L_stu, default_low=True)
-            txt_idxs = self._prepare_layer_indices(self.disent_txt_layers, L_stu, default_low=False)
+            spk_idxs = self._prepare_layer_indices(self.stu_spk_layers, L_stu, default_low=True)
+            txt_idxs = self._prepare_layer_indices(self.stu_txt_layers, L_stu, default_low=False)
 
             stu_txt_factor = None
             stu_spk_factor = None
@@ -1171,8 +1181,8 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         if not self.tch_feats:
             return None, None
         L = len(self.tch_feats)
-        spk_idxs = self._prepare_layer_indices(self.disent_spk_layers, L, default_low=True)
-        txt_idxs = self._prepare_layer_indices(self.disent_txt_layers, L, default_low=False)
+        spk_idxs = self._prepare_layer_indices(self.tch_spk_layers, L, default_low=True)
+        txt_idxs = self._prepare_layer_indices(self.tch_txt_layers, L, default_low=False)
         spk_rep = torch.stack([self.tch_feats[i] for i in spk_idxs], dim=0).mean(0)
         txt_rep = torch.stack([self.tch_feats[i] for i in txt_idxs], dim=0).mean(0)
         return spk_rep, txt_rep
@@ -1191,6 +1201,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             return sorted(set(idxs))
         k = max(1, L // 3)
         return list(range(0, k)) if default_low else list(range(L - k, L))
+
 
     # ============================================================
     # Misc helpers (models.py에서 그대로)

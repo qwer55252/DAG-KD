@@ -341,9 +341,17 @@ def main():
     p.add_argument("--diffkd_steps",     type=int,      default=5)
 
     # Disentanglement
-    p.add_argument("--use_disent",           type=str2bool,   default=True)
-    p.add_argument("--disent_spk_layers",    type=int_list_arg, default=[1, 2])
-    p.add_argument("--disent_txt_layers",    type=int_list_arg, default=[22, 23])
+    p.add_argument("--use_disent",        type=str2bool,   default=True)
+    # Teacher 레이어 선택 (1-based, Factorization용)
+    p.add_argument("--tch_spk_layers",   type=int_list_arg, default=[1, 2],
+                   help="Teacher에서 speaker rep 뽑을 레이어 (1-based, e.g. '1,2'). 24L 기준 하위 추천.")
+    p.add_argument("--tch_txt_layers",   type=int_list_arg, default=[23, 24],
+                   help="Teacher에서 text rep 뽑을 레이어 (1-based, e.g. '23,24'). 24L 기준 상위 추천.")
+    # Student 레이어 선택 (1-based, S-DisKD용)
+    p.add_argument("--stu_spk_layers",   type=int_list_arg, default=[1, 2],
+                   help="Student에서 speaker rep 뽑을 레이어 (1-based, e.g. '1,2'). 12L 기준 하위 추천.")
+    p.add_argument("--stu_txt_layers",   type=int_list_arg, default=[11, 12],
+                   help="Student에서 text rep 뽑을 레이어 (1-based, e.g. '11,12'). 12L 기준 상위 추천.")
     p.add_argument("--disen_mi_pairs",       type=str,        default="ts,tp,ps")
     p.add_argument("--disen_lll_weight",     type=float,      default=1.0)
     p.add_argument("--disen_mi_weight",      type=float,      default=1e-3)
@@ -535,8 +543,10 @@ def main():
         diffkd_steps=args.diffkd_steps,
         # Disentanglement
         use_disent=args.use_disent,
-        disent_spk_layers=args.disent_spk_layers,
-        disent_txt_layers=args.disent_txt_layers,
+        tch_spk_layers=args.tch_spk_layers,
+        tch_txt_layers=args.tch_txt_layers,
+        stu_spk_layers=args.stu_spk_layers,
+        stu_txt_layers=args.stu_txt_layers,
         disen_mi_pairs=args.disen_mi_pairs,
         disen_lll_weight=args.disen_lll_weight,
         disen_mi_weight=args.disen_mi_weight,
