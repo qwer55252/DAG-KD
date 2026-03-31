@@ -122,6 +122,13 @@ def main():
     p.add_argument("--use_mse_kd", type=str2bool, default=False,
                    help="txt_emb vs student last layer 단순 MSE KD 사용 여부")
 
+    # S-DisKD: Student-side Disentangled Factor KD
+    p.add_argument("--use_stu_txt_kd",    type=str2bool, default=False)
+    p.add_argument("--use_stu_spk_kd",    type=str2bool, default=False)
+    p.add_argument("--use_stu_club",      type=str2bool, default=False)
+    p.add_argument("--stu_txt_kd_weight", type=float,    default=1.0)
+    p.add_argument("--stu_spk_kd_weight", type=float,    default=1.0)
+    p.add_argument("--stu_club_weight",   type=float,    default=1e-3)
 
     args = p.parse_args()
 
@@ -347,6 +354,14 @@ def main():
     stu_cfg.phys_cache_sr = SR
     stu_cfg.phys_cache_ext = ".npy"
     stu_cfg.phys_cache_lru = 2048
+
+    # S-DisKD cfg 주입
+    stu_cfg.use_stu_txt_kd    = args.use_stu_txt_kd
+    stu_cfg.use_stu_spk_kd    = args.use_stu_spk_kd
+    stu_cfg.use_stu_club      = args.use_stu_club
+    stu_cfg.stu_txt_kd_weight = args.stu_txt_kd_weight
+    stu_cfg.stu_spk_kd_weight = args.stu_spk_kd_weight
+    stu_cfg.stu_club_weight   = args.stu_club_weight
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,

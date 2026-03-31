@@ -267,6 +267,26 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         
         self.spk_stat_proj = nn.Linear(self.latent_dim * 2, self.latent_dim)
 
+        # ===== S-DisKD: Student-side Factor KD =====
+        self.use_stu_txt_kd    = bool(getattr(cfg, "use_stu_txt_kd", False))
+        self.use_stu_spk_kd    = bool(getattr(cfg, "use_stu_spk_kd", False))
+        self.use_stu_club      = bool(getattr(cfg, "use_stu_club", False))
+        self.stu_txt_kd_weight = float(getattr(cfg, "stu_txt_kd_weight", 1.0))
+        self.stu_spk_kd_weight = float(getattr(cfg, "stu_spk_kd_weight", 1.0))
+        self.stu_club_weight   = float(getattr(cfg, "stu_club_weight", 1e-3))
+
+        # Student 중간 레이어(dim_s) → factor space(latent_dim) 투영
+        self.stu_txt_enc = nn.Conv1d(self.dim_s, self.latent_dim, kernel_size=1)
+        self.stu_spk_enc = nn.Conv1d(self.dim_s, self.latent_dim, kernel_size=1)
+
+        # Student-side CLUB MI 추정기 (E5: txt↔spk, dynamic-dynamic)
+        if self.use_stu_club:
+            self.stu_club_ts = ClubGaussian(
+                x_dim=self.latent_dim, y_dim=self.latent_dim,
+                hidden_size=club_hidden, max_samples=max_samp
+            )
+        else:
+            self.stu_club_ts = None
 
         # ===== Generative KD 모듈 (Student last layer ↔ Teacher Text feature) =====
         self.flow = FlowMatchingModule(
@@ -411,7 +431,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self._run_teacher(self._last_mel, self._last_mel_len) # student forward 때 캐시한 mel 사용
 
         total = torch.tensor(0.0, device=logp.device)
-        
+        embs = None  # S-DisKD 블록에서도 참조
+
         # 3) Factorization embeddings + MI/Rec/Speaker CE
         if self.use_disent:
             phys_targets = self._get_phys_targets(sample_ids, T_mel=self._last_mel.size(-1), split_name="train")
@@ -509,6 +530,48 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             kd_layer = self._layer_metric_kd()
             self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
             total = total + self.layer_kd_alpha * kd_layer
+
+        # 8) S-DisKD: Student-side Disentangled Factor KD
+        if (self.use_stu_txt_kd or self.use_stu_spk_kd) and self.stu_feats and embs is not None:
+            L_stu = len(self.stu_feats)
+            spk_idxs = self._prepare_layer_indices(self.disent_spk_layers, L_stu, default_low=True)
+            txt_idxs = self._prepare_layer_indices(self.disent_txt_layers, L_stu, default_low=False)
+
+            stu_txt_factor = None
+            stu_spk_factor = None
+
+            stu_txt_kd_loss = torch.tensor(0.0, device=self.device)
+            stu_spk_kd_loss = torch.tensor(0.0, device=self.device)
+
+            if self.use_stu_txt_kd:
+                stu_txt_rep = torch.stack([self.stu_feats[i] for i in txt_idxs], dim=0).mean(0)
+                stu_txt_factor = self.stu_txt_enc(stu_txt_rep)          # (B, latent_dim, T_s)
+                tch_txt_target = embs["txt_emb"].detach()               # (B, latent_dim, T_t)
+                if stu_txt_factor.size(-1) != tch_txt_target.size(-1):
+                    stu_txt_factor = F.interpolate(stu_txt_factor, size=tch_txt_target.size(-1), mode='linear', align_corners=False)
+                stu_txt_kd_loss = F.mse_loss(stu_txt_factor, tch_txt_target)
+
+            if self.use_stu_spk_kd:
+                stu_spk_rep = torch.stack([self.stu_feats[i] for i in spk_idxs], dim=0).mean(0)
+                stu_spk_factor = self.stu_spk_enc(stu_spk_rep)          # (B, latent_dim, T_s)
+                tch_spk_target = embs["spk_emb"].detach()               # (B, latent_dim, T_t)
+                if stu_spk_factor.size(-1) != tch_spk_target.size(-1):
+                    stu_spk_factor = F.interpolate(stu_spk_factor, size=tch_spk_target.size(-1), mode='linear', align_corners=False)
+                stu_spk_kd_loss = F.mse_loss(stu_spk_factor, tch_spk_target)
+
+            self.log("train/stu_txt_kd", stu_txt_kd_loss, on_step=False, on_epoch=True)
+            self.log("train/stu_spk_kd", stu_spk_kd_loss, on_step=False, on_epoch=True)
+            total = total + self.stu_txt_kd_weight * stu_txt_kd_loss + self.stu_spk_kd_weight * stu_spk_kd_loss
+
+            # Student-side CLUB MI 최소화 (E5)
+            if self.use_stu_club and self.stu_club_ts is not None and stu_txt_factor is not None and stu_spk_factor is not None:
+                stu_lll = self.stu_club_ts.ll_loss(stu_txt_factor.detach(), stu_spk_factor.detach())
+                self._freeze_params(self.stu_club_ts, True)
+                stu_mi = self.stu_club_ts.mi_upper(stu_txt_factor, stu_spk_factor, K=self.neg_K)
+                self._freeze_params(self.stu_club_ts, False)
+                self.log("train/stu_mi_ts", stu_mi, on_step=False, on_epoch=True)
+                self.log("train/stu_lll_ts", stu_lll, on_step=False, on_epoch=True)
+                total = total + self.stu_club_weight * stu_mi + self.lll_weight * stu_lll
 
         if self.use_disent and self.use_txt_spk_probe and (embs is not None):
             probe_ce = embs.get("txt_probe_ce", None)
