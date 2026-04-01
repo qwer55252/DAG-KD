@@ -11,6 +11,12 @@ import nemo.collections.asr as nemo_asr
 from collections import OrderedDict
 from utils import (ensure_BCT)
 
+try:
+    from sklearn.manifold import TSNE
+    _TSNE_AVAILABLE = True
+except ImportError:
+    _TSNE_AVAILABLE = False
+
 class DiffKDModule(nn.Module):
     """간단한 Linear AE + 1D CNN denoiser 버전"""
     def __init__(self, teacher_dim, student_dim, latent_dim=None, steps=5):
@@ -91,6 +97,92 @@ class FlowMatchingModule(nn.Module):
             return x.transpose(1, 2)
         # fallback(애매하면 last dim이 time일 가능성이 큼): (B,C,T)로 간주
         return x.transpose(1, 2)
+
+# ============================================================
+# Gradient Reversal Layer (Ganin et al., 2015)
+# ============================================================
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.alpha)
+
+
+class FeaturePredictor(nn.Module):
+    """
+    CCSRD (EMSLP 2023): 3 FC→ReLU + 1 FC→Tanh
+    Pointwise Conv1d == framewise FC, handles (B, D, T).
+    """
+    def __init__(self, in_dim, out_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_dim, hidden_dim, 1), nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1), nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, hidden_dim, 1), nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_dim, out_dim, 1), nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class CyclicReconstructionModule(nn.Module):
+    """
+    Cyclic Reconstruction Disentanglement (CCSRD, EMSLP 2023).
+
+    content    = txt_emb  (linguistic / text factor)
+    noncontent = spk_emb or pros_emb
+
+    L_CON  = ||content_predictor(GRL(noncontent)) - content||_2
+    L_NCON = ||noncontent_predictor(GRL(content)) - noncontent||_2
+
+    GRL pushes each encoder to remove the other factor's information.
+    """
+    def __init__(self, content_dim=96, noncontent_dim=96, hidden_dim=128, grl_alpha=0.1):
+        super().__init__()
+        self.grl = GradientReversalLayer(alpha=grl_alpha)
+        self.content_pred = FeaturePredictor(noncontent_dim, content_dim, hidden_dim)
+        self.noncontent_pred = FeaturePredictor(content_dim, noncontent_dim, hidden_dim)
+
+    def forward(self, content, noncontent):
+        """
+        content, noncontent: (B, D, T)
+        returns: total_loss, l_con, l_ncon
+        """
+        pred_content = self.content_pred(self.grl(noncontent))
+        pred_noncontent = self.noncontent_pred(self.grl(content))
+        l_con = F.mse_loss(pred_content, content.detach())
+        l_ncon = F.mse_loss(pred_noncontent, noncontent.detach())
+        return l_con + l_ncon, l_con, l_ncon
+
+
+def linear_cka(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """
+    Linear CKA between X (N, D1) and Y (N, D2).
+    Returns scalar in [0, 1]. Lower → more disentangled.
+    """
+    X = X - X.mean(0, keepdim=True)
+    Y = Y - Y.mean(0, keepdim=True)
+    XXT = X @ X.T
+    YYT = Y @ Y.T
+    hsic_xy = (XXT * YYT).sum()
+    hsic_xx = (XXT * XXT).sum()
+    hsic_yy = (YYT * YYT).sum()
+    return hsic_xy / (torch.sqrt(hsic_xx * hsic_yy) + 1e-8)
+
 
 class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(
@@ -310,6 +402,37 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_list_for_disent = self._prepare_layer_indices(getattr(cfg, "layer_list_for_disent", [4,8,12,16]), L, default_low=True)  # 1-based index
         self.neg_K = int(getattr(cfg, "neg_K", 8))
 
+        # ===== Cyclic Reconstruction (CCSRD, EMSLP 2023) =====
+        self.use_cyclic = bool(getattr(cfg, "use_cyclic", False))
+        self.cyclic_pairs = getattr(cfg, "cyclic_pairs", "ts")   # "ts", "tp", "ts,tp"
+        self.cyclic_weight = float(getattr(cfg, "cyclic_weight", 1e-2))
+        cyclic_grl_alpha = float(getattr(cfg, "cyclic_grl_alpha", 0.1))
+        cyclic_hidden_dim = int(getattr(cfg, "cyclic_hidden_dim", 128))
+
+        if self.use_cyclic:
+            active_pairs = set(p.strip() for p in self.cyclic_pairs.split(",") if p.strip())
+            self.cyclic_ts = CyclicReconstructionModule(
+                content_dim=self.latent_dim,
+                noncontent_dim=self.latent_dim,
+                hidden_dim=cyclic_hidden_dim,
+                grl_alpha=cyclic_grl_alpha,
+            ) if "ts" in active_pairs else None
+            self.cyclic_tp = CyclicReconstructionModule(
+                content_dim=self.latent_dim,
+                noncontent_dim=self.latent_dim,
+                hidden_dim=cyclic_hidden_dim,
+                grl_alpha=cyclic_grl_alpha,
+            ) if "tp" in active_pairs else None
+        else:
+            self.cyclic_ts = None
+            self.cyclic_tp = None
+
+        # CKA 로깅 주기 (step 단위)
+        self.cka_log_interval = int(getattr(cfg, "cka_log_interval", 500))
+        # t-SNE 로깅 주기 (epoch 단위)
+        self.tsne_log_interval = int(getattr(cfg, "tsne_log_interval", 10))
+        self._global_step_count = 0
+
     def forward(
         self,
         input_signal=None,
@@ -439,6 +562,36 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             if phys_loss is not None and torch.is_tensor(phys_loss):
                 self.log("train/phys_loss", phys_loss, on_step=True, on_epoch=True, prog_bar=False)
                 total = total + self.rec_pros_lambda * phys_loss
+
+            # Cyclic Reconstruction loss (CCSRD)
+            if self.use_cyclic:
+                txt_emb = embs["txt_emb"]   # (B, 96, T)
+                spk_emb = embs["spk_emb"]   # (B, 96, T)
+                pros_emb = embs["pros_emb"] # (B, 96, T)
+
+                if self.cyclic_ts is not None:
+                    cyc_ts, l_con_ts, l_ncon_ts = self.cyclic_ts(txt_emb, spk_emb)
+                    self.log("cyclic/loss_con_ts",  l_con_ts,  on_step=False, on_epoch=True)
+                    self.log("cyclic/loss_ncon_ts", l_ncon_ts, on_step=False, on_epoch=True)
+                    total = total + self.cyclic_weight * cyc_ts
+
+                if self.cyclic_tp is not None:
+                    cyc_tp, l_con_tp, l_ncon_tp = self.cyclic_tp(txt_emb, pros_emb)
+                    self.log("cyclic/loss_con_tp",  l_con_tp,  on_step=False, on_epoch=True)
+                    self.log("cyclic/loss_ncon_tp", l_ncon_tp, on_step=False, on_epoch=True)
+                    total = total + self.cyclic_weight * cyc_tp
+
+                # CKA metric 로깅
+                self._global_step_count += 1
+                if self._global_step_count % self.cka_log_interval == 0:
+                    with torch.no_grad():
+                        # flatten (B,D,T) → (B*T, D) for CKA
+                        B, D, T = txt_emb.shape
+                        t = txt_emb.permute(0, 2, 1).reshape(-1, D)
+                        s = spk_emb.permute(0, 2, 1).reshape(-1, D)
+                        p = pros_emb.permute(0, 2, 1).reshape(-1, D)
+                        self.log("disen/cka_ts", linear_cka(t, s), on_step=True, on_epoch=False)
+                        self.log("disen/cka_tp", linear_cka(t, p), on_step=True, on_epoch=False)
         else:
             self._txt_emb = None
 
@@ -487,8 +640,75 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
         
         self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
+
+        # t-SNE 버퍼 수집 (cyclic 실험 시 매 step 소량 누적)
+        if self.use_cyclic and self.use_disent and (embs is not None):
+            if not hasattr(self, "_tsne_buf_txt"):
+                self._tsne_buf_txt = []
+                self._tsne_buf_spk = []
+                self._tsne_buf_spk_ids = []
+            if len(self._tsne_buf_txt) < 512:
+                with torch.no_grad():
+                    B, D, T = embs["txt_emb"].shape
+                    self._tsne_buf_txt.append(embs["txt_emb"].mean(-1).cpu())   # (B, D)
+                    self._tsne_buf_spk.append(embs["spk_emb"].mean(-1).cpu())
+                    if speaker_ids is not None:
+                        self._tsne_buf_spk_ids.append(speaker_ids.cpu())
+
         return total
-        
+
+    def on_train_epoch_end(self):
+        """매 tsne_log_interval epoch마다 t-SNE를 WandB에 로깅."""
+        current_epoch = self.current_epoch + 1  # 0-indexed → 1-indexed
+        if (not self.use_cyclic) or (current_epoch % self.tsne_log_interval != 0):
+            # 버퍼만 초기화
+            self._tsne_buf_txt = []
+            self._tsne_buf_spk = []
+            self._tsne_buf_spk_ids = []
+            return
+
+        if not _TSNE_AVAILABLE:
+            return
+
+        buf_txt = getattr(self, "_tsne_buf_txt", [])
+        buf_spk = getattr(self, "_tsne_buf_spk", [])
+        buf_ids = getattr(self, "_tsne_buf_spk_ids", [])
+
+        if len(buf_txt) == 0:
+            return
+
+        txt_arr = torch.cat(buf_txt, dim=0).float().numpy()   # (N, D)
+        spk_arr = torch.cat(buf_spk, dim=0).float().numpy()
+        ids_arr = torch.cat(buf_ids, dim=0).numpy() if len(buf_ids) > 0 else None
+
+        for name, arr in [("tsne_txt", txt_arr), ("tsne_spk", spk_arr)]:
+            try:
+                emb2d = TSNE(n_components=2, random_state=0, perplexity=min(30, arr.shape[0] - 1)).fit_transform(arr)
+                fig, ax = plt.subplots(figsize=(6, 6))
+                scatter_kwargs = dict(s=5, alpha=0.6)
+                if ids_arr is not None:
+                    sc = ax.scatter(emb2d[:, 0], emb2d[:, 1], c=ids_arr % 20, cmap="tab20", **scatter_kwargs)
+                else:
+                    ax.scatter(emb2d[:, 0], emb2d[:, 1], **scatter_kwargs)
+                ax.set_title(f"{name} epoch={current_epoch}")
+                ax.axis("off")
+                fig.tight_layout()
+
+                if self.logger is not None:
+                    import wandb
+                    self.logger.experiment.log({
+                        f"disen/{name}": wandb.Image(fig),
+                        "epoch": current_epoch,
+                    })
+                plt.close(fig)
+            except Exception:
+                plt.close("all")
+
+        # 버퍼 초기화
+        self._tsne_buf_txt = []
+        self._tsne_buf_spk = []
+        self._tsne_buf_spk_ids = []
+
     def _make_embeddings(self, speaker_ids, phys_targets=None):
         """
         ===== Teacher Text/Speaker/Prosody embedding 생성 =====
