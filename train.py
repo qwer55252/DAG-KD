@@ -117,6 +117,27 @@ def main():
     p.add_argument("--cka_log_interval", type=int, default=500)      # step 단위
     p.add_argument("--tsne_log_interval", type=int, default=10)      # epoch 단위
 
+    # Ablation flags
+    p.add_argument("--use_pros", type=str2bool, default=True,
+                   help="Prosody(GST) 사용 여부. False시 MI ts쌍만 남고 pros 관련 손실 전체 비활성")
+    p.add_argument("--use_mi", type=str2bool, default=True,
+                   help="CLUB MI 손실 사용 여부")
+    p.add_argument("--use_rec_loss", type=str2bool, default=True,
+                   help="Reconstruction 손실 사용 여부 (spk/pros AE)")
+    p.add_argument("--use_txt_rec_loss", type=str2bool, default=True,
+                   help="Text Reconstruction 손실 사용 여부. False시 k=5 Conv1D projection으로 대체")
+    p.add_argument("--use_phys_loss", type=str2bool, default=True,
+                   help="Physical quantity supervision 사용 여부 (F0/Energy/VUV)")
+    p.add_argument("--use_mse_kd", type=str2bool, default=False,
+                   help="txt_emb vs student last layer 단순 MSE KD 사용 여부")
+
+    # S-DisKD: Student-side Disentangled Factor KD
+    p.add_argument("--use_stu_txt_kd",    type=str2bool, default=False)
+    p.add_argument("--use_stu_spk_kd",    type=str2bool, default=False)
+    p.add_argument("--use_stu_club",      type=str2bool, default=False)
+    p.add_argument("--stu_txt_kd_weight", type=float,    default=1.0)
+    p.add_argument("--stu_spk_kd_weight", type=float,    default=1.0)
+    p.add_argument("--stu_club_weight",   type=float,    default=1e-3)
 
     args = p.parse_args()
 
@@ -351,6 +372,13 @@ def main():
     stu_cfg.cyclic_hidden_dim = args.cyclic_hidden_dim
     stu_cfg.cka_log_interval = args.cka_log_interval
     stu_cfg.tsne_log_interval = args.tsne_log_interval
+    # S-DisKD cfg 주입
+    stu_cfg.use_stu_txt_kd    = args.use_stu_txt_kd
+    stu_cfg.use_stu_spk_kd    = args.use_stu_spk_kd
+    stu_cfg.use_stu_club      = args.use_stu_club
+    stu_cfg.stu_txt_kd_weight = args.stu_txt_kd_weight
+    stu_cfg.stu_spk_kd_weight = args.stu_spk_kd_weight
+    stu_cfg.stu_club_weight   = args.stu_club_weight
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
@@ -370,6 +398,12 @@ def main():
         use_disent=args.use_disent,
         disent_spk_layers=args.disent_spk_layers,
         disent_txt_layers=args.disent_txt_layers,
+        use_pros=args.use_pros,
+        use_mi=args.use_mi,
+        use_rec_loss=args.use_rec_loss,
+        use_txt_rec_loss=args.use_txt_rec_loss,
+        use_phys_loss=args.use_phys_loss,
+        use_mse_kd=args.use_mse_kd,
     )
     
     # ====== 멜 스펙트로그램 예시 저장 ======
@@ -425,6 +459,11 @@ def main():
             print(f"→ {split_name}: loss={loss:.4f} | wer={wer:.2%}")
             key = f"{split_name}/wer".replace('.', '_')
             wandb.log_metrics({key: wer}, step=trainer.current_epoch)
+
+        # trainer.test() 후 GPU 메모리 해제 (dl/results 명시 해제 후 transcribe)
+        del dl, results
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
 
         # 2) per-sample WER mean ± std
         with open(manifest, "r", encoding="utf-8") as f:
