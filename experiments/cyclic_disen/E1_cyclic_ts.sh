@@ -27,9 +27,9 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --use_txt_spk_probe True \
   --txt_probe_lambda 1.0 \
   --txt_probe_lr 0.001 \
-  --disen_mi_pairs "ts,tp" \
-  --disen_lll_weight 1.0 \
-  --disen_mi_weight 1.0 \
+  --disen_mi_pairs "" \
+  --disen_lll_weight 0.0 \
+  --disen_mi_weight 0.0 \
   --use_cyclic True \
   --cyclic_pairs "ts" \
   --cyclic_weight 1e-2 \
