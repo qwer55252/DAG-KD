@@ -116,7 +116,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         use_disent: bool = False,
         disent_spk_layers: list = [1,2],
         disent_txt_layers: list = [15,16],
-        
+
+        # Ablation flags
+        use_pros: bool = True,         # Prosody(GST) 사용 여부 — False시 MI ts쌍만 남음
+        use_mi: bool = True,           # CLUB MI 손실 사용 여부
+        use_rec_loss: bool = True,     # spk/pros Reconstruction 손실 사용 여부
+        use_txt_rec_loss: bool = True, # txt Reconstruction 손실 사용 여부 (False시 conv1D proj 사용)
+        use_phys_loss: bool = True,    # Physical quantity supervision 사용 여부
+        use_mse_kd: bool = False,      # txt_emb vs student last layer 단순 MSE KD
+
         # 기타
     ):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -134,6 +142,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.use_disent = use_disent
         self.disent_spk_layers = disent_spk_layers
         self.disent_txt_layers = disent_txt_layers
+        self.use_pros = use_pros
+        self.use_mi = use_mi
+        self.use_rec_loss = use_rec_loss
+        self.use_txt_rec_loss = use_txt_rec_loss
+        self.use_phys_loss = use_phys_loss
+        self.use_mse_kd = use_mse_kd
         self.latent_dim = cfg.latent_dim # 96
 
         # --- Feature capture (hook) ---
@@ -152,9 +166,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # Projection for metric KD (student->teacher) - 옵션
         self.stu_to_tea_proj = nn.Conv1d(self.dim_s, self.dim_t, kernel_size=1, bias=True)
 
+        # MSE KD projection: student last layer -> latent_dim (txt_emb space)
+        self.mse_kd_proj = nn.Conv1d(self.dim_s, self.latent_dim, kernel_size=1, bias=True)
+
         # Text Encoder (Conv1x1 → Conv1x1, Rec loss)
         self.txt_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
         self.txt_dec = nn.Conv1d(self.latent_dim, self.dim_t, kernel_size=1) # (B, 96, T)
+        # Text Projection (use_txt_rec_loss=False 시 사용: 주변 컨텍스트 보는 k=5 proj)
+        self.txt_proj_conv = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=5, padding=2)
 
         # Speaker Encoder (Conv1x1 → Conv1x1, Rec loss)
         self.spk_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
@@ -420,31 +439,33 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             embs = self._make_embeddings(speaker_ids, phys_targets=phys_targets)
             
             # MI term
-            mi_upper, lll, mi_terms, lll_terms = self._mi_loss(
-                txt_emb=embs["txt_emb"],
-                pros_emb=embs["pros_emb"],
-                spk_stat=embs["spk_stat"],
-                enc_len=getattr(self, "t_enc_len", None),  # ✅ teacher length 사용
-            )
-            mi_upper = torch.clamp(mi_upper, min=0.0)
-            self.log("train/mi_upper", mi_upper, on_epoch=True)
-            self.log("train/lll", lll, on_epoch=True)
-            total = total + self.mi_weight * mi_upper + self.lll_weight * lll
+            if self.use_mi:
+                mi_upper, lll, mi_terms, lll_terms = self._mi_loss(
+                    txt_emb=embs["txt_emb"],
+                    pros_emb=embs["pros_emb"],
+                    spk_stat=embs["spk_stat"],
+                    enc_len=getattr(self, "t_enc_len", None),
+                )
+                mi_upper = torch.clamp(mi_upper, min=0.0)
+                self.log("train/mi_upper", mi_upper, on_epoch=True)
+                self.log("train/lll", lll, on_epoch=True)
+                for k, v in mi_terms.items():
+                    self.log(f"train/mi_{k}", v, on_epoch=True)
+                for k, v in lll_terms.items():
+                    self.log(f"train/lll_{k}", v, on_epoch=True)
+                total = total + self.mi_weight * mi_upper + self.lll_weight * lll
 
             # Reconstruction loss
-            rec_txt = embs["rec_txt"]
-            rec_spk = embs["rec_spk"]
-            rec_pros = embs["rec_pros"]
-            self.log("train/rec_txt", rec_txt, on_epoch=True)
-            self.log("train/rec_spk", rec_spk, on_epoch=True)
-            self.log("train/rec_pros", rec_pros, on_epoch=True)
-            for k, v in mi_terms.items():
-                self.log(f"train/mi_{k}", v, on_epoch=True)
-            for k, v in lll_terms.items():
-                self.log(f"train/lll_{k}", v, on_epoch=True)
-            total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk + self.rec_pros_lambda * rec_pros
+            if self.use_rec_loss:
+                rec_txt = embs["rec_txt"]
+                rec_spk = embs["rec_spk"]
+                rec_pros = embs["rec_pros"]
+                self.log("train/rec_txt", rec_txt, on_epoch=True)
+                self.log("train/rec_spk", rec_spk, on_epoch=True)
+                self.log("train/rec_pros", rec_pros, on_epoch=True)
+                total = total + self.rec_txt_lambda * rec_txt + self.rec_spk_lambda * rec_spk + self.rec_pros_lambda * rec_pros
 
-            # Speaker CE & ACC
+            # Speaker CE & ACC (항상 활성 — spk embedding이 화자를 잘 잡도록)
             spk_ce = embs["spk_ce"]
             spk_acc = embs.get("spk_acc", None)
 
@@ -456,10 +477,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 self.log("train/spk_acc", spk_acc, on_epoch=True)
 
             # Prosody physical quantity supervision
-            phys_loss = embs.get("phys_loss", None)
-            if phys_loss is not None and torch.is_tensor(phys_loss):
-                self.log("train/phys_loss", phys_loss, on_step=True, on_epoch=True, prog_bar=False)
-                total = total + self.rec_pros_lambda * phys_loss
+            if self.use_phys_loss:
+                phys_loss = embs.get("phys_loss", None)
+                if phys_loss is not None and torch.is_tensor(phys_loss):
+                    self.log("train/phys_loss", phys_loss, on_step=True, on_epoch=True, prog_bar=False)
+                    total = total + self.rec_pros_lambda * phys_loss
         else:
             self._txt_emb = None
 
@@ -477,6 +499,19 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
         self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
         total = total + flow_loss + diff_loss
+
+        # 4-b) MSE KD: txt_emb vs student last layer (Flow/DiffKD 대체 또는 병행)
+        mse_kd_loss = torch.tensor(0.0, device=self.device)
+        if self.use_mse_kd and self._txt_emb is not None and self._last_enc is not None:
+            stu_feat = ensure_BCT(self._last_enc, C_expected=self.dim_s)
+            tch_feat = ensure_BCT(self._txt_emb.detach(), C_expected=self.latent_dim)
+            stu_proj = self.mse_kd_proj(stu_feat)  # (B, latent_dim, T)
+            # 시간 축 길이 맞추기
+            if stu_proj.size(-1) != tch_feat.size(-1):
+                stu_proj = F.interpolate(stu_proj, size=tch_feat.size(-1), mode='linear', align_corners=False)
+            mse_kd_loss = F.mse_loss(stu_proj, tch_feat)
+        self.log("train/mse_kd_loss", mse_kd_loss, on_step=False, on_epoch=True)
+        total = total + mse_kd_loss
 
         # 5) CTC
         if self.use_ctc:
@@ -578,10 +613,16 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             txt_rep = last
 
         # ----- Text Encoder -----
-        txt_emb = self.txt_enc(txt_rep)     # (B, 196, T) -> (B, 96, T)
-        txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, 196, T)
-        rec_txt = F.mse_loss(txt_rec, txt_rep)
-        
+        if self.use_txt_rec_loss:
+            # AE 방식: k=1 Conv로 인코딩 후 디코딩하여 Reconstruction loss
+            txt_emb = self.txt_enc(txt_rep)     # (B, C_t, T) -> (B, 96, T)
+            txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, C_t, T)
+            rec_txt = F.mse_loss(txt_rec, txt_rep)
+        else:
+            # Projection 방식: k=5 Conv로 주변 컨텍스트 보며 차원만 맞춤, Rec loss 없음
+            txt_emb = self.txt_proj_conv(txt_rep)  # (B, C_t, T) -> (B, 96, T)
+            rec_txt = torch.tensor(0.0, device=txt_emb.device)
+
         # === text speaker probe ===
         txt_probe_ce, txt_probe_acc = self._text_spk_probe(txt_emb, speaker_ids)
 
@@ -590,8 +631,11 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # ----- Speaker Encoder -----
         spk_emb = self.spk_enc(spk_rep)     # (B, 196, T) -> (B, 96, T)
-        spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
-        rec_spk = F.mse_loss(spk_rec, spk_rep)         # Speaker Encoder도 X_L^T를 재구성하도록 학습 (그림의 Rec loss)
+        if self.use_rec_loss:
+            spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
+            rec_spk = F.mse_loss(spk_rec, spk_rep)
+        else:
+            rec_spk = torch.tensor(0.0, device=spk_emb.device)
 
         # ====== Speaker static (B,96) 만들기 ======
         # backbone 통과 후 stats pooling 추천
@@ -603,34 +647,39 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_stat = self.spk_stat_proj(spk_stat)            # (B,96)
         
         # ----- Prosody (frame-level GST) -----
-        # TODO: utterance-level prosody를 다루지 않을거임. frame-wise한 prosody embedding을 만들고, text embedding과 MI 측정할 예정
         T = txt_emb.size(-1)
-        
-        mel = self._last_mel.to(self.device) # (B, n_mels, T_mel)
-        ref_seq = self.pros_ref(mel, return_seq=True) # (B, T', gru_dim)                # 1. Frame-level Reference Sequence (return_seq=True)
-        style_seq = self.pros_gst(ref_seq) # (B, T', token_dim)                         # 2. Frame-level Style Tokens
-        pros_emb = self.pros_proj(style_seq).transpose(1, 2)                            # 3. Projection & Transpose -> (B, latent_dim, T')
-        pros_emb = F.interpolate(pros_emb, size=T, mode='linear', align_corners=False)  # 4. Target 시간 축(T_target)에 맞게 보간(Interpolate)
-        
-        pros_stat = pros_emb.mean(dim=-1)  # (B, 96) pros_stat for MI (utterance-level)
 
-        # ===== Prosody Positive Supervision =====
-        # 1. Mel Reconstruction Loss
-        mel_target = self._last_mel # (B, 80, T_mel)
-        pros_emb_for_mel = F.interpolate(pros_emb, size=mel_target.size(-1), mode='linear', align_corners=False)
-        mel_pred = self.mel_dec(pros_emb_for_mel)
-        rec_pros = F.mse_loss(mel_pred, mel_target)
+        if self.use_pros:
+            mel = self._last_mel.to(self.device) # (B, n_mels, T_mel)
+            ref_seq = self.pros_ref(mel, return_seq=True) # (B, T', gru_dim)
+            style_seq = self.pros_gst(ref_seq) # (B, T', token_dim)
+            pros_emb = self.pros_proj(style_seq).transpose(1, 2)  # (B, latent_dim, T')
+            pros_emb = F.interpolate(pros_emb, size=T, mode='linear', align_corners=False)
+            pros_stat = pros_emb.mean(dim=-1)  # (B, 96)
 
-        # 2. Physical Quantity Loss
-        phys_loss = torch.tensor(0.0, device=pros_emb.device)
-        if phys_targets is not None:
-            phys_pred = self.prosody_predictor(pros_emb) # (B, 3, T_target)
-            
-            # target 길이를 맞춰줌 (보통 T와 T_mel이 같겠지만 만약을 대비)
-            if phys_pred.size(-1) != phys_targets.size(-1):
-                 phys_pred = F.interpolate(phys_pred, size=phys_targets.size(-1), mode='linear', align_corners=False)
-                 
-            phys_loss = F.mse_loss(phys_pred, phys_targets)
+            # ===== Prosody Positive Supervision =====
+            # 1. Mel Reconstruction Loss
+            if self.use_rec_loss:
+                mel_target = self._last_mel
+                pros_emb_for_mel = F.interpolate(pros_emb, size=mel_target.size(-1), mode='linear', align_corners=False)
+                mel_pred = self.mel_dec(pros_emb_for_mel)
+                rec_pros = F.mse_loss(mel_pred, mel_target)
+            else:
+                rec_pros = torch.tensor(0.0, device=pros_emb.device)
+
+            # 2. Physical Quantity Loss
+            phys_loss = torch.tensor(0.0, device=pros_emb.device)
+            if self.use_phys_loss and phys_targets is not None:
+                phys_pred = self.prosody_predictor(pros_emb)
+                if phys_pred.size(-1) != phys_targets.size(-1):
+                    phys_pred = F.interpolate(phys_pred, size=phys_targets.size(-1), mode='linear', align_corners=False)
+                phys_loss = F.mse_loss(phys_pred, phys_targets)
+        else:
+            # Prosody 전체 비활성 — MI ts쌍만 사용됨
+            pros_emb = None
+            pros_stat = None
+            rec_pros = torch.tensor(0.0, device=txt_emb.device)
+            phys_loss = torch.tensor(0.0, device=txt_emb.device)
             
         # ----- Speaker CE & ACC -----
         spk_ce = torch.tensor(0.0, device=txt_emb.device)
@@ -679,7 +728,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self._xai_visualize(
                 txt_emb=txt_emb.detach(),
                 spk_emb=spk_emb.detach(),
-                pros_emb=pros_emb.detach(),
+                pros_emb=pros_emb.detach() if pros_emb is not None else None,
                 txt_rep=txt_rep.detach(),
                 spk_rep=spk_rep.detach(),
                 rec_txt=rec_txt.detach(),
@@ -721,10 +770,13 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
           mi_sum, lll_sum, mi_terms, lll_terms
         """
         txt = txt_emb
-        pros = pros_emb
+        pros = pros_emb  # None이면 tp/ps 쌍 자동 스킵
         spk = spk_stat
 
         pairs = set([t.strip() for t in self.mi_pairs.split(",") if t.strip()])
+        # pros_emb가 없으면 prosody 관련 쌍 제거
+        if pros is None:
+            pairs = {p for p in pairs if "p" not in p}
 
         lll_terms = {}
         mi_terms = {}
