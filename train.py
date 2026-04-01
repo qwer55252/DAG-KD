@@ -108,6 +108,15 @@ def main():
     p.add_argument("--lll_lambda_max", type=float, default=0.01)     # 최종 LLL 가중치 (원하면 분리)
     p.add_argument("--mi_clamp_min0", type=str2bool, default=True)   # mi_upper <0 클램프
 
+    # Cyclic Reconstruction (CCSRD, EMSLP 2023)
+    p.add_argument("--use_cyclic", type=str2bool, default=False)
+    p.add_argument("--cyclic_pairs", type=str, default="ts")         # "ts", "tp", "ts,tp"
+    p.add_argument("--cyclic_weight", type=float, default=1e-2)
+    p.add_argument("--cyclic_grl_alpha", type=float, default=0.1)
+    p.add_argument("--cyclic_hidden_dim", type=int, default=128)
+    p.add_argument("--cka_log_interval", type=int, default=500)      # step 단위
+    p.add_argument("--tsne_log_interval", type=int, default=10)      # epoch 단위
+
     # Ablation flags
     p.add_argument("--use_pros", type=str2bool, default=True,
                    help="Prosody(GST) 사용 여부. False시 MI ts쌍만 남고 pros 관련 손실 전체 비활성")
@@ -355,6 +364,14 @@ def main():
     stu_cfg.phys_cache_ext = ".npy"
     stu_cfg.phys_cache_lru = 2048
 
+    # Cyclic Reconstruction 설정
+    stu_cfg.use_cyclic = args.use_cyclic
+    stu_cfg.cyclic_pairs = args.cyclic_pairs
+    stu_cfg.cyclic_weight = args.cyclic_weight
+    stu_cfg.cyclic_grl_alpha = args.cyclic_grl_alpha
+    stu_cfg.cyclic_hidden_dim = args.cyclic_hidden_dim
+    stu_cfg.cka_log_interval = args.cka_log_interval
+    stu_cfg.tsne_log_interval = args.tsne_log_interval
     # S-DisKD cfg 주입
     stu_cfg.use_stu_txt_kd    = args.use_stu_txt_kd
     stu_cfg.use_stu_spk_kd    = args.use_stu_spk_kd
