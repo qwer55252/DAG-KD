@@ -17,7 +17,7 @@
 | --- | --- | --- | --- | --- |
 | **E1 (Baseline)** | 기존 single-layer DAG-KD | — | [4] | [16] |
 | **E2** | Multi-Layer Shared AE + MSE KD | MSE | [2, 4, 6] | [12, 14, 16] |
-| **E3** | Multi-Layer Shared AE + Flow/DiffKD | Flow Matching + DiffKD | [2, 4, 6] | [12, 14, 16] |
+| **E3** | Multi-Layer Shared AE + Flow/DiffKD (step4 off) | Flow Matching + DiffKD | [2, 4, 6] | [12, 14, 16] |
 
 - E1은 MI_ablation best 설정(ts 단독, Phys=✓, Rec=✓, test WER 0.3223) 재사용
 - E2, E3는 동일 베이스 위에서 KD 모듈만 교체
@@ -77,6 +77,7 @@ stu_feats[15] → stu_txt_enc(96→96) → MSE(·, txt_emb_3)
 
 [E3 Flow/Diff]
 위 경로에서 MSE 대신 FlowMatchingModule / DiffKDModule 적용 (각 쌍 독립)
+step 4(기존 single-path Flow/Diff)는 비활성 — step 9에서 6쌍으로 대체
 ```
 
 ---
