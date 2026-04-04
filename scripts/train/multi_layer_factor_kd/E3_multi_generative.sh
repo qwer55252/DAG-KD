@@ -14,8 +14,8 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --use_ctc True \
   --use_logit_kd True \
   --use_layer_kd False \
-  --use_flow True \
-  --use_diffkd True \
+  --use_flow False \
+  --use_diffkd False \
   --use_disent True \
   --disent_spk_layers "2,4,6" \
   --disent_txt_layers "12,14,16" \
