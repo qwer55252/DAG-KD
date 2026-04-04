@@ -108,6 +108,13 @@ def main():
     p.add_argument("--lll_lambda_max", type=float, default=0.01)     # 최종 LLL 가중치 (원하면 분리)
     p.add_argument("--mi_clamp_min0", type=str2bool, default=True)   # mi_upper <0 클램프
 
+    # Multi-Layer Factor KD
+    p.add_argument("--use_multi_layer_kd",    type=str2bool,    default=False)
+    p.add_argument("--multi_kd_spk_layers",   type=int_list_arg, default=[2, 4, 6])
+    p.add_argument("--multi_kd_txt_layers",   type=int_list_arg, default=[12, 14, 16])
+    p.add_argument("--multi_layer_kd_type",   type=str,          default="mse")   # "mse" | "generative"
+    p.add_argument("--multi_layer_kd_weight", type=float,        default=1.0)
+
     # Cyclic Reconstruction (CCSRD, EMSLP 2023)
     p.add_argument("--use_cyclic", type=str2bool, default=False)
     p.add_argument("--cyclic_pairs", type=str, default="ts")         # "ts", "tp", "ts,tp"
@@ -372,6 +379,13 @@ def main():
     stu_cfg.cyclic_hidden_dim = args.cyclic_hidden_dim
     stu_cfg.cka_log_interval = args.cka_log_interval
     stu_cfg.tsne_log_interval = args.tsne_log_interval
+    # Multi-Layer Factor KD cfg 주입
+    stu_cfg.use_multi_layer_kd    = args.use_multi_layer_kd
+    stu_cfg.multi_kd_spk_layers   = args.multi_kd_spk_layers
+    stu_cfg.multi_kd_txt_layers   = args.multi_kd_txt_layers
+    stu_cfg.multi_layer_kd_type   = args.multi_layer_kd_type
+    stu_cfg.multi_layer_kd_weight = args.multi_layer_kd_weight
+
     # S-DisKD cfg 주입
     stu_cfg.use_stu_txt_kd    = args.use_stu_txt_kd
     stu_cfg.use_stu_spk_kd    = args.use_stu_spk_kd

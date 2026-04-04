@@ -380,6 +380,24 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             self.stu_club_ts = None
 
+        # ===== Multi-Layer Factor KD =====
+        self.use_multi_layer_kd    = bool(getattr(cfg, "use_multi_layer_kd", False))
+        self.multi_layer_kd_type   = getattr(cfg, "multi_layer_kd_type", "mse")   # "mse" | "generative"
+        self.multi_layer_kd_weight = float(getattr(cfg, "multi_layer_kd_weight", 1.0))
+        self.multi_kd_spk_layers   = getattr(cfg, "multi_kd_spk_layers", [2, 4, 6])
+        self.multi_kd_txt_layers   = getattr(cfg, "multi_kd_txt_layers", [12, 14, 16])
+
+        if self.use_multi_layer_kd and self.multi_layer_kd_type == "generative":
+            self.multi_flow_spk    = FlowMatchingModule(self.latent_dim, self.latent_dim, hidden=self.latent_dim, steps=flow_steps)
+            self.multi_flow_txt    = FlowMatchingModule(self.latent_dim, self.latent_dim, hidden=self.latent_dim, steps=flow_steps)
+            self.multi_diffkd_spk  = DiffKDModule(teacher_dim=self.latent_dim, student_dim=self.latent_dim, latent_dim=self.latent_dim, steps=diffkd_steps)
+            self.multi_diffkd_txt  = DiffKDModule(teacher_dim=self.latent_dim, student_dim=self.latent_dim, latent_dim=self.latent_dim, steps=diffkd_steps)
+        else:
+            self.multi_flow_spk   = None
+            self.multi_flow_txt   = None
+            self.multi_diffkd_spk = None
+            self.multi_diffkd_txt = None
+
         # ===== Generative KD 모듈 (Student last layer ↔ Teacher Text feature) =====
         self.flow = FlowMatchingModule(
             self.dim_s, self.latent_dim, hidden=self.latent_dim, steps=flow_steps, loss_weight=flow_weight
@@ -563,19 +581,36 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             
             # MI term
             if self.use_mi:
-                mi_upper, lll, mi_terms, lll_terms = self._mi_loss(
-                    txt_emb=embs["txt_emb"],
-                    pros_emb=embs["pros_emb"],
-                    spk_stat=embs["spk_stat"],
-                    enc_len=getattr(self, "t_enc_len", None),
-                )
-                mi_upper = torch.clamp(mi_upper, min=0.0)
-                self.log("train/mi_upper", mi_upper, on_epoch=True)
-                self.log("train/lll", lll, on_epoch=True)
-                for k, v in mi_terms.items():
-                    self.log(f"train/mi_{k}", v, on_epoch=True)
-                for k, v in lll_terms.items():
-                    self.log(f"train/lll_{k}", v, on_epoch=True)
+                if self.use_multi_layer_kd and embs.get("txt_embs_ml") is not None:
+                    # Multi-layer: txt_emb_i ↔ spk_stat_i 쌍별 MI → 평균
+                    txt_embs_ml  = embs["txt_embs_ml"]
+                    spk_stats_ml = embs["spk_stats_ml"]
+                    enc_len = getattr(self, "t_enc_len", None)
+                    mi_list, lll_list = [], []
+                    for txt_i, spk_i in zip(txt_embs_ml, spk_stats_ml):
+                        mi_i, lll_i, _, _ = self._mi_loss(
+                            txt_emb=txt_i, pros_emb=None, spk_stat=spk_i, enc_len=enc_len
+                        )
+                        mi_list.append(mi_i)
+                        lll_list.append(lll_i)
+                    mi_upper = torch.clamp(sum(mi_list) / len(mi_list), min=0.0)
+                    lll      = sum(lll_list) / len(lll_list)
+                    self.log("train/mi_upper", mi_upper, on_epoch=True)
+                    self.log("train/lll", lll, on_epoch=True)
+                else:
+                    mi_upper, lll, mi_terms, lll_terms = self._mi_loss(
+                        txt_emb=embs["txt_emb"],
+                        pros_emb=embs["pros_emb"],
+                        spk_stat=embs["spk_stat"],
+                        enc_len=getattr(self, "t_enc_len", None),
+                    )
+                    mi_upper = torch.clamp(mi_upper, min=0.0)
+                    self.log("train/mi_upper", mi_upper, on_epoch=True)
+                    self.log("train/lll", lll, on_epoch=True)
+                    for k, v in mi_terms.items():
+                        self.log(f"train/mi_{k}", v, on_epoch=True)
+                    for k, v in lll_terms.items():
+                        self.log(f"train/lll_{k}", v, on_epoch=True)
                 total = total + self.mi_weight * mi_upper + self.lll_weight * lll
 
             # Reconstruction loss
@@ -740,7 +775,53 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
             if probe_acc is not None:
                 self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
-        
+
+        # 9) Multi-Layer Factor KD (E2: MSE, E3: Flow/Diff)
+        if self.use_multi_layer_kd and embs is not None and self.stu_feats:
+            spk_embs_ml = embs.get("spk_embs_ml")
+            txt_embs_ml = embs.get("txt_embs_ml")
+            spk_idxs_ml = embs.get("spk_idxs_ml")
+            txt_idxs_ml = embs.get("txt_idxs_ml")
+
+            L_stu = len(self.stu_feats)
+            stu_spk_idxs = self._prepare_layer_indices(self.multi_kd_spk_layers, L_stu, default_low=True)
+            stu_txt_idxs = self._prepare_layer_indices(self.multi_kd_txt_layers, L_stu, default_low=False)
+
+            multi_spk_loss = torch.tensor(0.0, device=self.device)
+            multi_txt_loss = torch.tensor(0.0, device=self.device)
+
+            if spk_embs_ml is not None:
+                for tch_emb_i, stu_idx in zip(spk_embs_ml, stu_spk_idxs):
+                    stu_rep   = self.stu_feats[stu_idx]                          # (B, dim_s, T_s)
+                    stu_f     = self.stu_spk_enc(stu_rep)                        # (B, 96, T_s)
+                    tch_f     = tch_emb_i.detach()                               # (B, 96, T_t)
+                    if stu_f.size(-1) != tch_f.size(-1):
+                        stu_f = F.interpolate(stu_f, size=tch_f.size(-1), mode='linear', align_corners=False)
+                    if self.multi_layer_kd_type == "mse":
+                        multi_spk_loss = multi_spk_loss + F.mse_loss(stu_f, tch_f)
+                    else:
+                        multi_spk_loss = multi_spk_loss + self.multi_flow_spk(stu_f, tch_f)
+                        multi_spk_loss = multi_spk_loss + self.multi_diffkd_spk(stu_f, tch_f)
+                multi_spk_loss = multi_spk_loss / len(spk_embs_ml)
+
+            if txt_embs_ml is not None:
+                for tch_emb_i, stu_idx in zip(txt_embs_ml, stu_txt_idxs):
+                    stu_rep   = self.stu_feats[stu_idx]                          # (B, dim_s, T_s)
+                    stu_f     = self.stu_txt_enc(stu_rep)                        # (B, 96, T_s)
+                    tch_f     = tch_emb_i.detach()                               # (B, 96, T_t)
+                    if stu_f.size(-1) != tch_f.size(-1):
+                        stu_f = F.interpolate(stu_f, size=tch_f.size(-1), mode='linear', align_corners=False)
+                    if self.multi_layer_kd_type == "mse":
+                        multi_txt_loss = multi_txt_loss + F.mse_loss(stu_f, tch_f)
+                    else:
+                        multi_txt_loss = multi_txt_loss + self.multi_flow_txt(stu_f, tch_f)
+                        multi_txt_loss = multi_txt_loss + self.multi_diffkd_txt(stu_f, tch_f)
+                multi_txt_loss = multi_txt_loss / len(txt_embs_ml)
+
+            self.log("train/multi_spk_kd", multi_spk_loss, on_step=False, on_epoch=True)
+            self.log("train/multi_txt_kd", multi_txt_loss, on_step=False, on_epoch=True)
+            total = total + self.multi_layer_kd_weight * (multi_spk_loss + multi_txt_loss)
+
         self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
 
         # t-SNE 버퍼 수집 (cyclic 실험 시 매 step 소량 누적)
@@ -829,47 +910,85 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         B, C_t, T_t = self._tch_last.shape
         last = self._tch_last                       # X_L^T  (B, C_t, T)
         
-        # layer 리스트 기반 speaker/text representation 추출
-        spk_rep, txt_rep = self._get_spk_txt_reps_from_layers()
-        if spk_rep is None or txt_rep is None:
-            # hook이 비어 있는 이상한 상황이면 그냥 last로 fallback
-            spk_rep = last
-            txt_rep = last
+        if self.use_multi_layer_kd:
+            # ===== Multi-Layer 경로: shared enc/dec을 여러 레이어에 적용 =====
+            L = len(self.tch_feats)
+            spk_idxs_ml = self._prepare_layer_indices(self.multi_kd_spk_layers, L, default_low=True)
+            txt_idxs_ml = self._prepare_layer_indices(self.multi_kd_txt_layers, L, default_low=False)
 
-        # ----- Text Encoder -----
-        if self.use_txt_rec_loss:
-            # AE 방식: k=1 Conv로 인코딩 후 디코딩하여 Reconstruction loss
-            txt_emb = self.txt_enc(txt_rep)     # (B, C_t, T) -> (B, 96, T)
-            txt_rec = self.txt_dec(txt_emb)     # (B, 96, T) -> (B, C_t, T)
-            rec_txt = F.mse_loss(txt_rec, txt_rep)
+            spk_reps = [self.tch_feats[i] for i in spk_idxs_ml]   # each (B, C_t, T)
+            txt_reps = [self.tch_feats[i] for i in txt_idxs_ml]   # each (B, C_t, T)
+
+            # Shared spk_enc/dec → spk_embs list
+            spk_embs_ml = [self.spk_enc(r) for r in spk_reps]     # each (B, 96, T)
+            if self.use_rec_loss:
+                rec_spk = sum(F.mse_loss(self.spk_dec(e), r) for e, r in zip(spk_embs_ml, spk_reps)) / len(spk_embs_ml)
+            else:
+                rec_spk = torch.tensor(0.0, device=last.device)
+
+            # Shared txt_enc/dec → txt_embs list
+            txt_embs_ml = [self.txt_enc(r) for r in txt_reps]     # each (B, 96, T)
+            if self.use_txt_rec_loss:
+                rec_txt = sum(F.mse_loss(self.txt_dec(e), r) for e, r in zip(txt_embs_ml, txt_reps)) / len(txt_embs_ml)
+            else:
+                rec_txt = torch.tensor(0.0, device=last.device)
+
+            # 호환성: 단일 emb은 마지막 레이어 기준
+            spk_emb = spk_embs_ml[-1]
+            txt_emb = txt_embs_ml[-1]
+
+            # spk_stat list (MI용): 각 spk_emb_i → backbone → stats pooling → Linear
+            spk_stats_ml = []
+            for spk_emb_i in spk_embs_ml:
+                spk_feat_i = self.spk_backbone(spk_emb_i) if self.spk_backbone is not None else spk_emb_i
+                spk_mean_i = spk_feat_i.mean(dim=-1)
+                spk_std_i  = self.safe_std(spk_feat_i, dim=-1)
+                spk_stat_i = self.spk_stat_proj(torch.cat([spk_mean_i, spk_std_i], dim=-1))
+                spk_stats_ml.append(spk_stat_i)
+            spk_stat = spk_stats_ml[-1]   # 단일 호환성 유지
+
         else:
-            # Projection 방식: k=5 Conv로 주변 컨텍스트 보며 차원만 맞춤, Rec loss 없음
-            txt_emb = self.txt_proj_conv(txt_rep)  # (B, C_t, T) -> (B, 96, T)
-            rec_txt = torch.tensor(0.0, device=txt_emb.device)
+            # ===== 기존 Single-Layer 경로 =====
+            spk_rep, txt_rep = self._get_spk_txt_reps_from_layers()
+            if spk_rep is None or txt_rep is None:
+                spk_rep = last
+                txt_rep = last
 
-        # === text speaker probe ===
+            # Text Encoder
+            if self.use_txt_rec_loss:
+                txt_emb = self.txt_enc(txt_rep)
+                txt_rec = self.txt_dec(txt_emb)
+                rec_txt = F.mse_loss(txt_rec, txt_rep)
+            else:
+                txt_emb = self.txt_proj_conv(txt_rep)
+                rec_txt = torch.tensor(0.0, device=txt_emb.device)
+
+            # Speaker Encoder
+            spk_emb = self.spk_enc(spk_rep)
+            if self.use_rec_loss:
+                spk_rec = self.spk_dec(spk_emb)
+                rec_spk = F.mse_loss(spk_rec, spk_rep)
+            else:
+                rec_spk = torch.tensor(0.0, device=spk_emb.device)
+
+            # Speaker static
+            spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb
+            spk_mean = spk_feat.mean(dim=-1)
+            spk_std  = self.safe_std(spk_feat, dim=-1)
+            spk_stat = self.spk_stat_proj(torch.cat([spk_mean, spk_std], dim=-1))
+
+            spk_embs_ml  = None
+            txt_embs_ml  = None
+            spk_stats_ml = None
+            spk_idxs_ml  = None
+            txt_idxs_ml  = None
+
+        # === text speaker probe (공통) ===
         txt_probe_ce, txt_probe_acc = self._text_spk_probe(txt_emb, speaker_ids)
 
-        # Generative KD용 Text feature 캐시 (B, C_t, T)
+        # Generative KD용 Text feature 캐시
         self._txt_emb = txt_emb
 
-        # ----- Speaker Encoder -----
-        spk_emb = self.spk_enc(spk_rep)     # (B, 196, T) -> (B, 96, T)
-        if self.use_rec_loss:
-            spk_rec = self.spk_dec(spk_emb)     # (B, 96, T) -> (B, 196, T)
-            rec_spk = F.mse_loss(spk_rec, spk_rep)
-        else:
-            rec_spk = torch.tensor(0.0, device=spk_emb.device)
-
-        # ====== Speaker static (B,96) 만들기 ======
-        # backbone 통과 후 stats pooling 추천
-        # TODO: backbone이 아니라 그냥 바로 spk_emb에서 스피커 예측하도록 하는게 좋을 듯?
-        spk_feat = self.spk_backbone(spk_emb) if self.spk_backbone is not None else spk_emb  # (B,96,T)
-        spk_mean = spk_feat.mean(dim=-1)   # (B,96)
-        spk_std  = self.safe_std(spk_feat, dim=-1)    # (B,96)
-        spk_stat = torch.cat([spk_mean, spk_std], dim=-1)  # (B,192) # TODO: 이게 맞아? 이게 필요할까? MI를 왜 이걸로? 어차피 static인데 
-        spk_stat = self.spk_stat_proj(spk_stat)            # (B,96)
-        
         # ----- Prosody (frame-level GST) -----
         T = txt_emb.size(-1)
 
@@ -947,8 +1066,8 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 preds = all_logits.argmax(dim=-1)             # (B,) long
                 spk_acc = (preds[valid_mask] == target_valid).float().mean()
         
-        # XAI: 시각화
-        if self.vis_enable:
+        # XAI: 시각화 (single-layer 경로에서만 txt_rep/spk_rep 존재)
+        if self.vis_enable and not self.use_multi_layer_kd:
             self._xai_visualize(
                 txt_emb=txt_emb.detach(),
                 spk_emb=spk_emb.detach(),
@@ -960,27 +1079,33 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 speaker_ids=speaker_ids.detach() if speaker_ids is not None else None,
                 enc_len=getattr(self, "t_enc_len", None),
             )
-        
-        return {
-            "txt_emb": txt_emb,         # (B,96,T)
-            "spk_emb": spk_emb,         # (B,96)
-            "pros_emb": pros_emb,       # (B,96,T)
 
-            "spk_stat": spk_stat,       # (B,96) static (MI용)
-            "pros_stat": pros_stat,     # (B,96) static (MI용)
+        return {
+            "txt_emb": txt_emb,           # (B,96,T) — 호환성 (마지막 레이어)
+            "spk_emb": spk_emb,           # (B,96,T) — 호환성 (마지막 레이어)
+            "pros_emb": pros_emb,         # (B,96,T)
+
+            "spk_stat": spk_stat,         # (B,96) static — 호환성 (마지막 레이어)
+            "pros_stat": pros_stat,       # (B,96) static (MI용)
 
             "spk_ce": spk_ce,
             "spk_acc": spk_acc,
-            
+
             "rec_txt": rec_txt,
             "rec_spk": rec_spk,
             "rec_pros": rec_pros,
-            
+
             "txt_probe_ce": txt_probe_ce,
             "txt_probe_acc": txt_probe_acc,
-            
-            "pros_stat": pros_stat,     # (B,96) static (MI용)
-            "phys_loss": phys_loss
+
+            "phys_loss": phys_loss,
+
+            # Multi-Layer 전용 (use_multi_layer_kd=False 시 None)
+            "spk_embs_ml":  spk_embs_ml,   # List[(B,96,T)] x N_spk
+            "txt_embs_ml":  txt_embs_ml,   # List[(B,96,T)] x N_txt
+            "spk_stats_ml": spk_stats_ml,  # List[(B,96)]   x N_spk
+            "spk_idxs_ml":  spk_idxs_ml,  # List[int] 0-based Teacher layer idx
+            "txt_idxs_ml":  txt_idxs_ml,  # List[int] 0-based Teacher layer idx
         }
     
     def _mi_loss(self, txt_emb, pros_emb, spk_stat, enc_len=None):
