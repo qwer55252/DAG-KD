@@ -648,7 +648,27 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 pros_emb = embs["pros_emb"] # (B, 96, T)
 
                 if self.cyclic_ts is not None:
-                    cyc_ts, l_con_ts, l_ncon_ts = self.cyclic_ts(txt_emb, spk_emb)
+                    if self.use_multi_layer_kd and "txt_embs_ml" in embs and "spk_embs_ml" in embs:
+                        # Multi-layer: apply shared cyclic_ts to each of 3 (txt, spk) pairs and average
+                        cyc_ts_total = torch.tensor(0.0, device=self.device)
+                        l_con_ts_total = torch.tensor(0.0, device=self.device)
+                        l_ncon_ts_total = torch.tensor(0.0, device=self.device)
+                        txt_embs_ml = embs["txt_embs_ml"]
+                        spk_embs_ml = embs["spk_embs_ml"]
+                        n_pairs = len(txt_embs_ml)
+                        for t_emb_i, s_emb_i in zip(txt_embs_ml, spk_embs_ml):
+                            # Interpolate to same time length if needed
+                            if t_emb_i.size(-1) != s_emb_i.size(-1):
+                                s_emb_i = F.interpolate(s_emb_i, size=t_emb_i.size(-1), mode='linear', align_corners=False)
+                            cyc_i, l_con_i, l_ncon_i = self.cyclic_ts(t_emb_i, s_emb_i)
+                            cyc_ts_total = cyc_ts_total + cyc_i
+                            l_con_ts_total = l_con_ts_total + l_con_i
+                            l_ncon_ts_total = l_ncon_ts_total + l_ncon_i
+                        cyc_ts = cyc_ts_total / n_pairs
+                        l_con_ts = l_con_ts_total / n_pairs
+                        l_ncon_ts = l_ncon_ts_total / n_pairs
+                    else:
+                        cyc_ts, l_con_ts, l_ncon_ts = self.cyclic_ts(txt_emb, spk_emb)
                     self.log("cyclic/loss_con_ts",  l_con_ts,  on_step=False, on_epoch=True)
                     self.log("cyclic/loss_ncon_ts", l_ncon_ts, on_step=False, on_epoch=True)
                     total = total + self.cyclic_weight * cyc_ts
