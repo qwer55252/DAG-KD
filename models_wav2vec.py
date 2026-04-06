@@ -417,6 +417,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         # Optimizer
         learning_rate: float = 3e-4,
         warmup_epochs: int = 0,
+        kd_warmup_epochs: int = 0,
         freeze_feature_extractor: bool = False,
         # Student 초기화
         random_init_student: bool = False,
@@ -527,6 +528,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.use_txt_spk_probe = use_txt_spk_probe
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
+        self.kd_warmup_epochs = kd_warmup_epochs
         self.use_stu_txt_kd = use_stu_txt_kd
         self.use_stu_spk_kd = use_stu_spk_kd
         self.use_stu_club = use_stu_club
@@ -792,8 +794,12 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         total = total + flow_loss + diff_loss
 
         # 5) CTC + KD 정규화 가중합
+        # kd_warmup_epochs 동안은 CTC only로 학습 후 KD 활성화
         # KD 사용 시: total = (1-alpha)*CTC + alpha*KD  (스케일 독립적 균형)
         # KD 미사용 시: total = CTC
+        cur_epoch = self.current_epoch
+        kd_active = (cur_epoch >= self.kd_warmup_epochs)
+
         ctc = torch.tensor(0.0, device=logits.device)
         kd_logit = torch.tensor(0.0, device=logits.device)
         kd_layer = torch.tensor(0.0, device=logits.device)
@@ -802,19 +808,19 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             ctc = self._ctc_loss(logits, enc_len, labels)
             self.log("train/ctc", ctc, on_step=False, on_epoch=True)
 
-        if self.use_logit_kd:
+        if self.use_logit_kd and kd_active:
             kd_logit = self._logit_kd(logits)
             self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
 
-        if self.use_layer_kd:
+        if self.use_layer_kd and kd_active:
             kd_layer = self._layer_metric_kd()
             self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
 
         # 가중합 계산
-        if self.use_logit_kd:
+        if self.use_logit_kd and kd_active:
             # (1-kd_alpha)*CTC + kd_alpha*LogitKD
             total = total + (1.0 - self.kd_alpha) * ctc + self.kd_alpha * kd_logit
-        elif self.use_layer_kd:
+        elif self.use_layer_kd and kd_active:
             # (1-layer_kd_alpha)*CTC + layer_kd_alpha*LayerKD
             total = total + (1.0 - self.layer_kd_alpha) * ctc + self.layer_kd_alpha * kd_layer
         else:
