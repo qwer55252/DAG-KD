@@ -386,11 +386,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.multi_layer_kd_weight = float(getattr(cfg, "multi_layer_kd_weight", 1.0))
         self.multi_kd_spk_layers   = getattr(cfg, "multi_kd_spk_layers", [2, 4, 6])
         self.multi_kd_txt_layers   = getattr(cfg, "multi_kd_txt_layers", [12, 14, 16])
+        self.multi_kd_use_spk      = bool(getattr(cfg, "multi_kd_use_spk", True))
 
         if self.use_multi_layer_kd and self.multi_layer_kd_type == "generative":
-            self.multi_flow_spk    = FlowMatchingModule(self.latent_dim, self.latent_dim, hidden=self.latent_dim, steps=flow_steps)
+            self.multi_flow_spk    = FlowMatchingModule(self.latent_dim, self.latent_dim, hidden=self.latent_dim, steps=flow_steps) if self.multi_kd_use_spk else None
             self.multi_flow_txt    = FlowMatchingModule(self.latent_dim, self.latent_dim, hidden=self.latent_dim, steps=flow_steps)
-            self.multi_diffkd_spk  = DiffKDModule(teacher_dim=self.latent_dim, student_dim=self.latent_dim, latent_dim=self.latent_dim, steps=diffkd_steps)
+            self.multi_diffkd_spk  = DiffKDModule(teacher_dim=self.latent_dim, student_dim=self.latent_dim, latent_dim=self.latent_dim, steps=diffkd_steps) if self.multi_kd_use_spk else None
             self.multi_diffkd_txt  = DiffKDModule(teacher_dim=self.latent_dim, student_dim=self.latent_dim, latent_dim=self.latent_dim, steps=diffkd_steps)
         else:
             self.multi_flow_spk   = None
@@ -790,7 +791,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             multi_spk_loss = torch.tensor(0.0, device=self.device)
             multi_txt_loss = torch.tensor(0.0, device=self.device)
 
-            if spk_embs_ml is not None:
+            if spk_embs_ml is not None and self.multi_kd_use_spk:
                 for tch_emb_i, stu_idx in zip(spk_embs_ml, stu_spk_idxs):
                     stu_rep   = self.stu_feats[stu_idx]                          # (B, dim_s, T_s)
                     stu_f     = self.stu_spk_enc(stu_rep)                        # (B, 96, T_s)
