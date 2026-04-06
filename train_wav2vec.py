@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.strategies import DDPStrategy
 from datasets import load_dataset, DownloadConfig, config as hf_config
 from transformers import Wav2Vec2Processor
 
@@ -382,6 +383,12 @@ def main():
 
     # Optimizer
     p.add_argument("--learning_rate",    type=float, default=3e-4)
+    p.add_argument("--warmup_epochs",    type=int,   default=0,
+                   help="Linear warmup epoch 수 (이후 CosineAnnealingLR). large 모델 fine-tuning 시 5~10 권장")
+    p.add_argument("--freeze_feature_extractor", type=str2bool, default=False,
+                   help="Student CNN feature extractor를 freeze (large 모델 fine-tuning 시 권장)")
+    p.add_argument("--random_init_student", type=str2bool, default=False,
+                   help="Student를 random initialization으로 시작 (KD 순수 효과 측정용)")
 
     args = p.parse_args()
 
@@ -512,10 +519,12 @@ def main():
     trainer = pl.Trainer(
         devices=args.gpus,
         accelerator="gpu",
+        strategy=DDPStrategy(find_unused_parameters=True) if args.gpus > 1 else "auto",
         max_epochs=args.epochs,
         default_root_dir=args.out,
         logger=wandb,
         callbacks=[ckpt_cb],
+        gradient_clip_val=1.0,
     )
 
     # ---- 모델 ----
@@ -570,6 +579,9 @@ def main():
         disen_vis_enable=args.disen_vis_enable,
         # Optimizer
         learning_rate=args.learning_rate,
+        warmup_epochs=args.warmup_epochs,
+        freeze_feature_extractor=args.freeze_feature_extractor,
+        random_init_student=args.random_init_student,
         # Audio
         sample_rate=args.sample_rate,
     )

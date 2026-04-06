@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import lightning as pl
 import torchaudio
 from collections import OrderedDict
-from transformers import Wav2Vec2ForCTC
+from transformers import Wav2Vec2ForCTC, AutoConfig
 from utils import ensure_BCT
 
 
@@ -416,6 +416,10 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         txt_probe_lambda: float = 1.0,
         # Optimizer
         learning_rate: float = 3e-4,
+        warmup_epochs: int = 0,
+        freeze_feature_extractor: bool = False,
+        # Student 초기화
+        random_init_student: bool = False,
         # Vis
         disen_vis_enable: bool = False,
         # Audio
@@ -437,17 +441,35 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
 
         self.save_hyperparameters()
 
+        # teacher가 필요한지 여부 (어떤 KD/disentangle도 없으면 불필요)
+        _need_teacher = (
+            use_logit_kd or use_layer_kd or use_flow or use_diffkd or use_disent
+        )
+
         # ---- Teacher (frozen) ----
-        self.teacher = Wav2Vec2ForCTC.from_pretrained(teacher_name)
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
+        if _need_teacher:
+            self.teacher = Wav2Vec2ForCTC.from_pretrained(teacher_name)
+            self.teacher.eval()
+            for p in self.teacher.parameters():
+                p.requires_grad = False
+        else:
+            self.teacher = None
 
         # ---- Student ----
-        self.student = Wav2Vec2ForCTC.from_pretrained(student_name)
+        if random_init_student:
+            # config만 로드하고 가중치는 random 초기화
+            _cfg = AutoConfig.from_pretrained(student_name)
+            self.student = Wav2Vec2ForCTC(_cfg)
+        else:
+            self.student = Wav2Vec2ForCTC.from_pretrained(student_name)
+        if freeze_feature_extractor:
+            self.student.freeze_feature_encoder()
 
-        # vocab 크기 통일 (teacher 기준)
-        t_vocab = self.teacher.config.vocab_size
+        # vocab 크기 통일 (teacher 기준 또는 student 자체)
+        if self.teacher is not None:
+            t_vocab = self.teacher.config.vocab_size
+        else:
+            t_vocab = self.student.config.vocab_size
         s_vocab = self.student.config.vocab_size
         if t_vocab != s_vocab:
             self.student.lm_head = nn.Linear(
@@ -459,7 +481,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
 
         # ---- 차원 ----
         self.dim_s = self.student.config.hidden_size   # e.g. 768
-        self.dim_t = self.teacher.config.hidden_size   # e.g. 1024
+        self.dim_t = self.teacher.config.hidden_size if self.teacher is not None else self.dim_s
         self.latent_dim = latent_dim
 
         # ---- Feature capture hooks ----
@@ -468,8 +490,9 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.tch_feats: list = []
         for lyr in self.student.wav2vec2.encoder.layers:
             lyr.register_forward_hook(self._cap_stu)
-        for lyr in self.teacher.wav2vec2.encoder.layers:
-            lyr.register_forward_hook(self._cap_tch)
+        if self.teacher is not None:
+            for lyr in self.teacher.wav2vec2.encoder.layers:
+                lyr.register_forward_hook(self._cap_tch)
 
         # ---- KD flags ----
         self.use_ctc = use_ctc
@@ -503,6 +526,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.txt_probe_lambda = txt_probe_lambda
         self.use_txt_spk_probe = use_txt_spk_probe
         self.learning_rate = learning_rate
+        self.warmup_epochs = warmup_epochs
         self.use_stu_txt_kd = use_stu_txt_kd
         self.use_stu_spk_kd = use_stu_spk_kd
         self.use_stu_club = use_stu_club
@@ -650,7 +674,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
 
         # ---- manifest speaker 로딩 ----
         self._load_manifest_speakers(train_manifest)
-        L_t = self.teacher.config.num_hidden_layers
+        L_t = self.teacher.config.num_hidden_layers if self.teacher is not None else self.student.config.num_hidden_layers
         self.layer_list_for_disent = self._prepare_layer_indices(
             [4, 8, 12, 16], L_t, default_low=True
         )
@@ -883,12 +907,29 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=self.learning_rate, weight_decay=1e-2)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=True
-        )
+        T_max = self.trainer.max_epochs
+        warmup = self.warmup_epochs
+
+        if warmup > 0:
+            # Linear warmup → Cosine annealing
+            scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup
+            )
+            scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(T_max - warmup, 1), eta_min=1e-6
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[scheduler_warmup, scheduler_cosine],
+                milestones=[warmup],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=T_max, eta_min=1e-6
+            )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val/wer"},
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
         }
 
     # ============================================================
@@ -897,6 +938,11 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
 
     def _run_teacher(self, input_values, attention_mask):
         """Teacher encoder + decoder 한 번 실행. tch_feats / _tch_last / _tch_logp 갱신."""
+        if self.teacher is None:
+            self._tch_logp = None
+            self._tch_last = None
+            self.t_enc_len = None
+            return
         self.tch_feats.clear()
         with torch.no_grad():
             outputs = self.teacher(
@@ -1097,7 +1143,8 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         with torch.no_grad():
             p_t = F.softmax(tch_logp / T, dim=-1)
         logp_s_T = F.log_softmax(logits_s / T, dim=-1)
-        return F.kl_div(logp_s_T, p_t, reduction="batchmean") * (T * T)
+        # batchmean은 B로만 나누므로 T(시퀀스 길이)로 추가 정규화 → per-token KL
+        return F.kl_div(logp_s_T, p_t, reduction="batchmean") * (T * T) / T_s
 
     def _layer_metric_kd(self):
         if not self.stu_feats or not self.tch_feats:
