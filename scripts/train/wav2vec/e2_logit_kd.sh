@@ -24,7 +24,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --use_diffkd False \
   --use_disent False \
   --use_txt_spk_probe False \
-  --batch_size 8 \
+  --batch_size 4 \
   --epochs 100 \
   --gpus 4 \
   --learning_rate 1e-4 \
