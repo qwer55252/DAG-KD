@@ -385,6 +385,8 @@ def main():
     p.add_argument("--learning_rate",    type=float, default=3e-4)
     p.add_argument("--warmup_epochs",    type=int,   default=0,
                    help="Linear warmup epoch 수 (이후 CosineAnnealingLR). large 모델 fine-tuning 시 5~10 권장")
+    p.add_argument("--kd_warmup_epochs", type=int,   default=0,
+                   help="KD 시작 전 CTC only로 학습할 epoch 수. random init student 학습 시 권장 (e.g. 10)")
     p.add_argument("--freeze_feature_extractor", type=str2bool, default=False,
                    help="Student CNN feature extractor를 freeze (large 모델 fine-tuning 시 권장)")
     p.add_argument("--random_init_student", type=str2bool, default=False,
@@ -580,6 +582,7 @@ def main():
         # Optimizer
         learning_rate=args.learning_rate,
         warmup_epochs=args.warmup_epochs,
+        kd_warmup_epochs=args.kd_warmup_epochs,
         freeze_feature_extractor=args.freeze_feature_extractor,
         random_init_student=args.random_init_student,
         # Audio

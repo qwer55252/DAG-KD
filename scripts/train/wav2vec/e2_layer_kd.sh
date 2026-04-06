@@ -28,4 +28,5 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --gpus 4 \
   --learning_rate 1e-4 \
   --warmup_epochs 5 \
+  --kd_warmup_epochs 10 \
   2>&1 | tee "$OUT/train.log"
