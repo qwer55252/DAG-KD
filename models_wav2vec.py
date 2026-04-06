@@ -791,23 +791,34 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
         total = total + flow_loss + diff_loss
 
-        # 5) CTC
+        # 5) CTC + KD 정규화 가중합
+        # KD 사용 시: total = (1-alpha)*CTC + alpha*KD  (스케일 독립적 균형)
+        # KD 미사용 시: total = CTC
+        ctc = torch.tensor(0.0, device=logits.device)
+        kd_logit = torch.tensor(0.0, device=logits.device)
+        kd_layer = torch.tensor(0.0, device=logits.device)
+
         if self.use_ctc:
             ctc = self._ctc_loss(logits, enc_len, labels)
             self.log("train/ctc", ctc, on_step=False, on_epoch=True)
-            total = total + ctc
 
-        # 6) Logit KD
         if self.use_logit_kd:
             kd_logit = self._logit_kd(logits)
             self.log("train/logit_kd", kd_logit, on_step=False, on_epoch=True)
-            total = total + self.kd_alpha * kd_logit
 
-        # 7) Layer-wise metric KD
         if self.use_layer_kd:
             kd_layer = self._layer_metric_kd()
             self.log("train/layer_kd", kd_layer, on_step=False, on_epoch=True)
-            total = total + self.layer_kd_alpha * kd_layer
+
+        # 가중합 계산
+        if self.use_logit_kd:
+            # (1-kd_alpha)*CTC + kd_alpha*LogitKD
+            total = total + (1.0 - self.kd_alpha) * ctc + self.kd_alpha * kd_logit
+        elif self.use_layer_kd:
+            # (1-layer_kd_alpha)*CTC + layer_kd_alpha*LayerKD
+            total = total + (1.0 - self.layer_kd_alpha) * ctc + self.layer_kd_alpha * kd_layer
+        else:
+            total = total + ctc
 
         # 8) S-DisKD
         if (self.use_stu_txt_kd or self.use_stu_spk_kd) and self.stu_feats and embs is not None:
