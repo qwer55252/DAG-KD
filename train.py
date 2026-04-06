@@ -114,6 +114,7 @@ def main():
     p.add_argument("--multi_kd_txt_layers",   type=int_list_arg, default=[12, 14, 16])
     p.add_argument("--multi_layer_kd_type",   type=str,          default="mse")   # "mse" | "generative"
     p.add_argument("--multi_layer_kd_weight", type=float,        default=1.0)
+    p.add_argument("--multi_kd_use_spk",      type=str2bool,    default=True)
 
     # Cyclic Reconstruction (CCSRD, EMSLP 2023)
     p.add_argument("--use_cyclic", type=str2bool, default=False)
@@ -385,6 +386,7 @@ def main():
     stu_cfg.multi_kd_txt_layers   = args.multi_kd_txt_layers
     stu_cfg.multi_layer_kd_type   = args.multi_layer_kd_type
     stu_cfg.multi_layer_kd_weight = args.multi_layer_kd_weight
+    stu_cfg.multi_kd_use_spk      = args.multi_kd_use_spk
 
     # S-DisKD cfg 주입
     stu_cfg.use_stu_txt_kd    = args.use_stu_txt_kd
