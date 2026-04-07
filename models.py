@@ -164,8 +164,9 @@ class CyclicReconstructionModule(nn.Module):
         """
         pred_content = self.content_pred(self.grl(noncontent))
         pred_noncontent = self.noncontent_pred(self.grl(content))
-        l_con = F.mse_loss(pred_content, content.detach())
-        l_ncon = F.mse_loss(pred_noncontent, noncontent.detach())
+        # L2 normalize targets to match Tanh predictor output scale ([-1, 1])
+        l_con = F.mse_loss(pred_content, F.normalize(content.detach(), dim=1))
+        l_ncon = F.mse_loss(pred_noncontent, F.normalize(noncontent.detach(), dim=1))
         return l_con + l_ncon, l_con, l_ncon
 
 
