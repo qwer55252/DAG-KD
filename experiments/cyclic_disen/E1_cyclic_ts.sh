@@ -32,8 +32,8 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --disen_mi_weight 0.0 \
   --use_cyclic True \
   --cyclic_pairs "ts" \
-  --cyclic_weight 1e-2 \
-  --cyclic_grl_alpha 0.1 \
+  --cyclic_weight 5e-2 \
+  --cyclic_grl_alpha 1.0 \
   --cyclic_hidden_dim 128 \
   --cka_log_interval 500 \
   --tsne_log_interval 10
