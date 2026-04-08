@@ -173,17 +173,18 @@ class LayerwiseSpkGRL(nn.Module):
 
         for i in range(L):
             t = tch_feats[i].detach()          # (B, dim_t, T), teacher frozen
-            s = stu_feats[i].detach()          # (B, dim_s, T), stop gradient for KD target side
+            s = stu_feats[i]                   # (B, dim_s, T), student — gradient 흘러야 함
 
-            feat_i = self.encoders[i](t)       # (B, dim_s, T)
+            feat_i = self.encoders[i](t)       # (B, dim_s, T), enc_i 학습
             feat_list.append(feat_i)
 
-            # KD loss: feat_i vs student layer i
-            if feat_i.size(-1) != s.size(-1):
-                feat_i_aligned = F.interpolate(feat_i, size=s.size(-1), mode='linear', align_corners=False)
-            else:
-                feat_i_aligned = feat_i
-            l_kd_sum = l_kd_sum + F.mse_loss(feat_i_aligned, s)
+            # KD loss: student가 spk-free teacher 표현을 따라감
+            # feat_i.detach() → enc_i는 KD loss로 학습 안 함 (GRL로만 학습)
+            # student는 이 loss로 gradient를 받아 학습
+            target = feat_i.detach()
+            if target.size(-1) != s.size(-1):
+                target = F.interpolate(target, size=s.size(-1), mode='linear', align_corners=False)
+            l_kd_sum = l_kd_sum + F.mse_loss(s, target)
 
             # Adversarial loss: GRL → classifier → CE
             if speaker_ids is not None and self.num_spk > 1:
@@ -559,7 +560,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.use_layerwise_spk_grl  = bool(getattr(cfg, "use_layerwise_spk_grl", False))
         self.spk_grl_adv_weight     = float(getattr(cfg, "spk_grl_adv_weight", 0.1))
         if self.use_layerwise_spk_grl and self.num_spk > 1:
-            n_tch_layers = self.cfg.encoder.n_layers  # teacher와 동일 레이어 수
+            n_tch_layers = len(self.teacher.encoder.layers)  # teacher 레이어 수
             self.layerwise_spk_grl = LayerwiseSpkGRL(
                 num_layers=n_tch_layers,
                 dim_t=self.dim_t,
