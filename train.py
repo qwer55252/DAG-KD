@@ -139,6 +139,11 @@ def main():
     p.add_argument("--stu_spk_kd_weight", type=float,    default=1.0)
     p.add_argument("--stu_club_weight",   type=float,    default=1e-3)
 
+    # Layerwise Spk GRL
+    p.add_argument("--use_layerwise_spk_grl", type=str2bool, default=False)
+    p.add_argument("--spk_grl_alpha",         type=float,    default=0.1)
+    p.add_argument("--spk_grl_adv_weight",    type=float,    default=0.1)
+
     args = p.parse_args()
 
     # Output & manifests
@@ -379,6 +384,11 @@ def main():
     stu_cfg.stu_txt_kd_weight = args.stu_txt_kd_weight
     stu_cfg.stu_spk_kd_weight = args.stu_spk_kd_weight
     stu_cfg.stu_club_weight   = args.stu_club_weight
+
+    # Layerwise Spk GRL cfg 주입
+    stu_cfg.use_layerwise_spk_grl = args.use_layerwise_spk_grl
+    stu_cfg.spk_grl_alpha         = args.spk_grl_alpha
+    stu_cfg.spk_grl_adv_weight    = args.spk_grl_adv_weight
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
