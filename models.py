@@ -178,13 +178,13 @@ class LayerwiseSpkGRL(nn.Module):
             feat_i = self.encoders[i](t)       # (B, dim_s, T), enc_i 학습
             feat_list.append(feat_i)
 
-            # KD loss: student가 spk-free teacher 표현을 따라감
-            # feat_i.detach() → enc_i는 KD loss로 학습 안 함 (GRL로만 학습)
-            # student는 이 loss로 gradient를 받아 학습
-            target = feat_i.detach()
-            if target.size(-1) != s.size(-1):
-                target = F.interpolate(target, size=s.size(-1), mode='linear', align_corners=False)
-            l_kd_sum = l_kd_sum + F.mse_loss(s, target)
+            # KD loss: enc_i와 student 둘 다 gradient 받음
+            # enc_i: student와 가까운 표현을 만들어라 (정방향)
+            # student: enc_i(spk-free teacher)를 따라가라 (정방향)
+            feat_i_aligned = feat_i
+            if feat_i.size(-1) != s.size(-1):
+                feat_i_aligned = F.interpolate(feat_i, size=s.size(-1), mode='linear', align_corners=False)
+            l_kd_sum = l_kd_sum + F.mse_loss(s, feat_i_aligned)
 
             # Adversarial loss: GRL → classifier → CE
             if speaker_ids is not None and self.num_spk > 1:
@@ -200,7 +200,7 @@ class LayerwiseSpkGRL(nn.Module):
 
         l_kd  = l_kd_sum / L
         l_adv = l_adv_sum / L
-        spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0)
+        spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=tch_feats[0].device)
         return feat_list, l_kd, l_adv, spk_acc
 
 
