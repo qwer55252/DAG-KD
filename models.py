@@ -125,15 +125,16 @@ class LayerwiseSpkGRL(nn.Module):
     """
     Layerwise Speaker GRL for spk-free Layer KD.
 
-    각 Teacher 레이어에 개별 Conv1d encoder (dim_t → dim_s) 를 달고,
-    Shared GRL + Spk Classifier로 화자 정보를 제거한 feat_i를 만든다.
-    feat_i는 대응되는 student layer i와 MSE KD 타겟으로 사용된다.
+    각 Teacher 레이어에 개별 enc_i (dim_t→dim_s) + dec_i (dim_s→dim_t) AE를 달고:
+      1) rec_loss  = MSE(dec_i(feat_i), teacher_i) → enc_i/dec_i가 의미있는 표현 보존
+      2) adv_loss  = CE via GRL                    → enc_i가 spk 정보 제거
+      3) stu_loss  = MSE(student_i, feat_i.detach()) → student가 spk-free feat_i 학습
 
     Forward returns:
-        feat_list : List[(B, dim_s, T)]  — 각 레이어의 spk-free 표현
-        l_kd      : scalar  — MSE(feat_i, stu_feat_i) 평균
-        l_adv     : scalar  — CE(pred_spk, spk_label) 평균 (speaker_ids가 None이면 0)
-        spk_acc   : scalar  — classifier accuracy (모니터링용)
+        l_rec  : scalar — reconstruction loss 평균
+        l_adv  : scalar — adversarial loss 평균
+        l_stu  : scalar — student KD loss 평균
+        spk_acc: scalar — classifier accuracy (모니터링용)
     """
     def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1):
         super().__init__()
@@ -143,6 +144,12 @@ class LayerwiseSpkGRL(nn.Module):
         # 레이어별 개별 encoder: dim_t → dim_s
         self.encoders = nn.ModuleList([
             nn.Conv1d(dim_t, dim_s, kernel_size=1, bias=True)
+            for _ in range(num_layers)
+        ])
+
+        # 레이어별 개별 decoder: dim_s → dim_t (rec_loss용)
+        self.decoders = nn.ModuleList([
+            nn.Conv1d(dim_s, dim_t, kernel_size=1, bias=True)
             for _ in range(num_layers)
         ])
 
@@ -159,53 +166,53 @@ class LayerwiseSpkGRL(nn.Module):
 
     def forward(self, tch_feats, stu_feats, speaker_ids=None):
         """
-        tch_feats : List[(B, dim_t, T)]  — teacher hook 캡처 (len = num_layers)
-        stu_feats : List[(B, dim_s, T)]  — student hook 캡처 (len = num_layers)
+        tch_feats   : List[(B, dim_t, T)] — teacher hook 캡처
+        stu_feats   : List[(B, dim_s, T)] — student hook 캡처
         speaker_ids : (B,) LongTensor or None
         """
         L = min(len(tch_feats), len(stu_feats), self.num_layers)
+        device = tch_feats[0].device
 
-        l_kd_sum  = torch.tensor(0.0, device=tch_feats[0].device)
-        l_adv_sum = torch.tensor(0.0, device=tch_feats[0].device)
+        l_rec_sum = torch.tensor(0.0, device=device)
+        l_adv_sum = torch.tensor(0.0, device=device)
+        l_stu_sum = torch.tensor(0.0, device=device)
         n_correct = 0
         n_total   = 0
-        feat_list = []
 
         for i in range(L):
-            t = tch_feats[i].detach()          # (B, dim_t, T), teacher frozen
-            s = stu_feats[i]                   # (B, dim_s, T), student — gradient 흘러야 함
+            t = tch_feats[i].detach()   # (B, dim_t, T), teacher frozen
+            s = stu_feats[i]            # (B, dim_s, T), student
 
-            feat_i = self.encoders[i](t)       # (B, dim_s, T), enc_i 학습
-            feat_list.append(feat_i)
+            # 1) Encoder: teacher → spk-free 표현
+            feat_i = self.encoders[i](t)            # (B, dim_s, T)
 
-            # KD loss: gradient 방향을 역할별로 분리
-            # enc_i: student를 anchor로 삼아 "student 근처에서 spk만 제거"를 학습
-            #        → MSE(feat_i, student.detach()) : enc_i만 학습
-            # student: enc_i의 spk-free 결과를 일방적으로 따라감
-            #        → MSE(student, feat_i.detach()) : student만 학습
-            feat_i_aligned = feat_i
-            s_aligned = s
-            if feat_i.size(-1) != s.size(-1):
-                feat_i_aligned = F.interpolate(feat_i, size=s.size(-1), mode='linear', align_corners=False)
+            # 2) Rec loss: dec_i(feat_i) → teacher 재구성 (의미있는 표현 보장)
+            rec_i = self.decoders[i](feat_i)        # (B, dim_t, T)
+            l_rec_sum = l_rec_sum + F.mse_loss(rec_i, t)
 
-            enc_loss = F.mse_loss(feat_i_aligned, s_aligned.detach())   # enc_i 학습용
-            stu_loss = F.mse_loss(s_aligned, feat_i_aligned.detach())   # student 학습용
-            l_kd_sum = l_kd_sum + enc_loss + stu_loss
-
-            # Adversarial loss: GRL → classifier → CE
+            # 3) Adv loss: GRL → classifier → CE (spk 제거)
             if speaker_ids is not None and self.num_spk > 1:
-                pooled = feat_i.mean(dim=-1)               # (B, dim_s)
-                grl_out = self.grl(pooled)                 # gradient reversed
-                logits = self.classifier(grl_out)          # (B, num_spk)
-                valid = speaker_ids >= 0
+                pooled  = feat_i.mean(dim=-1)           # (B, dim_s)
+                grl_out = self.grl(pooled)
+                logits  = self.classifier(grl_out)      # (B, num_spk)
+                valid   = speaker_ids >= 0
                 if valid.any():
                     l_adv_sum = l_adv_sum + F.cross_entropy(logits[valid], speaker_ids[valid])
                     preds = logits[valid].argmax(dim=-1)
                     n_correct += (preds == speaker_ids[valid]).sum().item()
                     n_total   += valid.sum().item()
 
-        l_kd  = l_kd_sum / L
-        l_adv = l_adv_sum / L
+            # 4) Student KD: feat_i.detach() → student가 spk-free 표현 일방적으로 학습
+            target = feat_i.detach()
+            if target.size(-1) != s.size(-1):
+                target = F.interpolate(target, size=s.size(-1), mode='linear', align_corners=False)
+            l_stu_sum = l_stu_sum + F.mse_loss(s, target)
+
+        l_rec  = l_rec_sum / L
+        l_adv  = l_adv_sum / L
+        l_stu  = l_stu_sum / L
+        spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=device)
+        return l_rec, l_adv, l_stu, spk_acc
         spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=tch_feats[0].device)
         return feat_list, l_kd, l_adv, spk_acc
 
@@ -848,13 +855,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         
         # ===== Layerwise Spk GRL KD =====
         if self.layerwise_spk_grl is not None and self.tch_feats and self.stu_feats:
-            _, l_kd, l_adv, spk_acc = self.layerwise_spk_grl(
+            l_rec, l_adv, l_stu, spk_acc = self.layerwise_spk_grl(
                 self.tch_feats, self.stu_feats, speaker_ids
             )
-            self.log("train/spk_grl_kd",  l_kd,  on_step=False, on_epoch=True)
-            self.log("train/spk_grl_adv", l_adv,  on_step=False, on_epoch=True)
+            self.log("train/spk_grl_rec", l_rec,   on_step=False, on_epoch=True)
+            self.log("train/spk_grl_adv", l_adv,   on_step=False, on_epoch=True)
+            self.log("train/spk_grl_stu", l_stu,   on_step=False, on_epoch=True)
             self.log("train/spk_grl_acc", spk_acc, on_step=False, on_epoch=True)
-            total = total + l_kd + self.spk_grl_adv_weight * l_adv
+            total = total + l_rec + l_stu + self.spk_grl_adv_weight * l_adv
 
         self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
 
