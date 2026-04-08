@@ -178,13 +178,19 @@ class LayerwiseSpkGRL(nn.Module):
             feat_i = self.encoders[i](t)       # (B, dim_s, T), enc_i 학습
             feat_list.append(feat_i)
 
-            # KD loss: enc_i와 student 둘 다 gradient 받음
-            # enc_i: student와 가까운 표현을 만들어라 (정방향)
-            # student: enc_i(spk-free teacher)를 따라가라 (정방향)
+            # KD loss: gradient 방향을 역할별로 분리
+            # enc_i: student를 anchor로 삼아 "student 근처에서 spk만 제거"를 학습
+            #        → MSE(feat_i, student.detach()) : enc_i만 학습
+            # student: enc_i의 spk-free 결과를 일방적으로 따라감
+            #        → MSE(student, feat_i.detach()) : student만 학습
             feat_i_aligned = feat_i
+            s_aligned = s
             if feat_i.size(-1) != s.size(-1):
                 feat_i_aligned = F.interpolate(feat_i, size=s.size(-1), mode='linear', align_corners=False)
-            l_kd_sum = l_kd_sum + F.mse_loss(s, feat_i_aligned)
+
+            enc_loss = F.mse_loss(feat_i_aligned, s_aligned.detach())   # enc_i 학습용
+            stu_loss = F.mse_loss(s_aligned, feat_i_aligned.detach())   # student 학습용
+            l_kd_sum = l_kd_sum + enc_loss + stu_loss
 
             # Adversarial loss: GRL → classifier → CE
             if speaker_ids is not None and self.num_spk > 1:
