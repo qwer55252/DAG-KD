@@ -136,7 +136,8 @@ class LayerwiseSpkGRL(nn.Module):
         l_stu  : scalar — student KD loss 평균
         spk_acc: scalar — classifier accuracy (모니터링용)
     """
-    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1):
+    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1,
+                 normalize_stu: bool = False):
         super().__init__()
         self.num_layers = num_layers
         self.num_spk = num_spk
@@ -163,6 +164,7 @@ class LayerwiseSpkGRL(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden, num_spk),
         )
+        self.normalize_stu = normalize_stu
 
     def forward(self, tch_feats, stu_feats, speaker_ids=None):
         """
@@ -206,7 +208,13 @@ class LayerwiseSpkGRL(nn.Module):
             target = feat_i.detach()
             if target.size(-1) != s.size(-1):
                 target = F.interpolate(target, size=s.size(-1), mode='linear', align_corners=False)
-            l_stu_sum = l_stu_sum + F.mse_loss(s, target)
+            if self.normalize_stu:
+                # scale mismatch 제거: 방향만 정렬 (cosine 기반 MSE)
+                target_n = F.normalize(target, dim=1)
+                s_n = F.normalize(s, dim=1)
+                l_stu_sum = l_stu_sum + F.mse_loss(s_n, target_n)
+            else:
+                l_stu_sum = l_stu_sum + F.mse_loss(s, target)
 
         l_rec  = l_rec_sum / L
         l_adv  = l_adv_sum / L
@@ -572,6 +580,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # ===== Layerwise Spk GRL =====
         self.use_layerwise_spk_grl  = bool(getattr(cfg, "use_layerwise_spk_grl", False))
         self.spk_grl_adv_weight     = float(getattr(cfg, "spk_grl_adv_weight", 0.1))
+        self.spk_grl_rec_weight     = float(getattr(cfg, "spk_grl_rec_weight", 1.0))
         if self.use_layerwise_spk_grl and self.num_spk > 1:
             n_tch_layers = len(self.teacher.encoder.layers)  # teacher 레이어 수
             self.layerwise_spk_grl = LayerwiseSpkGRL(
@@ -580,6 +589,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 dim_s=self.dim_s,
                 num_spk=self.num_spk,
                 grl_alpha=float(getattr(cfg, "spk_grl_alpha", 0.1)),
+                normalize_stu=bool(getattr(cfg, "spk_grl_normalize_stu", False)),
             )
         else:
             self.layerwise_spk_grl = None
@@ -862,7 +872,7 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train/spk_grl_adv", l_adv,   on_step=False, on_epoch=True)
             self.log("train/spk_grl_stu", l_stu,   on_step=False, on_epoch=True)
             self.log("train/spk_grl_acc", spk_acc, on_step=False, on_epoch=True)
-            total = total + l_rec + l_stu + self.spk_grl_adv_weight * l_adv
+            total = total + self.spk_grl_rec_weight * l_rec + l_stu + self.spk_grl_adv_weight * l_adv
 
         self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
 
