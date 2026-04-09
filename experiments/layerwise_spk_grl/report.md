@@ -72,13 +72,15 @@ L_total = L_ctc                              (ASR 메인)
 
 ## 실험 테이블
 
-| Exp | 설명 | use_layer_kd | spk_grl | λ_adv | grl_alpha |
-|-----|------|:---:|:---:|:---:|:---:|
-| E1  | Layer KD only (baseline) | ✓ | ✗ | — | — |
-| E2  | Layerwise Spk GRL KD | ✗ | ✓ | 1e-1 | 0.1 |
+| Exp | 설명 | use_layer_kd | spk_grl | λ_adv | λ_rec | normalize_stu | grl_alpha |
+|-----|------|:---:|:---:|:---:|:---:|:---:|:---:|
+| E1  | Layer KD only (baseline) | ✓ | ✗ | — | — | — | — |
+| E2  | Layerwise Spk GRL KD | ✗ | ✓ | 1e-1 | 1.0 | ✗ | 0.1 |
+| E3  | E2 + Normalized Stu KD + λ_rec 감소 | ✗ | ✓ | 1e-1 | 0.1 | ✓ | 0.1 |
 
 - E1: 기존 `_layer_metric_kd` (stu_to_tea_proj MSE) → 비교군
 - E2: λ_adv=1e-1 선택 근거 — E5 cyclic 실험(grl_alpha=0.1)이 안정적으로 수렴했고, 동일 계열 adversarial loss이므로 같은 스케일 적용
+- E3: E2 결과 분석 — `spk_grl_stu=50` (teacher scale vs student ASR scale mismatch) → `F.normalize(feat_i, dim=1)` / `F.normalize(s, dim=1)` 후 MSE로 방향만 정렬. `λ_rec=0.1`로 rec_loss 비중을 줄여 enc_i가 adv signal에 더 집중하게 함
 
 ---
 
