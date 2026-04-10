@@ -150,12 +150,20 @@ class LayerwiseSpkGRL(nn.Module):
         # enc_dim: encoder 출력 차원. None이면 dim_t (E4 기본). dim_s 지정 시 E2/E3 호환
         enc_dim = enc_dim if enc_dim is not None else dim_t
         self.enc_dim = enc_dim
+        self.dim_t   = dim_t
 
         # 레이어별 개별 encoder: dim_t → enc_dim
         self.encoders = nn.ModuleList([
             nn.Conv1d(dim_t, enc_dim, kernel_size=1, bias=True)
             for _ in range(num_layers)
         ])
+
+        # E2/E3 호환: enc_dim < dim_t면 decoder 복원 (체크포인트 key 유지용)
+        if enc_dim < dim_t:
+            self.decoders = nn.ModuleList([
+                nn.Conv1d(enc_dim, dim_t, kernel_size=1, bias=True)
+                for _ in range(num_layers)
+            ])
 
         # Shared student proj: dim_s → enc_dim
         self.stu_proj = nn.Conv1d(dim_s, enc_dim, kernel_size=1, bias=True)
