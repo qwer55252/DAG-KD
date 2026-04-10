@@ -3,7 +3,7 @@
 ## 테이블 주제
 
 **Layerwise Spk-Free Layer KD**
-모든 Teacher 레이어에 개별 AE(enc_i + dec_i)와 Shared GRL Spk Classifier를 달아,
+모든 Teacher 레이어에 개별 enc_i와 Shared GRL Spk Classifier를 달아,
 spk 정보가 제거된 feat_i를 만들고 이를 Student Layer KD 타겟으로 사용한다.
 
 ---
@@ -72,15 +72,17 @@ L_total = L_ctc                              (ASR 메인)
 
 ## 실험 테이블
 
-| Exp | 설명 | use_layer_kd | spk_grl | λ_adv | λ_rec | normalize_stu | grl_alpha |
+| Exp | 설명 | enc_i 차원 | KD 방향 | decoder | λ_adv | λ_rec | grl_alpha |
 |-----|------|:---:|:---:|:---:|:---:|:---:|:---:|
-| E1  | Layer KD only (baseline) | ✓ | ✗ | — | — | — | — |
-| E2  | Layerwise Spk GRL KD | ✗ | ✓ | 1e-1 | 1.0 | ✗ | 0.1 |
-| E3  | E2 + Normalized Stu KD + λ_rec 감소 | ✗ | ✓ | 1e-1 | 0.1 | ✓ | 0.1 |
+| E1  | Layer KD only (baseline) | — | stu→tch | — | — | — | — |
+| E2  | Layerwise Spk GRL KD | 176→88 | tch→stu | AE | 0.1 | 1.0 | 0.1 |
+| E3  | E2 + normalize_stu + λ_rec 감소 | 176→88 | tch→stu | AE | 0.1 | 0.1 | 0.1 |
+| E4  | Teacher Space KD (정보 손실 없음) | 176→176 | stu→tch | ✗ | 0.1 | 1.0 | 0.1 |
 
-- E1: 기존 `_layer_metric_kd` (stu_to_tea_proj MSE) → 비교군
-- E2: λ_adv=1e-1 선택 근거 — E5 cyclic 실험(grl_alpha=0.1)이 안정적으로 수렴했고, 동일 계열 adversarial loss이므로 같은 스케일 적용
-- E3: E2 결과 분석 — `spk_grl_stu=50` (teacher scale vs student ASR scale mismatch) → `F.normalize(feat_i, dim=1)` / `F.normalize(s, dim=1)` 후 MSE로 방향만 정렬. `λ_rec=0.1`로 rec_loss 비중을 줄여 enc_i가 adv signal에 더 집중하게 함
+- E1: `stu_to_tea_proj` (88→176 shared) → teacher space에서 MSE
+- E2: enc_i (176→88) 압축 + AE decoder. KD 방향이 반대라 정보 손실 발생
+- E3: E2의 scale mismatch 해결 (normalize). spk_grl_stu 50→0.022 ✓, 하지만 압축 문제는 미해결. WER E1보다 나쁨
+- E4: enc_i를 176→176으로 변경해 정보 손실 제거. decoder 대신 `MSE(enc_i(t), t)` 직접 사용. student는 `shared_proj`(88→176)로 teacher space에서 spk-free 표현 학습 (E1 방향 + spk 제거)
 
 ---
 
