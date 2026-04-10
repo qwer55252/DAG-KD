@@ -145,6 +145,7 @@ def main():
     p.add_argument("--spk_grl_adv_weight",     type=float,    default=0.1)
     p.add_argument("--spk_grl_rec_weight",     type=float,    default=1.0)
     p.add_argument("--spk_grl_normalize_stu",  type=str2bool, default=False)
+    p.add_argument("--spk_grl_enc_dim",        type=int,      default=None)
 
     args = p.parse_args()
 
@@ -393,6 +394,7 @@ def main():
     stu_cfg.spk_grl_adv_weight     = args.spk_grl_adv_weight
     stu_cfg.spk_grl_rec_weight     = args.spk_grl_rec_weight
     stu_cfg.spk_grl_normalize_stu  = args.spk_grl_normalize_stu
+    stu_cfg.spk_grl_enc_dim        = args.spk_grl_enc_dim
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
