@@ -123,48 +123,49 @@ class GradientReversalLayer(nn.Module):
 
 class LayerwiseSpkGRL(nn.Module):
     """
-    Layerwise Speaker GRL for spk-free Layer KD.
+    Layerwise Speaker GRL for spk-free Layer KD (E4 설계).
 
-    각 Teacher 레이어에 개별 enc_i (dim_t→dim_s) + dec_i (dim_s→dim_t) AE를 달고:
-      1) rec_loss  = MSE(dec_i(feat_i), teacher_i) → enc_i/dec_i가 의미있는 표현 보존
-      2) adv_loss  = CE via GRL                    → enc_i가 spk 정보 제거
-      3) stu_loss  = MSE(student_i, feat_i.detach()) → student가 spk-free feat_i 학습
+    각 Teacher 레이어에 개별 enc_i (dim_t→dim_t, 동일 차원) 를 달고:
+      1) rec_loss = MSE(enc_i(teacher_i), teacher_i)       → enc_i가 content 보존 (decoder 불필요)
+      2) adv_loss = CE via GRL on pooled feat_i             → enc_i가 spk 정보 제거
+      3) stu_loss = MSE(shared_proj(student_i), feat_i)    → student가 teacher space에서 spk-free 표현 학습
+
+    E2/E3 대비 변경점:
+      - enc_i: dim_t→dim_s(압축) → dim_t→dim_t(동일 차원, 정보 손실 없음)
+      - decoder 제거: MSE(enc_i(t), t) 로 직접 content 보존
+      - stu_loss: student space(dim_s)에서 비교 → teacher space(dim_t)에서 비교
+      - shared_proj (dim_s→dim_t): student를 teacher space로 확장 (E1과 동일 방향)
 
     Forward returns:
-        l_rec  : scalar — reconstruction loss 평균
+        l_rec  : scalar — content 보존 loss 평균
         l_adv  : scalar — adversarial loss 평균
         l_stu  : scalar — student KD loss 평균
         spk_acc: scalar — classifier accuracy (모니터링용)
     """
-    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1,
-                 normalize_stu: bool = False):
+    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1):
         super().__init__()
         self.num_layers = num_layers
         self.num_spk = num_spk
 
-        # 레이어별 개별 encoder: dim_t → dim_s
+        # 레이어별 개별 encoder: dim_t → dim_t (동일 차원, 정보 손실 없음)
         self.encoders = nn.ModuleList([
-            nn.Conv1d(dim_t, dim_s, kernel_size=1, bias=True)
+            nn.Conv1d(dim_t, dim_t, kernel_size=1, bias=True)
             for _ in range(num_layers)
         ])
 
-        # 레이어별 개별 decoder: dim_s → dim_t (rec_loss용)
-        self.decoders = nn.ModuleList([
-            nn.Conv1d(dim_s, dim_t, kernel_size=1, bias=True)
-            for _ in range(num_layers)
-        ])
+        # Shared student proj: dim_s → dim_t (E1의 stu_to_tea_proj와 동일 방향)
+        self.stu_proj = nn.Conv1d(dim_s, dim_t, kernel_size=1, bias=True)
 
         # Shared GRL
         self.grl = GradientReversalLayer(alpha=grl_alpha)
 
-        # Shared Spk Classifier: (B, dim_s) → (B, num_spk)
-        hidden = max(dim_s * 2, 256)
+        # Shared Spk Classifier: (B, dim_t) → (B, num_spk)
+        hidden = max(dim_t * 2, 256)
         self.classifier = nn.Sequential(
-            nn.Linear(dim_s, hidden),
+            nn.Linear(dim_t, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, num_spk),
         )
-        self.normalize_stu = normalize_stu
 
     def forward(self, tch_feats, stu_feats, speaker_ids=None):
         """
@@ -185,18 +186,17 @@ class LayerwiseSpkGRL(nn.Module):
             t = tch_feats[i].detach()   # (B, dim_t, T), teacher frozen
             s = stu_feats[i]            # (B, dim_s, T), student
 
-            # 1) Encoder: teacher → spk-free 표현
-            feat_i = self.encoders[i](t)            # (B, dim_s, T)
+            # 1) Encoder: teacher → spk-free (동일 차원 유지)
+            feat_i = self.encoders[i](t)                    # (B, dim_t, T)
 
-            # 2) Rec loss: dec_i(feat_i) → teacher 재구성 (의미있는 표현 보장)
-            rec_i = self.decoders[i](feat_i)        # (B, dim_t, T)
-            l_rec_sum = l_rec_sum + F.mse_loss(rec_i, t)
+            # 2) Rec loss: MSE(feat_i, t) 직접 — decoder 불필요
+            l_rec_sum = l_rec_sum + F.mse_loss(feat_i, t)
 
             # 3) Adv loss: GRL → classifier → CE (spk 제거)
             if speaker_ids is not None and self.num_spk > 1:
-                pooled  = feat_i.mean(dim=-1)           # (B, dim_s)
+                pooled  = feat_i.mean(dim=-1)               # (B, dim_t)
                 grl_out = self.grl(pooled)
-                logits  = self.classifier(grl_out)      # (B, num_spk)
+                logits  = self.classifier(grl_out)          # (B, num_spk)
                 valid   = speaker_ids >= 0
                 if valid.any():
                     l_adv_sum = l_adv_sum + F.cross_entropy(logits[valid], speaker_ids[valid])
@@ -204,25 +204,18 @@ class LayerwiseSpkGRL(nn.Module):
                     n_correct += (preds == speaker_ids[valid]).sum().item()
                     n_total   += valid.sum().item()
 
-            # 4) Student KD: feat_i.detach() → student가 spk-free 표현 일방적으로 학습
-            target = feat_i.detach()
-            if target.size(-1) != s.size(-1):
-                target = F.interpolate(target, size=s.size(-1), mode='linear', align_corners=False)
-            if self.normalize_stu:
-                # scale mismatch 제거: 방향만 정렬 (cosine 기반 MSE)
-                target_n = F.normalize(target, dim=1)
-                s_n = F.normalize(s, dim=1)
-                l_stu_sum = l_stu_sum + F.mse_loss(s_n, target_n)
-            else:
-                l_stu_sum = l_stu_sum + F.mse_loss(s, target)
+            # 4) Student KD: student를 teacher space(dim_t)로 확장 후 spk-free feat_i에 align
+            target = feat_i.detach()                        # (B, dim_t, T)
+            s_proj = self.stu_proj(s)                       # (B, dim_t, T), shared proj
+            if target.size(-1) != s_proj.size(-1):
+                target = F.interpolate(target, size=s_proj.size(-1), mode='linear', align_corners=False)
+            l_stu_sum = l_stu_sum + F.mse_loss(s_proj, target)
 
         l_rec  = l_rec_sum / L
         l_adv  = l_adv_sum / L
         l_stu  = l_stu_sum / L
         spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=device)
         return l_rec, l_adv, l_stu, spk_acc
-        spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=tch_feats[0].device)
-        return feat_list, l_kd, l_adv, spk_acc
 
 
 class FeaturePredictor(nn.Module):
@@ -589,7 +582,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 dim_s=self.dim_s,
                 num_spk=self.num_spk,
                 grl_alpha=float(getattr(cfg, "spk_grl_alpha", 0.1)),
-                normalize_stu=bool(getattr(cfg, "spk_grl_normalize_stu", False)),
             )
         else:
             self.layerwise_spk_grl = None
