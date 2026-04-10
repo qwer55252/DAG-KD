@@ -903,6 +903,23 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         return total
 
+    def on_load_checkpoint(self, checkpoint):
+        """체크포인트 구조가 현재 모델과 다를 때 key를 맞춰줌 (strict 로드 전 개입)."""
+        sd = checkpoint["state_dict"]
+        if self.layerwise_spk_grl is None:
+            return
+        grl = self.layerwise_spk_grl
+        # 1) stu_proj가 현재 모델엔 있는데 체크포인트엔 없으면 → 현재 초기값으로 채움
+        for key in ["layerwise_spk_grl.stu_proj.weight", "layerwise_spk_grl.stu_proj.bias"]:
+            if key not in sd and hasattr(grl, "stu_proj"):
+                attr = "weight" if "weight" in key else "bias"
+                sd[key] = getattr(grl.stu_proj, attr).data.clone()
+        # 2) decoders가 체크포인트엔 있는데 현재 모델엔 없으면 → 제거
+        if not hasattr(grl, "decoders"):
+            for k in list(sd.keys()):
+                if "layerwise_spk_grl.decoders" in k:
+                    del sd[k]
+
     def on_train_epoch_end(self):
         """매 tsne_log_interval epoch마다 t-SNE를 WandB에 로깅."""
         current_epoch = self.current_epoch + 1  # 0-indexed → 1-indexed
