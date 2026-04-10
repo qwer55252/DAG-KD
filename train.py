@@ -145,7 +145,6 @@ def main():
     p.add_argument("--spk_grl_adv_weight",     type=float,    default=0.1)
     p.add_argument("--spk_grl_rec_weight",     type=float,    default=1.0)
     p.add_argument("--spk_grl_normalize_stu",  type=str2bool, default=False)
-    p.add_argument("--spk_grl_enc_dim",        type=int,      default=None)
 
     args = p.parse_args()
 
@@ -394,7 +393,6 @@ def main():
     stu_cfg.spk_grl_adv_weight     = args.spk_grl_adv_weight
     stu_cfg.spk_grl_rec_weight     = args.spk_grl_rec_weight
     stu_cfg.spk_grl_normalize_stu  = args.spk_grl_normalize_stu
-    stu_cfg.spk_grl_enc_dim        = args.spk_grl_enc_dim
 
     model = DistilDAGKDCTCModelBPE(
         cfg=stu_cfg,
@@ -438,14 +436,6 @@ def main():
 
     if ckpt_path and os.path.isfile(ckpt_path):
         print(f"[INFO] Resuming training from checkpoint: {ckpt_path}")
-        # strict=False로 state_dict 먼저 로드 (구조 변경된 체크포인트 호환)
-        import torch as _torch
-        _ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        _missing, _unexpected = model.load_state_dict(_ckpt["state_dict"], strict=False)
-        if _missing:
-            print(f"[WARN] Missing keys (new params, will be randomly initialized): {_missing}")
-        if _unexpected:
-            print(f"[WARN] Unexpected keys (ignored): {len(_unexpected)} keys")
         trainer.fit(model, ckpt_path=ckpt_path)
     else:
         if ckpt_path:
