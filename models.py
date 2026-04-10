@@ -142,39 +142,27 @@ class LayerwiseSpkGRL(nn.Module):
         l_stu  : scalar — student KD loss 평균
         spk_acc: scalar — classifier accuracy (모니터링용)
     """
-    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1,
-                 enc_dim: int = None):
+    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1):
         super().__init__()
         self.num_layers = num_layers
         self.num_spk = num_spk
-        # enc_dim: encoder 출력 차원. None이면 dim_t (E4 기본). dim_s 지정 시 E2/E3 호환
-        enc_dim = enc_dim if enc_dim is not None else dim_t
-        self.enc_dim = enc_dim
-        self.dim_t   = dim_t
 
-        # 레이어별 개별 encoder: dim_t → enc_dim
+        # 레이어별 개별 encoder: dim_t → dim_t (동일 차원, 정보 손실 없음)
         self.encoders = nn.ModuleList([
-            nn.Conv1d(dim_t, enc_dim, kernel_size=1, bias=True)
+            nn.Conv1d(dim_t, dim_t, kernel_size=1, bias=True)
             for _ in range(num_layers)
         ])
 
-        # E2/E3 호환: enc_dim < dim_t면 decoder 복원 (체크포인트 key 유지용)
-        if enc_dim < dim_t:
-            self.decoders = nn.ModuleList([
-                nn.Conv1d(enc_dim, dim_t, kernel_size=1, bias=True)
-                for _ in range(num_layers)
-            ])
-
-        # Shared student proj: dim_s → enc_dim
-        self.stu_proj = nn.Conv1d(dim_s, enc_dim, kernel_size=1, bias=True)
+        # Shared student proj: dim_s → dim_t (E1의 stu_to_tea_proj와 동일 방향)
+        self.stu_proj = nn.Conv1d(dim_s, dim_t, kernel_size=1, bias=True)
 
         # Shared GRL
         self.grl = GradientReversalLayer(alpha=grl_alpha)
 
-        # Shared Spk Classifier: (B, enc_dim) → (B, num_spk)
-        hidden = max(enc_dim * 2, 256)
+        # Shared Spk Classifier: (B, dim_t) → (B, num_spk)
+        hidden = max(dim_t * 2, 256)
         self.classifier = nn.Sequential(
-            nn.Linear(enc_dim, hidden),
+            nn.Linear(dim_t, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, num_spk),
         )
@@ -198,17 +186,15 @@ class LayerwiseSpkGRL(nn.Module):
             t = tch_feats[i].detach()   # (B, dim_t, T), teacher frozen
             s = stu_feats[i]            # (B, dim_s, T), student
 
-            # 1) Encoder: teacher → spk-free (enc_dim 차원)
-            feat_i = self.encoders[i](t)                    # (B, enc_dim, T)
+            # 1) Encoder: teacher → spk-free (동일 차원 유지)
+            feat_i = self.encoders[i](t)                    # (B, dim_t, T)
 
-            # 2) Rec loss: MSE(feat_i, t) — enc_dim==dim_t일 때만 의미있음 (E4)
-            #    enc_dim==dim_s (E2/E3 호환)일 때는 decoder가 없으므로 skip
-            if self.enc_dim == t.size(1):
-                l_rec_sum = l_rec_sum + F.mse_loss(feat_i, t)
+            # 2) Rec loss: MSE(feat_i, t) 직접 — decoder 불필요
+            l_rec_sum = l_rec_sum + F.mse_loss(feat_i, t)
 
             # 3) Adv loss: GRL → classifier → CE (spk 제거)
             if speaker_ids is not None and self.num_spk > 1:
-                pooled  = feat_i.mean(dim=-1)               # (B, enc_dim)
+                pooled  = feat_i.mean(dim=-1)               # (B, dim_t)
                 grl_out = self.grl(pooled)
                 logits  = self.classifier(grl_out)          # (B, num_spk)
                 valid   = speaker_ids >= 0
@@ -218,9 +204,9 @@ class LayerwiseSpkGRL(nn.Module):
                     n_correct += (preds == speaker_ids[valid]).sum().item()
                     n_total   += valid.sum().item()
 
-            # 4) Student KD: stu_proj(student) → MSE ← feat_i
-            target = feat_i.detach()                        # (B, enc_dim, T)
-            s_proj = self.stu_proj(s)                       # (B, enc_dim, T)
+            # 4) Student KD: student를 teacher space(dim_t)로 확장 후 spk-free feat_i에 align
+            target = feat_i.detach()                        # (B, dim_t, T)
+            s_proj = self.stu_proj(s)                       # (B, dim_t, T), shared proj
             if target.size(-1) != s_proj.size(-1):
                 target = F.interpolate(target, size=s_proj.size(-1), mode='linear', align_corners=False)
             l_stu_sum = l_stu_sum + F.mse_loss(s_proj, target)
@@ -590,17 +576,12 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.spk_grl_rec_weight     = float(getattr(cfg, "spk_grl_rec_weight", 1.0))
         if self.use_layerwise_spk_grl and self.num_spk > 1:
             n_tch_layers = len(self.teacher.encoder.layers)  # teacher 레이어 수
-            # enc_dim: None이면 dim_t(E4), 명시하면 그 값 사용 (E2=dim_s, E3=dim_s)
-            _enc_dim = getattr(cfg, "spk_grl_enc_dim", None)
-            if _enc_dim is not None:
-                _enc_dim = int(_enc_dim)
             self.layerwise_spk_grl = LayerwiseSpkGRL(
                 num_layers=n_tch_layers,
                 dim_t=self.dim_t,
                 dim_s=self.dim_s,
                 num_spk=self.num_spk,
                 grl_alpha=float(getattr(cfg, "spk_grl_alpha", 0.1)),
-                enc_dim=_enc_dim,
             )
         else:
             self.layerwise_spk_grl = None
@@ -902,23 +883,6 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                         self._tsne_buf_spk_ids.append(speaker_ids.cpu())
 
         return total
-
-    def on_load_checkpoint(self, checkpoint):
-        """체크포인트 구조가 현재 모델과 다를 때 key를 맞춰줌 (strict 로드 전 개입)."""
-        sd = checkpoint["state_dict"]
-        if self.layerwise_spk_grl is None:
-            return
-        grl = self.layerwise_spk_grl
-        # 1) stu_proj가 현재 모델엔 있는데 체크포인트엔 없으면 → 현재 초기값으로 채움
-        for key in ["layerwise_spk_grl.stu_proj.weight", "layerwise_spk_grl.stu_proj.bias"]:
-            if key not in sd and hasattr(grl, "stu_proj"):
-                attr = "weight" if "weight" in key else "bias"
-                sd[key] = getattr(grl.stu_proj, attr).data.clone()
-        # 2) decoders가 체크포인트엔 있는데 현재 모델엔 없으면 → 제거
-        if not hasattr(grl, "decoders"):
-            for k in list(sd.keys()):
-                if "layerwise_spk_grl.decoders" in k:
-                    del sd[k]
 
     def on_train_epoch_end(self):
         """매 tsne_log_interval epoch마다 t-SNE를 WandB에 로깅."""
