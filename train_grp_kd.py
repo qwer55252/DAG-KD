@@ -51,6 +51,8 @@ from utils import (
     compute_speaker_durations,
     compute_sample_wers,
     snapshot_sources,
+    load_speaker_table_from_manifest,
+    extract_speaker_ids_from_batch,
 )
 
 
@@ -315,6 +317,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.proj_spk_s  = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
             self.lat_dec     = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
             self.spk_cls     = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+            # sample_id → speaker_class 룩업 테이블 (register_buffer: 저장/로드 가능, 학습 X)
+            self.spk_table: torch.Tensor | None = None
 
         _flow_cfg = dict(flow_cfg or {})
         self.fm_latent   = FMLatent(latent_dim=latent_dim, flow_cfg=_flow_cfg)
@@ -481,7 +485,12 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
     def training_step(self, batch, batch_idx):
         if len(batch) == 5:
-            signal, sig_len, transcript, transcript_len, spk_id = batch
+            signal, sig_len, transcript, transcript_len, sample_id = batch
+            # sample_id(dataset index) → speaker class label
+            if self.disen_mode >= 1 and self.spk_table is not None:
+                spk_id = self.spk_table.to(signal.device)[sample_id.long()]
+            else:
+                spk_id = None
         else:
             signal, sig_len, transcript, transcript_len = batch
             spk_id = None
@@ -778,6 +787,13 @@ def main():
         orth_weight=args.orth_weight,
         spk_cls_weight=args.spk_cls_weight,
     )
+
+    # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
+    if args.disen_mode >= 1:
+        _manifest = train_manifest if not args.test_mode else \
+            os.path.join(manifest_dir, "test_mode_train.json")
+        model.spk_table = load_speaker_table_from_manifest(_manifest)
+        print(f"[INFO] spk_table loaded: {len(model.spk_table)} samples, {num_spk} speakers")
 
     # ── Train ─────────────────────────────────────────────────
     ckpt_path = args.resume_ckpt
