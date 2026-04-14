@@ -32,6 +32,8 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from pathlib import Path
@@ -764,14 +766,17 @@ def main():
         plot_dir = os.path.join(args.out, "xai/wer_plots")
         os.makedirs(plot_dir, exist_ok=True)
         wers_np = np.array(sample_wers_pct, dtype=float)
-        plt.figure()
-        plt.hist(wers_np, bins=[0, 10, 20, 30, 50, 100, 200], edgecolor="black")
-        plt.xlabel("Per-sample WER (%)")
-        plt.ylabel("Count")
-        plt.title(f"WER Histogram - {split_name}\nmean={wer_mean:.2f}%, std={wer_std:.2f}%")
-        plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, f"wer_hist_{split_name}.png"))
-        plt.close()
+        torch.cuda.empty_cache()
+        try:
+            fig, ax = plt.subplots()
+            ax.hist(wers_np, bins=[0, 10, 20, 30, 50, 100, 200], edgecolor="black")
+            ax.set_xlabel("Per-sample WER (%)")
+            ax.set_ylabel("Count")
+            ax.set_title(f"WER Histogram - {split_name}\nmean={wer_mean:.2f}%, std={wer_std:.2f}%")
+            fig.tight_layout()
+            fig.savefig(os.path.join(plot_dir, f"wer_hist_{split_name}.png"))
+        finally:
+            plt.close("all")
 
 
 if __name__ == "__main__":
