@@ -314,9 +314,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.enc_text_t  = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
             self.enc_spk_t   = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
             self.proj_text_s = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
-            self.proj_spk_s  = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
-            self.lat_dec     = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
-            self.spk_cls     = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+            # student spk 인코더 없음: KD 타겟이 이미 speaker-clean(z_t_text)이므로
+            # FM+Diffusion이 z_s_text를 z_t_text로 당기면 자연히 text-only 표현이 됨
+            self.lat_dec = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
+            self.spk_cls = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
             # sample_id → speaker_class 룩업 테이블 (register_buffer: 저장/로드 가능, 학습 X)
             self.spk_table: torch.Tensor | None = None
 
@@ -402,14 +403,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             # Recon: (z_t_text + z_t_spk) → teacher feature
             out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk), t_bct)
 
-            # Student 병렬 투영
+            # Student 투영 (text only)
             z_s_text = self.proj_text_s(s_bct)          # (B, latent_dim, T)
-            z_s_spk  = self.proj_spk_s(s_bct)           # (B, latent_dim, T)
 
-            # 직교 제약 (teacher + student)
-            orth_t = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
-            orth_s = (z_s_text * z_s_spk).sum(dim=1).pow(2).mean()
-            out["orth_loss"] = orth_t + orth_s
+            # 직교 제약 (teacher side only)
+            out["orth_loss"] = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
 
             # Speaker classifier (teacher spk latent)
             if spk_id is not None:
