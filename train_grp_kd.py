@@ -208,6 +208,17 @@ class SimpleDenoiser(nn.Module):
         return x
 
 
+class SpeakerClassifier(nn.Module):
+    """z_spk (B, latent_dim, T) → mean pool → fc → logits (B, num_spk)"""
+    def __init__(self, latent_dim: int, num_spk: int):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, num_spk)
+
+    def forward(self, z_spk_bct):
+        pooled = z_spk_bct.mean(dim=2)   # (B, latent_dim)
+        return self.fc(pooled)            # (B, num_spk)
+
+
 class FMLatent(nn.Module):
     """잠재공간 전용 FlowMatching 래퍼 (shape_transform=identity, student_dim=teacher_dim=latent_dim)"""
     def __init__(self, latent_dim: int, flow_cfg: dict):
@@ -263,6 +274,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         latent_dim: int = 96,
         diffusion_steps: int = 9,
         flow_cfg: dict = None,
+        disen_mode: int = 0,
+        num_spk: int = 1,
+        orth_weight: float = 1.0,
+        spk_cls_weight: float = 1.0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -279,14 +294,27 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.teacher_dim = teacher_dim
         self.latent_dim  = latent_dim
 
+        self.disen_mode     = disen_mode
+        self.orth_weight    = orth_weight
+        self.spk_cls_weight = spk_cls_weight
+
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
 
-        # 공통 블록
+        # 공통 블록 (disen_mode=0: E1 그대로)
         self.tae      = TeacherAutoEncoder(teacher_dim=teacher_dim, latent_dim=latent_dim)
         self.sproj    = StudentProjector(student_dim=student_dim, latent_dim=latent_dim)
         self.adapter  = NoiseAdapter(latent_dim=latent_dim)
         self.denoiser = SimpleDenoiser(latent_dim=latent_dim, steps=diffusion_steps)
+
+        # disen_mode >= 1: 병렬 인코더 + decoder + speaker classifier
+        if disen_mode >= 1:
+            self.enc_text_t  = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+            self.enc_spk_t   = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+            self.proj_text_s = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
+            self.proj_spk_s  = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
+            self.lat_dec     = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
+            self.spk_cls     = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
 
         _flow_cfg = dict(flow_cfg or {})
         self.fm_latent   = FMLatent(latent_dim=latent_dim, flow_cfg=_flow_cfg)
@@ -344,27 +372,62 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             return log_probs, enc_len, greedy
 
-    def _compute_v_losses_one_layer(self, s_bht, t_bht):
+    def _compute_v_losses_one_layer(self, s_bht, t_bht, spk_id=None):
         """단일 레이어 (B,Hs,T), (B,Ht,T) → version별 loss dict"""
         # (B,H,T) → (B,T,H) 로 transpose (원본과 동일)
         s_bct = s_bht.transpose(1, 2)
         t_bct = t_bht.transpose(1, 2)
 
-        # Teacher AE
-        z_t, t_rec    = self.tae(t_bct)
-        z_t           = z_t.detach()
-        recon_loss    = self.recon_crit(t_rec, t_bct)
-
-        # Student projection
-        z_s = self.sproj(s_bct)
-
         out = {
-            "recon_loss":  recon_loss,
+            "recon_loss":   torch.zeros((), device=s_bct.device),
             "kd_loss_pre":  torch.zeros((), device=s_bct.device),
             "fm_loss_pre":  torch.zeros((), device=s_bct.device),
             "kd_loss_post": torch.zeros((), device=s_bct.device),
             "fm_loss_post": torch.zeros((), device=s_bct.device),
+            "orth_loss":    torch.zeros((), device=s_bct.device),
+            "spk_cls_loss": torch.zeros((), device=s_bct.device),
         }
+
+        # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
+        if self.disen_mode >= 1:
+            # Teacher 병렬 인코더
+            z_t_text = self.enc_text_t(t_bct)          # (B, latent_dim, T)
+            z_t_spk  = self.enc_spk_t(t_bct)           # (B, latent_dim, T)
+            z_t_text_d = z_t_text.detach()
+
+            # Recon: (z_t_text + z_t_spk) → teacher feature
+            out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk), t_bct)
+
+            # Student 병렬 투영
+            z_s_text = self.proj_text_s(s_bct)          # (B, latent_dim, T)
+            z_s_spk  = self.proj_spk_s(s_bct)           # (B, latent_dim, T)
+
+            # 직교 제약 (teacher + student)
+            orth_t = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+            orth_s = (z_s_text * z_s_spk).sum(dim=1).pow(2).mean()
+            out["orth_loss"] = orth_t + orth_s
+
+            # Speaker classifier (teacher spk latent)
+            if spk_id is not None:
+                spk_logits = self.spk_cls(z_t_spk)
+                out["spk_cls_loss"] = F.cross_entropy(spk_logits, spk_id)
+
+            # FM(pre) + Diffusion on text subspace only
+            fm_loss_pre, _ = self.fm_latent(z_s_text, z_t_text_d)
+            out["fm_loss_pre"] = fm_loss_pre
+            z_noisy, _      = self.adapter(z_s_text)
+            z_deno           = self.denoiser(z_noisy)
+            out["kd_loss_post"] = self.kd_crit(z_deno, z_t_text_d)
+            return out
+
+        # ── disen_mode == 0: E1 원본 로직 ────────────────────────
+        # Teacher AE
+        z_t, t_rec    = self.tae(t_bct)
+        z_t           = z_t.detach()
+        out["recon_loss"] = self.recon_crit(t_rec, t_bct)
+
+        # Student projection
+        z_s = self.sproj(s_bct)
 
         if self.version == 1:
             out["kd_loss_pre"] = self.kd_crit(z_s, z_t)
@@ -418,9 +481,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
     def training_step(self, batch, batch_idx):
         if len(batch) == 5:
-            signal, sig_len, transcript, transcript_len, _ = batch
+            signal, sig_len, transcript, transcript_len, spk_id = batch
         else:
             signal, sig_len, transcript, transcript_len = batch
+            spk_id = None
 
         log_probs, enc_len, _, _dummy, enc_out = self.forward(
             input_signal=signal, input_signal_length=sig_len,
@@ -466,15 +530,18 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
         recon_sum = kd_pre_sum = fm_pre_sum = kd_post_sum = fm_post_sum = \
             torch.zeros((), device=log_probs.device)
+        orth_sum = spk_cls_sum = torch.zeros((), device=log_probs.device)
         for s, t in zip(self.stu_feats, self.tch_feats):
-            losses       = self._compute_v_losses_one_layer(s, t)
+            losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id)
             recon_sum   += losses["recon_loss"]
             kd_pre_sum  += losses["kd_loss_pre"]
             fm_pre_sum  += losses["fm_loss_pre"]
             kd_post_sum += losses["kd_loss_post"]
             fm_post_sum += losses["fm_loss_post"]
+            orth_sum    += losses["orth_loss"]
+            spk_cls_sum += losses["spk_cls_loss"]
 
-        # 5) 총 loss (원본과 동일)
+        # 5) 총 loss
         total_loss = (
             ctc_loss
             + self.kd_alpha * logit_kd_loss
@@ -482,18 +549,22 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + recon_sum
             + kd_pre_sum + kd_post_sum
             + fm_pre_sum + fm_post_sum
+            + self.orth_weight * orth_sum
+            + self.spk_cls_weight * spk_cls_sum
         )
 
         # 6) 로깅
         self.log("loss/ctc",      ctc_loss,      on_step=True, on_epoch=True)
         self.log("loss/logit_kd", logit_kd_loss, on_step=True, on_epoch=True)
         self.log("loss/layer_kd", layer_kd_loss, on_step=True, on_epoch=True)
-        self.log("v/recon",    recon_sum,   on_step=True, on_epoch=True)
-        self.log("v/kd_pre",   kd_pre_sum,  on_step=True, on_epoch=True)
-        self.log("v/fm_pre",   fm_pre_sum,  on_step=True, on_epoch=True)
-        self.log("v/kd_post",  kd_post_sum, on_step=True, on_epoch=True)
-        self.log("v/fm_post",  fm_post_sum, on_step=True, on_epoch=True)
-        self.log("train_loss", total_loss,  on_step=True, on_epoch=True, prog_bar=True)
+        self.log("v/recon",      recon_sum,    on_step=True, on_epoch=True)
+        self.log("v/kd_pre",     kd_pre_sum,   on_step=True, on_epoch=True)
+        self.log("v/fm_pre",     fm_pre_sum,   on_step=True, on_epoch=True)
+        self.log("v/kd_post",    kd_post_sum,  on_step=True, on_epoch=True)
+        self.log("v/fm_post",    fm_post_sum,  on_step=True, on_epoch=True)
+        self.log("v/orth",       orth_sum,     on_step=True, on_epoch=True)
+        self.log("v/spk_cls",    spk_cls_sum,  on_step=True, on_epoch=True)
+        self.log("train_loss",   total_loss,   on_step=True, on_epoch=True, prog_bar=True)
         return total_loss
 
 
@@ -543,6 +614,12 @@ def main():
     # Flow Matching
     p.add_argument("--flow_steps",  type=int,   default=8)
     p.add_argument("--flow_weight", type=float, default=1.0)
+
+    # Disentanglement (disen_mode=0: E1 그대로, disen_mode=1: orth+spk_cls)
+    p.add_argument("--disen_mode",     type=int,   default=0,
+                   help="0=E1 baseline, 1=parallel enc + orthogonal + spk_cls")
+    p.add_argument("--orth_weight",    type=float, default=1.0)
+    p.add_argument("--spk_cls_weight", type=float, default=1.0)
 
     args = p.parse_args()
 
@@ -696,6 +773,10 @@ def main():
         latent_dim=args.latent_dim,
         diffusion_steps=args.diffusion_steps,
         flow_cfg=flow_cfg,
+        disen_mode=args.disen_mode,
+        num_spk=num_spk,
+        orth_weight=args.orth_weight,
+        spk_cls_weight=args.spk_cls_weight,
     )
 
     # ── Train ─────────────────────────────────────────────────
