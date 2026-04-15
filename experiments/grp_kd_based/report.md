@@ -51,7 +51,8 @@ DAG-KD 베이스라인과의 차이:
 | Exp | 방법 | 가정 | 스크립트 |
 |-----|------|------|----------|
 | E1 | GRP-KD ver4 (baseline) | GRP-KD 자체 재현 | E1_ver4_baseline.sh |
-| E2 | E1 + Latent Disentanglement | teacher latent를 text/spk로 분리하고 text만 KD하면 ASR 성능 개선 | E2_disen_orth.sh |
+| E2 | E1 + Latent Disentanglement (Orthogonal) | teacher latent를 text/spk로 분리하고 text만 KD하면 ASR 성능 개선 | E2_disen_orth.sh |
+| E3 | E2에서 orth_loss → CLUB MI | 직교 제약보다 정보이론적으로 더 엄밀한 분리가 성능 개선에 유리 | E3_club_mi.sh |
 
 ---
 
@@ -68,11 +69,11 @@ DAG-KD 베이스라인과의 차이:
 ### 결과
 
 | Split | WER (%) |
-|-------|---------|
-| dev_clean | - |
-| dev_other | - |
-| test_clean | - |
-| test_other | - |
+| --- | --- |
+| dev_clean | 12.0 |
+| dev_other | 28.3 |
+| test_clean | 12.4 |
+| test_other | 28.8 |
 
 ---
 
@@ -117,14 +118,55 @@ DAG-KD 측 disentanglement와의 차이:
 ### 결과
 
 | Split | WER (%) |
-|-------|---------|
-| dev_clean | - |
-| dev_other | - |
-| test_clean | - |
-| test_other | - |
+| --- | --- |
+| dev_clean | 11.0 |
+| dev_other | 28.8 |
+| test_clean | 11.5 |
+| test_other | 29.5 |
+
+---
+
+## E3: Latent Disentanglement (CLUB MI + Speaker Classifier)
+
+### 가정
+
+직교 제약(E2)은 기하학적 조건만 강제하며 크기(magnitude)에 숨은 정보는 포착하지 못한다. CLUB MI upper bound를 최소화하면 정보이론적으로 더 엄밀한 분리가 가능하여 추가 성능 개선이 기대된다.
+
+### 구조
+
+E2와 동일하되 Orthogonality Loss → CLUB MI로 대체:
+
+- `club.mi_upper(z_t_text, z_t_spk, K=8)`: MI upper bound 최소화
+- `club.ll_loss(z_t_text, z_t_spk)`: variational 네트워크 학습 (NLL)
+
+### 설정
+
+- `disen_mode=2`
+- `orth_weight=1.0` (club_mi_loss에도 동일 weight 재사용), `spk_cls_weight=1.0`
+- 나머지 하이퍼파라미터 E2와 동일
+- wandb: `GRP-based / grp_kd_E3_club_mi`
+
+### 결과
+
+| Split | WER (%) |
+| --- | --- |
+| dev_clean | 13.1 |
+| dev_other | 31.0 |
+| test_clean | 13.3 |
+| test_other | 32.0 |
 
 ---
 
 ## 결과 분석
 
-*(실험 완료 후 작성)*
+| Exp | 방법 | dev_clean | dev_other | test_clean | test_other |
+| --- | --- | --- | --- | --- | --- |
+| E1 | GRP-KD ver4 baseline | 12.0 | 28.3 | 12.4 | 28.8 |
+| E2 | E1 + Orth + SpkCls | **11.0** | 28.8 | **11.5** | 29.5 |
+| E3 | E1 + CLUB MI + SpkCls | 13.1 | 31.0 | 13.3 | 32.0 |
+
+E2(Orthogonal)는 E1 대비 clean split에서 WER이 유의미하게 감소했다(dev_clean -1.0%p, test_clean -0.9%p). Teacher latent를 text/speaker subspace로 분리하고 text subspace에만 FM+Diffusion KD를 적용하는 것이 효과적임을 확인했다. 다만 other split에서는 소폭 저하가 관찰되며, 화자 다양성이 높은 환경에서 분리 효과가 제한적임을 시사한다.
+
+E3(CLUB MI)는 E1 대비 전 split에서 성능이 저하됐다. CLUB의 variational network 학습(ll_loss)과 MI 최소화(mi_upper)가 레이어마다 16회씩 반복되어 학습 신호가 불안정해졌을 가능성이 있다. 또한 직교 제약과 달리 CLUB은 variational network가 충분히 수렴해야 MI 추정이 신뢰가능해지는데, 100 epoch의 joint training으로는 부족했을 수 있다.
+
+**결론**: Orthogonal 제약이 CLUB보다 이 설정에서 더 효과적이다. E2를 기반으로 추가 실험을 진행한다.
