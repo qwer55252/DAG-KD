@@ -27,7 +27,7 @@ CUDA_VISIBLE_DEVICES=0 python train_grp_kd.py \
   --orth_weight 1.0 \
   --spk_cls_weight 1.0 \
   --grl_weight 1.0 \
-  --grl_alpha 1.0 \
+  --grl_alpha 0.1 \
   --batch_size 32 \
   --epochs 100 \
   --gpus 1
