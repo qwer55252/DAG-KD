@@ -24,6 +24,7 @@ version 1~8:
 import os
 import gc
 import json
+import math
 import torch
 import aiohttp
 import argparse
@@ -283,6 +284,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_cls_weight: float = 1.0,
         grl_weight: float = 1.0,
         grl_alpha: float = 1.0,
+        grl_anneal: bool = False,
+        grl_alpha_max: float = 1.0,
+        grl_s_weight: float = 1.0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -303,6 +307,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.orth_weight    = orth_weight
         self.spk_cls_weight = spk_cls_weight
         self.grl_weight     = grl_weight
+        self.grl_anneal     = grl_anneal
+        self.grl_alpha_max  = grl_alpha_max
+        self.grl_s_weight   = grl_s_weight
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -330,10 +337,14 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                     x_dim=latent_dim, y_dim=latent_dim,
                     hidden_size=128, max_samples=2048,
                 )
-            # disen_mode=3: orth + GRL on z_t_text (speaker 못 맞추게)
-            if disen_mode == 3:
+            # disen_mode=3: orth + GRL on z_t_text (E4/E5)
+            # disen_mode=4: orth + GRL on z_t_text + GRL on z_s_text (E6)
+            if disen_mode in (3, 4):
                 self.grl = GradientReversalLayer(alpha=grl_alpha)
                 self.spk_cls_text = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+            if disen_mode == 4:
+                self.grl_s = GradientReversalLayer(alpha=grl_alpha)
+                self.spk_cls_s = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
 
         _flow_cfg = dict(flow_cfg or {})
         self.fm_latent   = FMLatent(latent_dim=latent_dim, flow_cfg=_flow_cfg)
@@ -408,6 +419,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "club_mi_loss":  torch.zeros((), device=s_bct.device),
             "club_lll_loss": torch.zeros((), device=s_bct.device),
             "grl_loss":      torch.zeros((), device=s_bct.device),
+            "grl_s_loss":    torch.zeros((), device=s_bct.device),
         }
 
         # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
@@ -423,23 +435,27 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             # Student 투영 (text only)
             z_s_text = self.proj_text_s(s_bct)          # (B, latent_dim, T)
 
-            # 분리 제약: disen_mode=1 → orthogonal, disen_mode=2 → CLUB MI, disen_mode=3 → orth + GRL
+            # 분리 제약
             if self.disen_mode == 1:
                 out["orth_loss"] = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
             elif self.disen_mode == 2:
                 out["club_mi_loss"]  = self.club.mi_upper(z_t_text, z_t_spk, K=8)
                 out["club_lll_loss"] = self.club.ll_loss(z_t_text, z_t_spk)
-            elif self.disen_mode == 3:
+            elif self.disen_mode in (3, 4):
                 out["orth_loss"] = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
 
             # Speaker classifier (teacher spk latent, all disen modes)
             if spk_id is not None:
                 spk_logits = self.spk_cls(z_t_spk)
                 out["spk_cls_loss"] = F.cross_entropy(spk_logits, spk_id)
-                # disen_mode=3: GRL on z_t_text → speaker 못 맞추게
-                if self.disen_mode == 3:
+                # disen_mode=3,4: teacher GRL on z_t_text
+                if self.disen_mode in (3, 4):
                     grl_logits = self.spk_cls_text(self.grl(z_t_text))
                     out["grl_loss"] = F.cross_entropy(grl_logits, spk_id)
+                # disen_mode=4: student GRL on z_s_text
+                if self.disen_mode == 4:
+                    grl_s_logits = self.spk_cls_s(self.grl_s(z_s_text))
+                    out["grl_s_loss"] = F.cross_entropy(grl_s_logits, spk_id)
 
             # FM(pre) + Diffusion on text subspace only
             fm_loss_pre, _ = self.fm_latent(z_s_text, z_t_text_d)
@@ -562,11 +578,21 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
+        # E5: DANN-style alpha annealing — training_step마다 grl.alpha 업데이트
+        if self.disen_mode in (3, 4) and self.grl_anneal:
+            total_steps = max(1, self.trainer.estimated_stepping_batches)
+            p     = self.global_step / total_steps          # 0 → 1
+            alpha = self.grl_alpha_max * (2 / (1 + math.exp(-10 * p)) - 1)
+            self.grl.alpha = alpha
+            if self.disen_mode == 4:
+                self.grl_s.alpha = alpha
+            self.log("v/grl_alpha", alpha, on_step=True, on_epoch=False)
+
         recon_sum = kd_pre_sum = fm_pre_sum = kd_post_sum = fm_post_sum = \
             torch.zeros((), device=log_probs.device)
         orth_sum = spk_cls_sum = torch.zeros((), device=log_probs.device)
         club_mi_sum = club_lll_sum = torch.zeros((), device=log_probs.device)
-        grl_sum = torch.zeros((), device=log_probs.device)
+        grl_sum = grl_s_sum = torch.zeros((), device=log_probs.device)
         for s, t in zip(self.stu_feats, self.tch_feats):
             losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id)
             recon_sum    += losses["recon_loss"]
@@ -579,6 +605,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             club_mi_sum  += losses["club_mi_loss"]
             club_lll_sum += losses["club_lll_loss"]
             grl_sum      += losses["grl_loss"]
+            grl_s_sum    += losses["grl_s_loss"]
 
         # 5) 총 loss
         total_loss = (
@@ -593,6 +620,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + self.orth_weight * club_mi_sum   # club_mi도 orth_weight 재사용
             + club_lll_sum                     # variational net 학습, 별도 weight 없음
             + self.grl_weight * grl_sum
+            + self.grl_s_weight * grl_s_sum
         )
 
         # 6) 로깅
@@ -609,6 +637,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("v/club_mi",    club_mi_sum,  on_step=True, on_epoch=True)
         self.log("v/club_lll",   club_lll_sum, on_step=True, on_epoch=True)
         self.log("v/grl",        grl_sum,      on_step=True, on_epoch=True)
+        self.log("v/grl_s",      grl_s_sum,    on_step=True, on_epoch=True)
         self.log("train_loss",   total_loss,   on_step=True, on_epoch=True, prog_bar=True)
         return total_loss
 
@@ -662,11 +691,18 @@ def main():
 
     # Disentanglement (disen_mode=0: E1 그대로, disen_mode=1: orth+spk_cls)
     p.add_argument("--disen_mode",     type=int,   default=0,
-                   help="0=E1 baseline, 1=orth+spk_cls, 2=CLUB MI+spk_cls, 3=orth+spk_cls+GRL")
+                   help="0=E1, 1=orth+spk_cls, 2=CLUB MI, 3=orth+GRL(teacher), 4=orth+GRL(teacher+student)")
     p.add_argument("--orth_weight",    type=float, default=1.0)
     p.add_argument("--spk_cls_weight", type=float, default=1.0)
     p.add_argument("--grl_weight",     type=float, default=1.0)
-    p.add_argument("--grl_alpha",      type=float, default=1.0)
+    p.add_argument("--grl_alpha",      type=float, default=0.1,
+                   help="고정 alpha (grl_anneal=False) 또는 annealing 시작값(=0으로 고정)")
+    p.add_argument("--grl_anneal",     type=str2bool, default=False,
+                   help="True: DANN-style alpha annealing (0→grl_alpha_max)")
+    p.add_argument("--grl_alpha_max",  type=float, default=1.0,
+                   help="annealing 최대 alpha (grl_anneal=True일 때 사용)")
+    p.add_argument("--grl_s_weight",   type=float, default=1.0,
+                   help="student GRL loss 가중치 (disen_mode=4)")
 
     args = p.parse_args()
 
@@ -826,6 +862,9 @@ def main():
         spk_cls_weight=args.spk_cls_weight,
         grl_weight=args.grl_weight,
         grl_alpha=args.grl_alpha,
+        grl_anneal=args.grl_anneal,
+        grl_alpha_max=args.grl_alpha_max,
+        grl_s_weight=args.grl_s_weight,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
