@@ -72,16 +72,31 @@ E4 (GRL):
   E2 구조 그대로 유지 (enc_text_t + enc_spk_t + orth + SpkCls_spk)
   → 추가: z_t_text → GRL(α=0.1) → SpkCls_text → CE loss
   → GRL이 enc_text_t에 역전된 gradient를 전달 → z_t_text에서 speaker 정보 적극 제거
+
+E5 (GRL + alpha annealing):
+  E4 구조 그대로 (disen_mode=3), grl_anneal=True
+  → α(p) = 0.5 × (2/(1+exp(-10p))-1), p = global_step / total_steps
+  → 초반 KD 안정화 우선, 후반 adversarial pressure 점진적 증가
+  → epoch 30 기준 α ≈ 0.45 (E4 고정 0.1 대비 4.5배)
+
+E6 (GRL teacher + student):
+  E4 구조 전체 유지 (disen_mode=4)
+  → 추가: z_s_text → GRL(α=0.1) → SpkCls_s → CE loss
+  → teacher enc_text_t + student proj_text_s 양쪽 모두 speaker-free 유도
+  → KD(FM+Diffusion)는 원본 z_s_text 사용 (GRL은 별도 adversarial branch)
 ```
 
 ### 제어 플래그
 
 ```bash
---disen_mode     # 0=E1, 1=E2(orth), 2=E3(CLUB MI), 3=E4(orth+GRL)
+--disen_mode     # 0=E1, 1=E2(orth), 2=E3(CLUB MI), 3=E4/E5(orth+GRL), 4=E6(orth+GRL×2)
 --orth_weight    # orth_loss 가중치 (default 1.0)
 --spk_cls_weight # speaker classifier loss 가중치 (default 1.0)
---grl_weight     # GRL CE loss 가중치 (default 1.0)
---grl_alpha      # GRL gradient reversal 강도 (default 0.1)
+--grl_weight     # teacher GRL CE loss 가중치 (default 1.0)
+--grl_alpha      # 고정 GRL alpha (default 0.1)
+--grl_anneal     # True: DANN-style alpha annealing (default False)
+--grl_alpha_max  # annealing 최대 alpha (default 1.0)
+--grl_s_weight   # student GRL CE loss 가중치 (disen_mode=4, default 1.0)
 ```
 
 ### 공통 하이퍼파라미터
@@ -104,6 +119,8 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E2 | E1 + Orth + SpkCls | Orthogonal | ✅ | **11.0** | 28.8 | **11.5** | 29.5 |
 | E3 | E1 + CLUB MI + SpkCls | CLUB MI | ✅ | 13.1 | 31.0 | 13.3 | 32.0 |
 | E4 | E2 + GRL on z_t_text | Orth + GRL | ✅ | **11.0** | **28.3** | **11.5** | **28.7** |
+| E5 | E4 + GRL alpha annealing | Orth + GRL(anneal) | ✅ | - | - | - | - |
+| E6 | E4 + student GRL | Orth + GRL×2 | ✅ | - | - | - | - |
 
 ---
 
@@ -130,6 +147,21 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 - gradient flow: `z_t_text → GRL → spk_cls_text → CE` — enc_text_t에 역전된 gradient 전달
 - `grl_alpha=0.1`: 보수적 설정으로 recon/FM loss와의 gradient 충돌 방지
 
+### E5 추가 사항
+
+- E4와 동일 구조, `--grl_anneal True --grl_alpha_max 0.5` 추가
+- `training_step`마다 `α = 0.5 × (2/(1+exp(-10p))-1)` 계산 후 `self.grl.alpha` 동적 업데이트
+- `v/grl_alpha` wandb 로깅으로 annealing 진행 추적 가능
+- epoch 30 기준 α ≈ 0.45, epoch 50 이후 α ≈ 0.497로 수렴
+
+### E6 추가 사항
+
+- E4 전체 유지 (disen_mode=4), student GRL branch 추가
+- `grl_s = GradientReversalLayer(alpha=0.1)` + `spk_cls_s = SpeakerClassifier(96, 251)`
+- gradient flow: `z_s_text → GRL_s → spk_cls_s → CE` — proj_text_s에 역전된 gradient 전달
+- KD(FM+Diffusion)는 원본 z_s_text 사용 — GRL_s는 별도 adversarial branch로 gradient만 역전
+- `v/grl_s` wandb 로깅
+
 ---
 
 ## 6. 결과 분석
@@ -153,15 +185,17 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 
 E2/E4 체크포인트에서 `eval_spk_probe.py`로 linear probe를 학습하여 z_t_text / z_t_spk의 speaker 정보 잔존량을 정량화했다. train-clean-100(251명)을 80/20으로 분리해 probe train/eval로 사용했다 (dev/test 화자는 train 화자와 겹치지 않아 zero-shot 평가 불가).
 
-| 지표 | E2 (Orth) | E4 (Orth+GRL) | Random baseline |
-| --- | --- | --- | --- |
-| z_t_spk speaker acc | 88.91% | 88.63% | 0.40% |
-| **z_t_text speaker acc** | **14.17%** | **3.56%** | **0.40%** |
+| 지표 | E2 (Orth) | E3 (CLUB MI) | E4 (Orth+GRL) | Random baseline |
+| --- | --- | --- | --- | --- |
+| z_t_spk speaker acc | 88.91% | **90.29%** | 88.63% | 0.40% |
+| **z_t_text speaker acc** | 14.17% | **1.51%** | 3.56% | **0.40%** |
 
-**z_t_spk**: 두 실험 모두 ~89%로 동일. GRL이 enc_spk_t는 건드리지 않았으며 speaker encoder가 정상적으로 화자 정보를 담고 있음을 확인.
+**z_t_spk**: 전 실험 ~89~90%로 안정적. 분리 제약 방식에 무관하게 enc_spk_t가 화자 정보를 정상적으로 담고 있음을 확인.
 
-**z_t_text**: E2는 14.17%로 랜덤 기준선(0.40%) 대비 35배 높아 orthogonal 제약만으로는 speaker 정보가 충분히 제거되지 않음. E4는 3.56%로 4배 감소(랜덤 대비 9배 수준). GRL의 adversarial signal이 enc_text_t에 역전된 gradient를 직접 전달하여 speaker 정보를 효과적으로 제거했다.
+**z_t_text**: 분리 성능 순위는 E3(1.51%) > E4(3.56%) >> E2(14.17%). 그러나 WER 성능 순위는 E4 > E2 >> E3로 역전된다. disentanglement 수치가 낮다고 반드시 ASR 성능이 좋은 것은 아님을 보여준다.
 
-**WER과의 연결**: z_t_text speaker acc가 14.17%로 높았던 E2에서 other split WER이 소폭 악화(28.3→28.8%)됐고, 3.56%로 낮아진 E4에서 other split WER이 회복(28.3%)됐다. disentanglement 품질과 WER 결과가 정량적으로 일치한다.
+**E3의 역설**: z_t_text speaker acc가 가장 낮음(=분리 가장 잘됨)에도 WER이 가장 나쁘다. CLUB variational network 추정 실패(`v/club_mi = -15.6`, 음수 MI는 수학적으로 불가)로 인해 z_t_text 자체가 ASR에 유용한 정보를 잃어버린 것으로 해석된다. 분리는 됐지만 표현이 붕괴된 사례.
 
-**결론**: E4 (Orth + GRL)가 전 split에서 E1 이상의 성능을 달성한 best 설정이다. z_t_text speaker acc 3.56%는 완전한 분리(0.40%)에 비해 아직 차이가 있으며, grl_alpha를 높이거나 학습을 더 진행하면 추가 개선 여지가 있다.
+**WER과의 연결**: z_t_text speaker acc와 WER other split 변화가 정량적으로 연결된다. E2(14.17%) → other split 악화, E4(3.56%) → other split 회복. 단, E3처럼 표현 자체가 붕괴되면 이 관계가 성립하지 않는다.
+
+**결론**: E4가 현재 best. E5(alpha annealing)로 z_t_text acc를 3.56%에서 더 낮추면서 표현 안정성을 유지하는 것이 다음 목표다.
