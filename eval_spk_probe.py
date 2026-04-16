@@ -293,7 +293,7 @@ def main():
 
     # ── 체크포인트 로드 ───────────────────────────────────────────────────────
     print(f"\n[INFO] Loading checkpoint: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["state_dict"], strict=False)
     model = model.to(device)
     model.eval()
@@ -312,59 +312,55 @@ def main():
         model.setup_training_data(cfg)
         return model.train_dataloader()
 
-    def make_eval_dl(manifest):
-        cfg = deepcopy(model.cfg.train_ds)  # return_sample_id=True (eval도 spk_id 필요)
-        cfg.manifest_filepath = manifest
-        cfg.shuffle = False
-        model.setup_training_data(cfg)
-        return model.train_dataloader()
-
-    # ── Feature 추출 ─────────────────────────────────────────────────────────
-    print("\n[1/4] Extracting features from train set (for probe training)...")
+    # ── Feature 추출 (train 전체) ─────────────────────────────────────────────
+    # dev/test 화자는 train-clean-100 251명과 겹치지 않으므로
+    # train 셋을 80/20으로 분리하여 probe train/eval로 사용한다.
+    print("\n[INFO] Extracting features from train set...")
     train_dl = make_dl(train_manifest)
-    train_text, train_spk, train_labels = extract_features(
+    all_text, all_spk, all_labels = extract_features(
         model, teacher, train_dl, spk_table, device,
     )
-    print(f"      train: {train_text.shape[0]} samples, latent_dim={train_text.shape[1]}")
+    n_total = all_text.shape[0]
+    print(f"      total: {n_total} samples, latent_dim={all_text.shape[1]}, num_spk={num_spk}")
 
-    results = {}
+    # 80/20 stratified split (같은 화자가 양쪽에 고루 들어가도록)
+    torch.manual_seed(42)
+    perm     = torch.randperm(n_total)
+    n_train  = int(n_total * 0.8)
+    tr_idx   = perm[:n_train]
+    ev_idx   = perm[n_train:]
 
-    for split_name, manifest in [
-        ("dev_clean",  dev_clean_manifest),
-        ("dev_other",  dev_other_manifest),
-        ("test_clean", test_clean_manifest),
-        ("test_other", test_other_manifest),
-    ]:
-        if not os.path.isfile(manifest):
-            print(f"[WARN] {split_name} manifest not found, skip")
-            continue
+    probe_train_text   = all_text[tr_idx]
+    probe_train_spk    = all_spk[tr_idx]
+    probe_train_labels = all_labels[tr_idx]
+    probe_eval_text    = all_text[ev_idx]
+    probe_eval_spk     = all_spk[ev_idx]
+    probe_eval_labels  = all_labels[ev_idx]
+    print(f"      probe train: {len(tr_idx)}, probe eval: {len(ev_idx)}")
 
-        print(f"\n[INFO] Extracting features from {split_name}...")
-        eval_dl = make_eval_dl(manifest)
-        eval_text, eval_spk, eval_labels = extract_features(
-            model, teacher, eval_dl, spk_table, device,
-        )
-        print(f"      {split_name}: {eval_text.shape[0]} samples")
+    # ── z_t_spk probe (sanity check) ─────────────────────────────────────────
+    print("\n[z_t_spk probe — sanity check, should be HIGH]")
+    spk_probe = train_probe(probe_train_spk, probe_train_labels, num_spk,
+                            epochs=args.probe_epochs, lr=args.probe_lr, device=device)
+    spk_acc = eval_probe(spk_probe, probe_eval_spk, probe_eval_labels, device)
+    print(f"  z_t_spk  speaker acc (train 20%): {spk_acc*100:.2f}%")
 
-        # ── z_t_spk probe (sanity check) ─────────────────────────────────────
-        print(f"\n  [z_t_spk probe — {split_name}]")
-        spk_probe = train_probe(train_spk, train_labels, num_spk,
-                                epochs=args.probe_epochs, lr=args.probe_lr, device=device)
-        spk_acc = eval_probe(spk_probe, eval_spk, eval_labels, device)
-        print(f"  z_t_spk  speaker acc ({split_name}): {spk_acc:.4f} ({spk_acc*100:.2f}%)")
+    # ── z_t_text probe (main metric) ─────────────────────────────────────────
+    print("\n[z_t_text probe — main metric, should be LOW if disentangled]")
+    text_probe = train_probe(probe_train_text, probe_train_labels, num_spk,
+                             epochs=args.probe_epochs, lr=args.probe_lr, device=device)
+    text_acc = eval_probe(text_probe, probe_eval_text, probe_eval_labels, device)
+    print(f"  z_t_text speaker acc (train 20%): {text_acc*100:.2f}%")
 
-        # ── z_t_text probe (main metric) ─────────────────────────────────────
-        print(f"\n  [z_t_text probe — {split_name}]")
-        text_probe = train_probe(train_text, train_labels, num_spk,
-                                 epochs=args.probe_epochs, lr=args.probe_lr, device=device)
-        text_acc = eval_probe(text_probe, eval_text, eval_labels, device)
-        print(f"  z_t_text speaker acc ({split_name}): {text_acc:.4f} ({text_acc*100:.2f}%)")
-
-        results[split_name] = {
-            "z_t_spk_acc":  round(spk_acc,  4),
-            "z_t_text_acc": round(text_acc, 4),
-            "n_samples":    eval_text.shape[0],
-        }
+    results = {
+        "n_total":        n_total,
+        "n_probe_train":  int(n_train),
+        "n_probe_eval":   int(n_total - n_train),
+        "num_spk":        num_spk,
+        "random_baseline_acc": round(1.0 / num_spk, 4),
+        "z_t_spk_acc":   round(float(spk_acc),  4),
+        "z_t_text_acc":  round(float(text_acc), 4),
+    }
 
     # ── 결과 저장 ─────────────────────────────────────────────────────────────
     result_path = os.path.join(args.out, "probe_results.json")
@@ -373,12 +369,11 @@ def main():
     print(f"\n[INFO] Results saved to {result_path}")
 
     # ── 요약 출력 ─────────────────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print(f"{'Split':<12} {'z_t_spk acc':>14} {'z_t_text acc':>14}")
-    print("="*60)
-    for split, r in results.items():
-        print(f"{split:<12} {r['z_t_spk_acc']*100:>13.2f}% {r['z_t_text_acc']*100:>13.2f}%")
-    print("="*60)
+    print("\n" + "="*55)
+    print(f"  Random baseline (1/251): {1/num_spk*100:.2f}%")
+    print(f"  z_t_spk  speaker acc  : {spk_acc*100:.2f}%  (sanity: high expected)")
+    print(f"  z_t_text speaker acc  : {text_acc*100:.2f}%  (disentanglement metric)")
+    print("="*55)
 
 
 if __name__ == "__main__":
