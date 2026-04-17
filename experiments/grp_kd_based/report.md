@@ -84,19 +84,29 @@ E6 (GRL teacher + student):
   → 추가: z_s_text → GRL(α=0.1) → SpkCls_s → CE loss
   → teacher enc_text_t + student proj_text_s 양쪽 모두 speaker-free 유도
   → KD(FM+Diffusion)는 원본 z_s_text 사용 (GRL은 별도 adversarial branch)
+
+E7 (Layer-selective disentanglement):
+  E4 구조 전체 유지 (disen_mode=3, layer_disen_decay=0.8)
+  → orth/GRL 가중치를 레이어별로 선택적 적용
+  → layer_weight = 1.0 - 0.8 × (layer_idx / 15)
+     layer 0(최하위): weight=1.0, layer 15(최상위): weight=0.2
+  → 하위 레이어(speaker/acoustic 정보 多) → 강한 분리 제약
+  → 상위 레이어(linguistic/text 정보 多) → 약한 분리 제약 (표현 보존)
+  → grl_alpha=0.1 고정 (E4와 동일), annealing 없음
 ```
 
 ### 제어 플래그
 
 ```bash
---disen_mode     # 0=E1, 1=E2(orth), 2=E3(CLUB MI), 3=E4/E5(orth+GRL), 4=E6(orth+GRL×2)
---orth_weight    # orth_loss 가중치 (default 1.0)
---spk_cls_weight # speaker classifier loss 가중치 (default 1.0)
---grl_weight     # teacher GRL CE loss 가중치 (default 1.0)
---grl_alpha      # 고정 GRL alpha (default 0.1)
---grl_anneal     # True: DANN-style alpha annealing (default False)
---grl_alpha_max  # annealing 최대 alpha (default 1.0)
---grl_s_weight   # student GRL CE loss 가중치 (disen_mode=4, default 1.0)
+--disen_mode          # 0=E1, 1=E2(orth), 2=E3(CLUB MI), 3=E4/E5/E7(orth+GRL), 4=E6(orth+GRL×2)
+--orth_weight         # orth_loss 가중치 (default 1.0)
+--spk_cls_weight      # speaker classifier loss 가중치 (default 1.0)
+--grl_weight          # teacher GRL CE loss 가중치 (default 1.0)
+--grl_alpha           # 고정 GRL alpha (default 0.1)
+--grl_anneal          # True: DANN-style alpha annealing (default False)
+--grl_alpha_max       # annealing 최대 alpha (default 1.0)
+--grl_s_weight        # student GRL CE loss 가중치 (disen_mode=4, default 1.0)
+--layer_disen_decay   # E7: orth/GRL 레이어별 감쇠율 (default 0.0=균일, 0.8=E7)
 ```
 
 ### 공통 하이퍼파라미터
@@ -119,8 +129,9 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E2 | E1 + Orth + SpkCls | Orthogonal | ✅ | **11.0** | 28.8 | **11.5** | 29.5 |
 | E3 | E1 + CLUB MI + SpkCls | CLUB MI | ✅ | 13.1 | 31.0 | 13.3 | 32.0 |
 | E4 | E2 + GRL on z_t_text | Orth + GRL | ✅ | **11.0** | **28.3** | **11.5** | **28.7** |
-| E5 | E4 + GRL alpha annealing | Orth + GRL(anneal) | ✅ | - | - | - | - |
-| E6 | E4 + student GRL | Orth + GRL×2 | ✅ | - | - | - | - |
+| E5 | E4 + GRL alpha annealing | Orth + GRL(anneal) | ✅ | 11.1 | 28.4 | 11.4 | 29.0 |
+| E6 | E4 + student GRL | Orth + GRL×2 | ✅ | 11.3 | 28.8 | 11.6 | 29.0 |
+| E7 | E4 + layer-selective decay | Orth + GRL(layer↓) | ✅ | - | - | - | - |
 
 ---
 
@@ -172,12 +183,18 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E2 | E1 + Orth + SpkCls | **11.0** | 28.8 | **11.5** | 29.5 |
 | E3 | E1 + CLUB MI + SpkCls | 13.1 | 31.0 | 13.3 | 32.0 |
 | **E4** | E2 + GRL on z_t_text | **11.0** | **28.3** | **11.5** | **28.7** |
+| E5 | E4 + GRL alpha annealing | 11.1 | 28.4 | 11.4 | 29.0 |
+| E6 | E4 + student GRL | 11.3 | 28.8 | 11.6 | 29.0 |
 
 **E2 (Orthogonal)**: E1 대비 clean split에서 유의미한 개선(dev_clean -1.0%p, test_clean -0.9%p). Teacher latent를 text/speaker subspace로 분리하고 text subspace에만 FM+Diffusion KD를 적용하는 것이 효과적임을 확인했다. 다만 other split에서는 소폭 저하가 관찰되며, 화자 다양성이 높은 환경에서 분리 효과가 제한적임을 시사한다.
 
 **E3 (CLUB MI)**: 전 split에서 E1 대비 성능 저하. CLUB의 variational network 학습(ll_loss)과 MI 최소화(mi_upper)가 레이어마다 16회 반복되어 학습 신호가 불안정해졌을 가능성이 있다. Variational network가 충분히 수렴하려면 100 epoch의 joint training으로는 부족했을 수 있다.
 
 **E4 (GRL)**: E2에서 z_t_text에 GRL + SpkCls_text를 추가하여 enc_text_t가 speaker 정보를 적극적으로 제거하도록 유도했다. clean split은 E2 수준을 유지하면서 other split이 E1 baseline 수준으로 완전히 회복됐다(dev_other 28.8→28.3%, test_other 29.5→28.7%).
+
+**E5 (GRL annealing)**: E4 대비 전 split에서 미미한 차이(dev_clean +0.1%p, dev_other +0.1%p). DANN annealing이 초반 KD 안정화에 도움이 되지만 최종 성능 차이는 미미하다. α가 0.5까지 점진적으로 증가해도 E4(고정 0.1) 대비 significant한 개선 없음. 다만 chained assignment 버그로 인해 grl_sum이 실제보다 2배 집계되었을 가능성이 있으므로 버그 수정 후 재실험이 필요하다.
+
+**E6 (student GRL)**: E4 대비 전 split에서 소폭 저하(dev_clean +0.3%p, dev_other +0.5%p). student z_s_text에 GRL을 추가해도 KD 타겟인 z_t_text가 이미 speaker-clean하므로 student가 자연히 text-only 표현으로 수렴한다는 가설이 지지된다. 오히려 student-side adversarial pressure가 FM/Diffusion 학습을 방해할 수 있다. 동일한 chained assignment 버그 영향 존재.
 
 ---
 
@@ -198,4 +215,21 @@ E2/E4 체크포인트에서 `eval_spk_probe.py`로 linear probe를 학습하여 
 
 **WER과의 연결**: z_t_text speaker acc와 WER other split 변화가 정량적으로 연결된다. E2(14.17%) → other split 악화, E4(3.56%) → other split 회복. 단, E3처럼 표현 자체가 붕괴되면 이 관계가 성립하지 않는다.
 
-**결론**: E4가 현재 best. E5(alpha annealing)로 z_t_text acc를 3.56%에서 더 낮추면서 표현 안정성을 유지하는 것이 다음 목표다.
+**결론**: E4가 현재 best. E5/E6 모두 E4를 유의미하게 개선하지 못했다. 다음 방향으로 E7(layer-selective disentanglement)을 시도한다.
+
+---
+
+## 8. E7 설계 근거 — layer-selective disentanglement
+
+**배경**: E5/E6 결과를 통해 단순히 GRL 강도를 높이거나 student에 GRL을 추가하는 것만으로는 other split 성능을 추가 개선하기 어렵다는 것을 확인했다. 한편 E4 chained assignment 버그 분석 중 모든 16개 레이어에 동일한 강도로 orth/GRL을 적용하는 것이 비효율적일 수 있다는 점에 주목했다.
+
+**근거**: ASR 인코더의 레이어별 역할 분담은 잘 알려진 현상이다. 하위 레이어는 음향/화자 특성(speaker identity, pitch, timbre)을 주로 담고, 상위 레이어는 음소/언어 정보를 담는다. E4에서 상위 레이어에 강한 speaker 분리 제약을 주면 linguistic 표현까지 손상될 수 있다.
+
+**E7 가설**: orth와 GRL 제약을 하위 레이어에 집중시키고 상위 레이어에서는 완화하면, speaker 정보는 음향 표현 단계에서 제거되고 상위 레이어의 linguistic 표현은 온전히 보존되어 WER(특히 other split)이 추가 개선된다.
+
+**구현**: `layer_weight = 1.0 - 0.8 × (layer_idx / 15)`
+
+- layer 0: weight=1.0 (E4와 동일)
+- layer 7: weight=0.47
+- layer 15: weight=0.2 (20% 강도만 적용)
+- 버그 수정(chained assignment) 포함된 코드베이스에서 실행

@@ -287,6 +287,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         grl_anneal: bool = False,
         grl_alpha_max: float = 1.0,
         grl_s_weight: float = 1.0,
+        layer_disen_decay: float = 0.0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -306,10 +307,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.disen_mode     = disen_mode
         self.orth_weight    = orth_weight
         self.spk_cls_weight = spk_cls_weight
-        self.grl_weight     = grl_weight
-        self.grl_anneal     = grl_anneal
-        self.grl_alpha_max  = grl_alpha_max
-        self.grl_s_weight   = grl_s_weight
+        self.grl_weight        = grl_weight
+        self.grl_anneal        = grl_anneal
+        self.grl_alpha_max     = grl_alpha_max
+        self.grl_s_weight      = grl_s_weight
+        self.layer_disen_decay = layer_disen_decay
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -402,7 +404,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             return log_probs, enc_len, greedy
 
-    def _compute_v_losses_one_layer(self, s_bht, t_bht, spk_id=None):
+    def _compute_v_losses_one_layer(self, s_bht, t_bht, spk_id=None,
+                                    layer_idx: int = 0, num_layers: int = 16):
         """단일 레이어 (B,Hs,T), (B,Ht,T) → version별 loss dict"""
         # (B,H,T) → (B,T,H) 로 transpose (원본과 동일)
         s_bct = s_bht.transpose(1, 2)
@@ -424,6 +427,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
         if self.disen_mode >= 1:
+            # E7: lower layers → stronger disentanglement, upper layers → weaker
+            # layer_weight = 1.0 at layer 0, decays linearly to (1 - layer_disen_decay) at last layer
+            rel = layer_idx / max(1, num_layers - 1)   # 0.0 (bottom) → 1.0 (top)
+            layer_disen_w = 1.0 - self.layer_disen_decay * rel
+
             # Teacher 병렬 인코더
             z_t_text = self.enc_text_t(t_bct)          # (B, latent_dim, T)
             z_t_spk  = self.enc_spk_t(t_bct)           # (B, latent_dim, T)
@@ -435,14 +443,14 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             # Student 투영 (text only)
             z_s_text = self.proj_text_s(s_bct)          # (B, latent_dim, T)
 
-            # 분리 제약
+            # 분리 제약 (layer_disen_w 가중치 적용)
             if self.disen_mode == 1:
-                out["orth_loss"] = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
             elif self.disen_mode == 2:
-                out["club_mi_loss"]  = self.club.mi_upper(z_t_text, z_t_spk, K=8)
-                out["club_lll_loss"] = self.club.ll_loss(z_t_text, z_t_spk)
+                out["club_mi_loss"]  = layer_disen_w * self.club.mi_upper(z_t_text, z_t_spk, K=8)
+                out["club_lll_loss"] = layer_disen_w * self.club.ll_loss(z_t_text, z_t_spk)
             elif self.disen_mode in (3, 4):
-                out["orth_loss"] = (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
 
             # Speaker classifier (teacher spk latent, all disen modes)
             if spk_id is not None:
@@ -451,11 +459,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 # disen_mode=3,4: teacher GRL on z_t_text
                 if self.disen_mode in (3, 4):
                     grl_logits = self.spk_cls_text(self.grl(z_t_text))
-                    out["grl_loss"] = F.cross_entropy(grl_logits, spk_id)
+                    out["grl_loss"] = layer_disen_w * F.cross_entropy(grl_logits, spk_id)
                 # disen_mode=4: student GRL on z_s_text
                 if self.disen_mode == 4:
                     grl_s_logits = self.spk_cls_s(self.grl_s(z_s_text))
-                    out["grl_s_loss"] = F.cross_entropy(grl_s_logits, spk_id)
+                    out["grl_s_loss"] = layer_disen_w * F.cross_entropy(grl_s_logits, spk_id)
 
             # FM(pre) + Diffusion on text subspace only
             fm_loss_pre, _ = self.fm_latent(z_s_text, z_t_text_d)
@@ -588,13 +596,22 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 self.grl_s.alpha = alpha
             self.log("v/grl_alpha", alpha, on_step=True, on_epoch=False)
 
-        recon_sum = kd_pre_sum = fm_pre_sum = kd_post_sum = fm_post_sum = \
-            torch.zeros((), device=log_probs.device)
-        orth_sum = spk_cls_sum = torch.zeros((), device=log_probs.device)
-        club_mi_sum = club_lll_sum = torch.zeros((), device=log_probs.device)
-        grl_sum = grl_s_sum = torch.zeros((), device=log_probs.device)
-        for s, t in zip(self.stu_feats, self.tch_feats):
-            losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id)
+        recon_sum    = torch.zeros((), device=log_probs.device)
+        kd_pre_sum   = torch.zeros((), device=log_probs.device)
+        fm_pre_sum   = torch.zeros((), device=log_probs.device)
+        kd_post_sum  = torch.zeros((), device=log_probs.device)
+        fm_post_sum  = torch.zeros((), device=log_probs.device)
+        orth_sum     = torch.zeros((), device=log_probs.device)
+        spk_cls_sum  = torch.zeros((), device=log_probs.device)
+        club_mi_sum  = torch.zeros((), device=log_probs.device)
+        club_lll_sum = torch.zeros((), device=log_probs.device)
+        grl_sum      = torch.zeros((), device=log_probs.device)
+        grl_s_sum    = torch.zeros((), device=log_probs.device)
+        num_layers = len(self.stu_feats)
+        for layer_idx, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
+            losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id,
+                                                            layer_idx=layer_idx,
+                                                            num_layers=num_layers)
             recon_sum    += losses["recon_loss"]
             kd_pre_sum   += losses["kd_loss_pre"]
             fm_pre_sum   += losses["fm_loss_pre"]
@@ -703,6 +720,9 @@ def main():
                    help="annealing 최대 alpha (grl_anneal=True일 때 사용)")
     p.add_argument("--grl_s_weight",   type=float, default=1.0,
                    help="student GRL loss 가중치 (disen_mode=4)")
+    p.add_argument("--layer_disen_decay", type=float, default=0.0,
+                   help="layer-selective disentanglement: orth/grl weight = 1 - decay*(layer_idx/(N-1)). "
+                        "0.0=uniform(E1~E6), 0.8=E7(lower layers stronger)")
 
     args = p.parse_args()
 
@@ -865,6 +885,7 @@ def main():
         grl_anneal=args.grl_anneal,
         grl_alpha_max=args.grl_alpha_max,
         grl_s_weight=args.grl_s_weight,
+        layer_disen_decay=args.layer_disen_decay,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
