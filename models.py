@@ -121,6 +121,103 @@ class GradientReversalLayer(nn.Module):
         return GradientReversalFunction.apply(x, self.alpha)
 
 
+class LayerwiseSpkGRL(nn.Module):
+    """
+    Layerwise Speaker GRL for spk-free Layer KD (E4 설계).
+
+    각 Teacher 레이어에 개별 enc_i (dim_t→dim_t, 동일 차원) 를 달고:
+      1) rec_loss = MSE(enc_i(teacher_i), teacher_i)       → enc_i가 content 보존 (decoder 불필요)
+      2) adv_loss = CE via GRL on pooled feat_i             → enc_i가 spk 정보 제거
+      3) stu_loss = MSE(shared_proj(student_i), feat_i)    → student가 teacher space에서 spk-free 표현 학습
+
+    E2/E3 대비 변경점:
+      - enc_i: dim_t→dim_s(압축) → dim_t→dim_t(동일 차원, 정보 손실 없음)
+      - decoder 제거: MSE(enc_i(t), t) 로 직접 content 보존
+      - stu_loss: student space(dim_s)에서 비교 → teacher space(dim_t)에서 비교
+      - shared_proj (dim_s→dim_t): student를 teacher space로 확장 (E1과 동일 방향)
+
+    Forward returns:
+        l_rec  : scalar — content 보존 loss 평균
+        l_adv  : scalar — adversarial loss 평균
+        l_stu  : scalar — student KD loss 평균
+        spk_acc: scalar — classifier accuracy (모니터링용)
+    """
+    def __init__(self, num_layers: int, dim_t: int, dim_s: int, num_spk: int, grl_alpha: float = 0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_spk = num_spk
+
+        # 레이어별 개별 encoder: dim_t → dim_t (동일 차원, 정보 손실 없음)
+        self.encoders = nn.ModuleList([
+            nn.Conv1d(dim_t, dim_t, kernel_size=1, bias=True)
+            for _ in range(num_layers)
+        ])
+
+        # Shared student proj: dim_s → dim_t (E1의 stu_to_tea_proj와 동일 방향)
+        self.stu_proj = nn.Conv1d(dim_s, dim_t, kernel_size=1, bias=True)
+
+        # Shared GRL
+        self.grl = GradientReversalLayer(alpha=grl_alpha)
+
+        # Shared Spk Classifier: (B, dim_t) → (B, num_spk)
+        hidden = max(dim_t * 2, 256)
+        self.classifier = nn.Sequential(
+            nn.Linear(dim_t, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, num_spk),
+        )
+
+    def forward(self, tch_feats, stu_feats, speaker_ids=None):
+        """
+        tch_feats   : List[(B, dim_t, T)] — teacher hook 캡처
+        stu_feats   : List[(B, dim_s, T)] — student hook 캡처
+        speaker_ids : (B,) LongTensor or None
+        """
+        L = min(len(tch_feats), len(stu_feats), self.num_layers)
+        device = tch_feats[0].device
+
+        l_rec_sum = torch.tensor(0.0, device=device)
+        l_adv_sum = torch.tensor(0.0, device=device)
+        l_stu_sum = torch.tensor(0.0, device=device)
+        n_correct = 0
+        n_total   = 0
+
+        for i in range(L):
+            t = tch_feats[i].detach()   # (B, dim_t, T), teacher frozen
+            s = stu_feats[i]            # (B, dim_s, T), student
+
+            # 1) Encoder: teacher → spk-free (동일 차원 유지)
+            feat_i = self.encoders[i](t)                    # (B, dim_t, T)
+
+            # 2) Rec loss: MSE(feat_i, t) 직접 — decoder 불필요
+            l_rec_sum = l_rec_sum + F.mse_loss(feat_i, t)
+
+            # 3) Adv loss: GRL → classifier → CE (spk 제거)
+            if speaker_ids is not None and self.num_spk > 1:
+                pooled  = feat_i.mean(dim=-1)               # (B, dim_t)
+                grl_out = self.grl(pooled)
+                logits  = self.classifier(grl_out)          # (B, num_spk)
+                valid   = speaker_ids >= 0
+                if valid.any():
+                    l_adv_sum = l_adv_sum + F.cross_entropy(logits[valid], speaker_ids[valid])
+                    preds = logits[valid].argmax(dim=-1)
+                    n_correct += (preds == speaker_ids[valid]).sum().item()
+                    n_total   += valid.sum().item()
+
+            # 4) Student KD: student를 teacher space(dim_t)로 확장 후 spk-free feat_i에 align
+            target = feat_i.detach()                        # (B, dim_t, T)
+            s_proj = self.stu_proj(s)                       # (B, dim_t, T), shared proj
+            if target.size(-1) != s_proj.size(-1):
+                target = F.interpolate(target, size=s_proj.size(-1), mode='linear', align_corners=False)
+            l_stu_sum = l_stu_sum + F.mse_loss(s_proj, target)
+
+        l_rec  = l_rec_sum / L
+        l_adv  = l_adv_sum / L
+        l_stu  = l_stu_sum / L
+        spk_acc = torch.tensor(n_correct / n_total if n_total > 0 else 0.0, device=device)
+        return l_rec, l_adv, l_stu, spk_acc
+
+
 class FeaturePredictor(nn.Module):
     """
     CCSRD (EMSLP 2023): 3 FC→ReLU + 1 FC→Tanh
@@ -473,6 +570,22 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.tsne_log_interval = int(getattr(cfg, "tsne_log_interval", 10))
         self._global_step_count = 0
 
+        # ===== Layerwise Spk GRL =====
+        self.use_layerwise_spk_grl  = bool(getattr(cfg, "use_layerwise_spk_grl", False))
+        self.spk_grl_adv_weight     = float(getattr(cfg, "spk_grl_adv_weight", 0.1))
+        self.spk_grl_rec_weight     = float(getattr(cfg, "spk_grl_rec_weight", 1.0))
+        if self.use_layerwise_spk_grl and self.num_spk > 1:
+            n_tch_layers = len(self.teacher.encoder.layers)  # teacher 레이어 수
+            self.layerwise_spk_grl = LayerwiseSpkGRL(
+                num_layers=n_tch_layers,
+                dim_t=self.dim_t,
+                dim_s=self.dim_s,
+                num_spk=self.num_spk,
+                grl_alpha=float(getattr(cfg, "spk_grl_alpha", 0.1)),
+            )
+        else:
+            self.layerwise_spk_grl = None
+
     def forward(
         self,
         input_signal=None,
@@ -742,6 +855,17 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             if probe_acc is not None:
                 self.log("probe/txt_spk_acc", probe_acc, on_step=False, on_epoch=True)
         
+        # ===== Layerwise Spk GRL KD =====
+        if self.layerwise_spk_grl is not None and self.tch_feats and self.stu_feats:
+            l_rec, l_adv, l_stu, spk_acc = self.layerwise_spk_grl(
+                self.tch_feats, self.stu_feats, speaker_ids
+            )
+            self.log("train/spk_grl_rec", l_rec,   on_step=False, on_epoch=True)
+            self.log("train/spk_grl_adv", l_adv,   on_step=False, on_epoch=True)
+            self.log("train/spk_grl_stu", l_stu,   on_step=False, on_epoch=True)
+            self.log("train/spk_grl_acc", spk_acc, on_step=False, on_epoch=True)
+            total = total + self.spk_grl_rec_weight * l_rec + l_stu + self.spk_grl_adv_weight * l_adv
+
         self.log("train/total", total, on_step=False, on_epoch=True, prog_bar=True)
 
         # t-SNE 버퍼 수집 (cyclic 실험 시 매 step 소량 누적)
