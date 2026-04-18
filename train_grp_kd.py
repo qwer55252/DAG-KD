@@ -288,6 +288,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         grl_alpha_max: float = 1.0,
         grl_s_weight: float = 1.0,
         layer_disen_decay: float = 0.0,
+        crd_weight: float = 0.0,
+        crd_temperature: float = 0.07,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -312,6 +314,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.grl_alpha_max     = grl_alpha_max
         self.grl_s_weight      = grl_s_weight
         self.layer_disen_decay = layer_disen_decay
+        self.crd_weight        = crd_weight
+        self.crd_temperature   = crd_temperature
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -423,6 +427,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "club_lll_loss": torch.zeros((), device=s_bct.device),
             "grl_loss":      torch.zeros((), device=s_bct.device),
             "grl_s_loss":    torch.zeros((), device=s_bct.device),
+            "crd_loss":      torch.zeros((), device=s_bct.device),
         }
 
         # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
@@ -464,6 +469,14 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 if self.disen_mode == 4:
                     grl_s_logits = self.spk_cls_s(self.grl_s(z_s_text))
                     out["grl_s_loss"] = layer_disen_w * F.cross_entropy(grl_s_logits, spk_id)
+
+            # CRD: InfoNCE on mean-pooled text latents (z_s vs z_t, same utterance = positive)
+            if self.crd_weight > 0:
+                z_s_pool = F.normalize(z_s_text.mean(dim=2), dim=1)   # (B, D)
+                z_t_pool = F.normalize(z_t_text_d.mean(dim=2), dim=1) # (B, D)
+                sim = z_s_pool @ z_t_pool.T / self.crd_temperature     # (B, B)
+                labels = torch.arange(sim.size(0), device=sim.device)
+                out["crd_loss"] = F.cross_entropy(sim, labels)
 
             # FM(pre) + Diffusion on text subspace only
             fm_loss_pre, _ = self.fm_latent(z_s_text, z_t_text_d)
@@ -607,6 +620,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         club_lll_sum = torch.zeros((), device=log_probs.device)
         grl_sum      = torch.zeros((), device=log_probs.device)
         grl_s_sum    = torch.zeros((), device=log_probs.device)
+        crd_sum      = torch.zeros((), device=log_probs.device)
         num_layers = len(self.stu_feats)
         for layer_idx, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
             losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id,
@@ -623,6 +637,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             club_lll_sum += losses["club_lll_loss"]
             grl_sum      += losses["grl_loss"]
             grl_s_sum    += losses["grl_s_loss"]
+            crd_sum      += losses["crd_loss"]
 
         # 5) 총 loss
         total_loss = (
@@ -638,6 +653,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + club_lll_sum                     # variational net 학습, 별도 weight 없음
             + self.grl_weight * grl_sum
             + self.grl_s_weight * grl_s_sum
+            + self.crd_weight * crd_sum
         )
 
         # 6) 로깅
@@ -655,6 +671,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("v/club_lll",   club_lll_sum, on_step=True, on_epoch=True)
         self.log("v/grl",        grl_sum,      on_step=True, on_epoch=True)
         self.log("v/grl_s",      grl_s_sum,    on_step=True, on_epoch=True)
+        self.log("v/crd",        crd_sum,      on_step=True, on_epoch=True)
         self.log("train_loss",   total_loss,   on_step=True, on_epoch=True, prog_bar=True)
         return total_loss
 
@@ -723,6 +740,12 @@ def main():
     p.add_argument("--layer_disen_decay", type=float, default=0.0,
                    help="layer-selective disentanglement: orth/grl weight = 1 - decay*(layer_idx/(N-1)). "
                         "0.0=uniform(E1~E6), 0.8=E7(lower layers stronger)")
+
+    # CRD (Contrastive Representation Distillation)
+    p.add_argument("--crd_weight",      type=float, default=0.0,
+                   help="CRD InfoNCE loss 가중치 (default 0.0=비활성, E8: 1.0)")
+    p.add_argument("--crd_temperature", type=float, default=0.07,
+                   help="CRD InfoNCE temperature (default 0.07)")
 
     args = p.parse_args()
 
@@ -886,6 +909,8 @@ def main():
         grl_alpha_max=args.grl_alpha_max,
         grl_s_weight=args.grl_s_weight,
         layer_disen_decay=args.layer_disen_decay,
+        crd_weight=args.crd_weight,
+        crd_temperature=args.crd_temperature,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
