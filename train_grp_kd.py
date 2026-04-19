@@ -290,6 +290,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         layer_disen_decay: float = 0.0,
         crd_weight: float = 0.0,
         crd_temperature: float = 0.07,
+        kd_top_k: int = 0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -316,6 +317,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_disen_decay = layer_disen_decay
         self.crd_weight        = crd_weight
         self.crd_temperature   = crd_temperature
+        self.kd_top_k          = kd_top_k
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -622,7 +624,12 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         grl_s_sum    = torch.zeros((), device=log_probs.device)
         crd_sum      = torch.zeros((), device=log_probs.device)
         num_layers = len(self.stu_feats)
-        for layer_idx, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
+        k = self.kd_top_k if self.kd_top_k > 0 else num_layers
+        stu_feats_sel = self.stu_feats[-k:]
+        tch_feats_sel = self.tch_feats[-k:]
+        # layer_idx는 전체 레이어 기준 유지 (E7 layer_disen_w 계산에 사용)
+        offset = num_layers - k
+        for layer_idx, (s, t) in enumerate(zip(stu_feats_sel, tch_feats_sel), start=offset):
             losses       = self._compute_v_losses_one_layer(s, t, spk_id=spk_id,
                                                             layer_idx=layer_idx,
                                                             num_layers=num_layers)
@@ -746,6 +753,8 @@ def main():
                    help="CRD InfoNCE loss 가중치 (default 0.0=비활성, E8: 1.0)")
     p.add_argument("--crd_temperature", type=float, default=0.07,
                    help="CRD InfoNCE temperature (default 0.07)")
+    p.add_argument("--kd_top_k",        type=int,   default=0,
+                   help="상위 K개 레이어만 KD에 사용 (default 0=전체, E9: 4)")
 
     args = p.parse_args()
 
@@ -911,6 +920,7 @@ def main():
         layer_disen_decay=args.layer_disen_decay,
         crd_weight=args.crd_weight,
         crd_temperature=args.crd_temperature,
+        kd_top_k=args.kd_top_k,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
