@@ -339,6 +339,13 @@ def main():
     p.add_argument("--flow_weight",      type=float,    default=1.0)
     p.add_argument("--use_diffkd",       type=str2bool, default=False)
     p.add_argument("--diffkd_steps",     type=int,      default=5)
+    # GRP-KD (논문 대조군)
+    p.add_argument("--use_grp_kd",       type=str2bool, default=False)
+    p.add_argument("--grp_latent_dim",   type=int,      default=96)
+    p.add_argument("--grp_fm_steps",     type=int,      default=8)
+    p.add_argument("--grp_diff_steps",   type=int,      default=9)
+    p.add_argument("--grp_rec_weight",   type=float,    default=1.0)
+    p.add_argument("--grp_gen_weight",   type=float,    default=1.0)
 
     # Disentanglement
     p.add_argument("--use_disent",        type=str2bool,   default=True)
@@ -355,6 +362,9 @@ def main():
     p.add_argument("--disen_mi_pairs",       type=str,        default="ts,tp,ps")
     p.add_argument("--disen_lll_weight",     type=float,      default=1.0)
     p.add_argument("--disen_mi_weight",      type=float,      default=1e-3)
+    p.add_argument("--phys_loss_lambda",     type=float,      default=1e-3,
+                   help="Weight for physical quantity supervision loss (f0/energy/vuv). "
+                        "Raw MSE on f0(Hz) is O(1000), so keep this small (default: 1e-3).")
 
     # W&B
     p.add_argument("--wandb_project",    type=str,  default=os.getenv("PRJ_NAME", "DAG-KD-wav2vec"))
@@ -391,6 +401,13 @@ def main():
                    help="Student CNN feature extractor를 freeze (large 모델 fine-tuning 시 권장)")
     p.add_argument("--random_init_student", type=str2bool, default=False,
                    help="Student를 random initialization으로 시작 (KD 순수 효과 측정용)")
+    # Student 아키텍처 커스텀 (random_init_student=True 전용)
+    p.add_argument("--student_hidden_size",       type=int, default=-1,
+                   help="Student hidden dim override. -1=모델 기본값. e.g. 384 (base 768의 절반)")
+    p.add_argument("--student_num_heads",         type=int, default=-1,
+                   help="Student attention heads override. -1=기본값. e.g. 6 (base 12의 절반)")
+    p.add_argument("--student_intermediate_size", type=int, default=-1,
+                   help="Student FFN intermediate dim override. -1=기본값. e.g. 1536 (base 3072의 절반)")
 
     args = p.parse_args()
 
@@ -551,6 +568,12 @@ def main():
         flow_weight=args.flow_weight,
         use_diffkd=args.use_diffkd,
         diffkd_steps=args.diffkd_steps,
+        use_grp_kd=args.use_grp_kd,
+        grp_latent_dim=args.grp_latent_dim,
+        grp_fm_steps=args.grp_fm_steps,
+        grp_diff_steps=args.grp_diff_steps,
+        grp_rec_weight=args.grp_rec_weight,
+        grp_gen_weight=args.grp_gen_weight,
         # Disentanglement
         use_disent=args.use_disent,
         tch_spk_layers=args.tch_spk_layers,
@@ -560,6 +583,7 @@ def main():
         disen_mi_pairs=args.disen_mi_pairs,
         disen_lll_weight=args.disen_lll_weight,
         disen_mi_weight=args.disen_mi_weight,
+        phys_loss_lambda=args.phys_loss_lambda,
         # Probe
         use_txt_spk_probe=args.use_txt_spk_probe,
         txt_probe_lambda=args.txt_probe_lambda,
@@ -585,6 +609,9 @@ def main():
         kd_warmup_epochs=args.kd_warmup_epochs,
         freeze_feature_extractor=args.freeze_feature_extractor,
         random_init_student=args.random_init_student,
+        student_hidden_size=args.student_hidden_size,
+        student_num_heads=args.student_num_heads,
+        student_intermediate_size=args.student_intermediate_size,
         # Audio
         sample_rate=args.sample_rate,
     )

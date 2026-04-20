@@ -105,6 +105,214 @@ class FlowMatchingModule(nn.Module):
         return x.transpose(1, 2)
 
 
+# ============================================================
+# GRP-KD Components
+# Ref: "Knowledge Distillation via Generative Reconstruction
+#       Pathways for End-to-End ASR" (ICASSP 2026)
+# Ported from: https://github.com/qwer55252/KD-via-FM-in-ASR
+# ============================================================
+
+class GRPTeacherAutoEncoder(nn.Module):
+    """Teacher feature (B, C_t, T) → latent (B, L, T) → recon (B, C_t, T)"""
+    def __init__(self, teacher_dim: int, latent_dim: int):
+        super().__init__()
+        self.enc = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+        self.dec = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
+
+    @torch.no_grad()
+    def encode_nograd(self, x_ct):
+        return self.enc(x_ct)
+
+    def forward(self, x_ct):
+        z_t = self.enc(x_ct)
+        rec = self.dec(z_t)
+        return z_t, rec
+
+
+class GRPStudentProjector(nn.Module):
+    """Student feature (B, C_s, T) → latent (B, L, T)"""
+    def __init__(self, student_dim: int, latent_dim: int):
+        super().__init__()
+        self.proj = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
+
+    def forward(self, x_cs):
+        return self.proj(x_cs)
+
+
+class GRPNoiseAdapter(nn.Module):
+    """
+    γ(x)∈[0,1] 예측: (B,L,T)->(B,1,T)  → Z_noisy = γ·Z + (1-γ)·ε
+    Reference: NoiseAdapter in asr_train_diffm.py
+    """
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.gamma_head = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(latent_dim, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z_latent):
+        gamma = self.gamma_head(z_latent)   # (B, 1, T), scalar per time step
+        eps = torch.randn_like(z_latent)    # (B, L, T)
+        z_noisy = gamma * z_latent + (1.0 - gamma) * eps
+        return z_noisy, gamma
+
+
+class GRPSimpleDenoiser(nn.Module):
+    """Iterative 1D-CNN denoiser for diffusion pathway"""
+    def __init__(self, latent_dim: int, steps: int = 5):
+        super().__init__()
+        self.steps = steps
+        self.net = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
+        )
+
+    def forward(self, z_in):
+        x = z_in
+        for _ in range(self.steps):
+            pred_noise = self.net(x)
+            x = x - pred_noise / self.steps
+        return x
+
+
+class GRPFlowMatchingModule(nn.Module):
+    """
+    Latent-space Flow Matching (MLP meta-encoder, rectified flow schedule).
+    Ported from reference FlowMatchingModule with meta_encoder_type='mlp'.
+    Inputs/outputs are (B, L, T); MLP operates on (B, T, L) internally.
+
+    FM loss (rectified flow): dalpha_dt=1, dsigma_dt=-1
+      noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt) = s_f - velocity
+      L_FM = MSE(noise_scheduled_x, t_f)
+    """
+    def __init__(self, latent_dim: int, time_embed_dim: int = 32,
+                 hidden_dim: int = 128, training_steps: int = 8):
+        super().__init__()
+        self.training_steps = training_steps
+        self.time_embed = nn.Linear(1, time_embed_dim)
+        self.meta_encoder = nn.Sequential(
+            nn.Linear(latent_dim + time_embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, s_latent_bct: torch.Tensor, t_latent_bct: torch.Tensor,
+                steps: int = None):
+        """
+        s_latent_bct, t_latent_bct: (B, L, T)
+        returns: fm_loss (scalar), s_out_bct: (B, L, T)
+        """
+        K = steps or self.training_steps
+        x = s_latent_bct.permute(0, 2, 1).contiguous()  # (B, T, L)
+        B, T, L = x.shape
+        velocity = None
+        s_f_btl = s_latent_bct.permute(0, 2, 1)  # keep original for loss
+
+        for i in range(K, 0, -1):
+            t_val = i / K
+            t_inp = torch.full((B, T, 1), t_val, device=x.device, dtype=x.dtype)
+            t_emb = self.time_embed(t_inp)             # (B, T, time_embed_dim)
+            h = torch.cat([x, t_emb], dim=-1)         # (B, T, L+time_embed_dim)
+            velocity = self.meta_encoder(h)            # (B, T, L)
+            x = x - velocity / K
+
+        fm_loss = torch.tensor(0.0, device=s_latent_bct.device, dtype=s_latent_bct.dtype)
+        if self.training and t_latent_bct is not None and velocity is not None:
+            t_f_btl = t_latent_bct.permute(0, 2, 1)   # (B, T, L)
+            # rectified flow: dalpha_dt=1, dsigma_dt=-1
+            noise_scheduled_x = s_f_btl - velocity
+            fm_loss = F.mse_loss(noise_scheduled_x, t_f_btl)
+
+        s_out_bct = x.permute(0, 2, 1)  # (B, L, T)
+        return fm_loss, s_out_bct
+
+
+class GRPKDModule(nn.Module):
+    """
+    GRP-KD: Shared AutoEncoder + Flow Matching + Diffusion (version 4).
+
+    Ported from reference DistilFlowMatchingCTCModelBPE (version=4):
+      1. TeacherAE: z_t, t_rec = TAE(t_feat)  → L_rec = MSE(t_rec, t_feat)
+      2. Student proj: z_s = SProj(s_feat)
+      3. FM: L_FM = GRPFlowMatchingModule(z_s, z_t.detach())
+      4. Diffusion: z_noisy = NoiseAdapter(z_s); z_deno = Denoiser(z_noisy)
+                    L_DF = MSE(z_deno, z_t.detach())
+
+    Teacher 24 layers → Student 12 layers: uniform stride alignment.
+    """
+
+    def __init__(
+        self,
+        teacher_dim: int,
+        student_dim: int,
+        latent_dim: int = 96,
+        fm_steps: int = 8,
+        diff_steps: int = 9,
+        time_embed_dim: int = 32,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.fm_steps = fm_steps
+        self.diff_steps = diff_steps
+
+        self.tae = GRPTeacherAutoEncoder(teacher_dim, latent_dim)
+        self.sproj = GRPStudentProjector(student_dim, latent_dim)
+        self.adapter = GRPNoiseAdapter(latent_dim)
+        self.denoiser = GRPSimpleDenoiser(latent_dim, steps=diff_steps)
+        self.fm_latent = GRPFlowMatchingModule(latent_dim, time_embed_dim, hidden_dim, fm_steps)
+
+    def forward(self, tch_feats: list, stu_feats: list):
+        pairs = self._align_layers(tch_feats, stu_feats)
+        L_rec_list, L_fm_list, L_df_list = [], [], []
+
+        for x_t_raw, x_s in pairs:
+            # Align time dimension if needed
+            if x_t_raw.size(-1) != x_s.size(-1):
+                x_t_raw = F.interpolate(
+                    x_t_raw, size=x_s.size(-1), mode="linear", align_corners=False
+                )
+
+            # 1. Teacher AE recon loss
+            z_t, t_rec = self.tae(x_t_raw)
+            L_rec_list.append(F.mse_loss(t_rec, x_t_raw.detach()))
+            z_t_stop = z_t.detach()   # z_t used as fixed target for FM and DF
+
+            # 2. Student latent projection
+            z_s = self.sproj(x_s)
+
+            # 3. FM pathway
+            fm_loss, _ = self.fm_latent(z_s, z_t_stop, steps=self.fm_steps)
+            L_fm_list.append(fm_loss)
+
+            # 4. Diffusion pathway
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            L_df_list.append(F.mse_loss(z_deno, z_t_stop))
+
+        L_rec = torch.stack(L_rec_list).mean()
+        L_fm  = torch.stack(L_fm_list).mean()
+        L_df  = torch.stack(L_df_list).mean()
+        return L_rec, L_fm, L_df
+
+    def _align_layers(self, tch_feats, stu_feats):
+        """Uniform stride alignment: teacher 24 → student 12 layers."""
+        L_t, L_s = len(tch_feats), len(stu_feats)
+        if L_t == L_s:
+            return list(zip(tch_feats, stu_feats))
+        if L_t > L_s:
+            stride = L_t / L_s
+            idxs = [min(int(i * stride + stride - 1), L_t - 1) for i in range(L_s)]
+            return [(tch_feats[i], stu_feats[j]) for j, i in enumerate(idxs)]
+        else:
+            stride = L_s / L_t
+            idxs = [min(int(i * stride + stride - 1), L_s - 1) for i in range(L_t)]
+            return [(tch_feats[i], stu_feats[j]) for i, j in enumerate(idxs)]
+
+
 class GlobalStyleTokenLayer(nn.Module):
     def __init__(self, num_tokens=10, token_dim=96, num_heads=4, ref_dim=96):
         super().__init__()
@@ -371,12 +579,19 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         kd_temperature: float = 1.0,
         use_layer_kd: bool = False,
         layer_kd_alpha: float = 0.5,
-        # Generative KD
+        # Generative KD (simple single-layer, ablation용)
         use_flow: bool = False,
         flow_steps: int = 8,
         flow_weight: float = 1.0,
         use_diffkd: bool = False,
         diffkd_steps: int = 5,
+        # GRP-KD (multi-layer AE+FM+DF, 대조군)
+        use_grp_kd: bool = False,
+        grp_latent_dim: int = 96,
+        grp_fm_steps: int = 8,
+        grp_diff_steps: int = 9,
+        grp_rec_weight: float = 1.0,
+        grp_gen_weight: float = 1.0,
         # Disentanglement
         use_disent: bool = True,
         # Teacher 레이어 선택 (1-based, Factorization용)
@@ -397,6 +612,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         rec_txt_lambda: float = 0.1,
         rec_spk_lambda: float = 0.1,
         rec_pros_lambda: float = 1.0,
+        phys_loss_lambda: float = 1e-3,
         neg_K: int = 8,
         mi_warmup_steps: int = 5000,
         mi_ramp_steps: int = 20000,
@@ -421,6 +637,11 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         freeze_feature_extractor: bool = False,
         # Student 초기화
         random_init_student: bool = False,
+        # Student 아키텍처 커스텀 (random_init_student=True일 때만 적용)
+        # -1이면 student_name 모델의 기본값 사용
+        student_hidden_size: int = -1,
+        student_num_heads: int = -1,
+        student_intermediate_size: int = -1,
         # Vis
         disen_vis_enable: bool = False,
         # Audio
@@ -445,6 +666,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         # teacher가 필요한지 여부 (어떤 KD/disentangle도 없으면 불필요)
         _need_teacher = (
             use_logit_kd or use_layer_kd or use_flow or use_diffkd or use_disent
+            or use_grp_kd
         )
 
         # ---- Teacher (frozen) ----
@@ -460,6 +682,13 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         if random_init_student:
             # config만 로드하고 가중치는 random 초기화
             _cfg = AutoConfig.from_pretrained(student_name)
+            # 아키텍처 커스텀 (hidden_size, heads, ffn)
+            if student_hidden_size > 0:
+                _cfg.hidden_size = student_hidden_size
+            if student_num_heads > 0:
+                _cfg.num_attention_heads = student_num_heads
+            if student_intermediate_size > 0:
+                _cfg.intermediate_size = student_intermediate_size
             self.student = Wav2Vec2ForCTC(_cfg)
         else:
             self.student = Wav2Vec2ForCTC.from_pretrained(student_name)
@@ -504,6 +733,9 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.layer_kd_alpha = layer_kd_alpha
         self.use_flow = use_flow
         self.use_diffkd = use_diffkd
+        self.use_grp_kd = use_grp_kd
+        self.grp_rec_weight = grp_rec_weight
+        self.grp_gen_weight = grp_gen_weight
         self.use_disent = use_disent
         self.tch_spk_layers = tch_spk_layers
         self.tch_txt_layers = tch_txt_layers
@@ -517,6 +749,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.rec_txt_lambda = rec_txt_lambda
         self.rec_spk_lambda = rec_spk_lambda
         self.rec_pros_lambda = rec_pros_lambda
+        self.phys_loss_lambda = phys_loss_lambda
         self.disen_spk_ce_lambda = disen_spk_ce_lambda
         self.neg_K = neg_K
         self.mi_warmup_steps = mi_warmup_steps
@@ -629,7 +862,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         else:
             self.stu_club_ts = None
 
-        # ---- Generative KD ----
+        # ---- Generative KD (simple, ablation용) ----
         self.flow = FlowMatchingModule(
             self.dim_s, self.latent_dim,
             hidden=self.latent_dim, steps=flow_steps, loss_weight=flow_weight,
@@ -638,6 +871,15 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             teacher_dim=self.latent_dim, latent_dim=self.latent_dim,
             student_dim=self.dim_s, steps=diffkd_steps,
         ) if use_diffkd else None
+
+        # ---- GRP-KD (multi-layer AE+FM+DF, 논문 대조군) ----
+        self.grpkd = GRPKDModule(
+            teacher_dim=self.dim_t,
+            student_dim=self.dim_s,
+            latent_dim=grp_latent_dim,
+            fm_steps=grp_fm_steps,
+            diff_steps=grp_diff_steps,
+        ) if use_grp_kd else None
 
         # ---- Text speaker probe ----
         if self.num_spk > 1 and use_txt_spk_probe:
@@ -771,17 +1013,16 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
                 phys_loss = embs.get("phys_loss", None)
                 if phys_loss is not None and torch.is_tensor(phys_loss):
                     self.log("train/phys_loss", phys_loss, on_step=True, on_epoch=True)
-                    total = total + self.rec_pros_lambda * phys_loss
+                    total = total + self.phys_loss_lambda * phys_loss
         else:
             self._txt_emb = None
 
-        # 4) Generative KD (FM / DiffKD)
+        # 4) Generative KD (FM / DiffKD — single-layer, ablation용)
         flow_loss = torch.tensor(0.0, device=self.device)
         diff_loss = torch.tensor(0.0, device=self.device)
         if self._txt_emb is not None and self._last_enc is not None:
             stu_feat = ensure_BCT(self._last_enc, C_expected=self.dim_s)
             tch_feat = ensure_BCT(self._txt_emb.detach(), C_expected=self.latent_dim)
-            # T축 정렬 (teacher/student T_enc는 동일하지만 혹시 모르니 맞춰줌)
             if stu_feat.size(-1) != tch_feat.size(-1):
                 tch_feat = F.interpolate(tch_feat, size=stu_feat.size(-1), mode="linear", align_corners=False)
             if self.use_flow and self.flow is not None:
@@ -792,6 +1033,23 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.log("train/flow_loss", flow_loss, on_step=False, on_epoch=True)
         self.log("train/diff_loss", diff_loss, on_step=False, on_epoch=True)
         total = total + flow_loss + diff_loss
+
+        # 4-b) GRP-KD (multi-layer AE + FM + DF, 논문 대조군)
+        grp_rec_loss = torch.tensor(0.0, device=self.device)
+        grp_fm_loss  = torch.tensor(0.0, device=self.device)
+        grp_df_loss  = torch.tensor(0.0, device=self.device)
+        if self.use_grp_kd and self.grpkd is not None and self.tch_feats and self.stu_feats:
+            grp_rec_loss, grp_fm_loss, grp_df_loss = self.grpkd(
+                tch_feats=self.tch_feats,
+                stu_feats=self.stu_feats,
+            )
+            self.log("train/grp_rec",  grp_rec_loss, on_step=False, on_epoch=True)
+            self.log("train/grp_fm",   grp_fm_loss,  on_step=False, on_epoch=True)
+            self.log("train/grp_df",   grp_df_loss,  on_step=False, on_epoch=True)
+            total = total + (
+                self.grp_rec_weight * grp_rec_loss
+                + self.grp_gen_weight * (grp_fm_loss + grp_df_loss)
+            )
 
         # 5) CTC + KD 정규화 가중합
         # kd_warmup_epochs 동안은 CTC only로 학습 후 KD 활성화
@@ -1020,12 +1278,17 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         rec_pros = F.mse_loss(mel_pred, mel_target)
 
         # Physical Quantity Supervision
+        # phys_targets: (B, 3, T) with raw values [f0(Hz), energy(RMS), vuv(0~1)]
+        # f0 ranges ~0-300 Hz, so raw MSE can be O(1000). Z-score per channel to normalize scale.
         phys_loss = torch.tensor(0.0, device=pros_emb.device)
         if phys_targets is not None:
+            mean = phys_targets.mean(dim=-1, keepdim=True)           # (B, 3, 1)
+            std  = phys_targets.std(dim=-1, keepdim=True).clamp(min=1e-5)  # (B, 3, 1)
+            phys_targets_norm = (phys_targets - mean) / std
             phys_pred = self.prosody_predictor(pros_emb)
-            if phys_pred.size(-1) != phys_targets.size(-1):
-                phys_pred = F.interpolate(phys_pred, size=phys_targets.size(-1), mode="linear", align_corners=False)
-            phys_loss = F.mse_loss(phys_pred, phys_targets)
+            if phys_pred.size(-1) != phys_targets_norm.size(-1):
+                phys_pred = F.interpolate(phys_pred, size=phys_targets_norm.size(-1), mode="linear", align_corners=False)
+            phys_loss = F.mse_loss(phys_pred, phys_targets_norm)
 
         # Speaker CE & ACC
         spk_ce = torch.tensor(0.0, device=txt_emb.device)

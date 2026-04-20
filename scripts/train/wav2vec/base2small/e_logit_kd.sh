@@ -1,22 +1,29 @@
 #!/bin/bash
+# base2small / E-B: CTC + Logit KD
+# Teacher: wav2vec2-base-960h (12L, hidden=768)
+# Student: random init half-base (12L, hidden=384, heads=6, ffn=1536)
+# GPU: 1
+
 export WANDB_API_KEY=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
-# e2_dag_kd: Random init student + CTC + LogitKD + Disentanglement (DAG-KD 제안 방법)
-# v2: phys_loss_lambda=1e-3 추가 (이전 실패 원인: raw f0/energy MSE가 ~1300 폭주 → fix)
-OUT=outputs/wav2vec/e2_dag_kd_v2
+
+OUT=outputs/wav2vec/base2small/e_logit_kd
 mkdir -p "$OUT"
 
-PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=1 python train_wav2vec.py \
   --wandb_project DAG-KD-wav2vec \
-  --wandb_run wav2vec_e2_dag_kd_v2 \
+  --wandb_run b2s_logit_kd \
   --out "$OUT" \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
   --train_split train.clean.100 \
   --val_split dev.clean \
   --test_split test.clean \
-  --teacher_name facebook/wav2vec2-large-960h \
+  --teacher_name facebook/wav2vec2-base-960h \
   --student_name facebook/wav2vec2-base-960h \
   --random_init_student True \
+  --student_hidden_size 384 \
+  --student_num_heads 6 \
+  --student_intermediate_size 1536 \
   --use_ctc True \
   --use_logit_kd True \
   --kd_alpha 0.5 \
@@ -24,16 +31,13 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --use_layer_kd False \
   --use_flow False \
   --use_diffkd False \
-  --use_disent True \
-  --tch_spk_layers "8" \
-  --tch_txt_layers "24" \
-  --stu_spk_layers "4" \
-  --stu_txt_layers "12" \
-  --use_txt_spk_probe True \
-  --phys_loss_lambda 1e-3 \
-  --batch_size 4 \
+  --use_disent False \
+  --use_grp_kd False \
+  --use_txt_spk_probe False \
+  --batch_size 8 \
+  --num_workers 2 \
   --epochs 100 \
-  --gpus 4 \
+  --gpus 1 \
   --learning_rate 1e-4 \
   --warmup_epochs 5 \
   --kd_warmup_epochs 10 \
