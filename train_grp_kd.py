@@ -291,6 +291,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         crd_weight: float = 0.0,
         crd_temperature: float = 0.07,
         kd_top_k: int = 0,
+        stage1_epochs: int = 0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -318,6 +319,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.crd_weight        = crd_weight
         self.crd_temperature   = crd_temperature
         self.kd_top_k          = kd_top_k
+        self.stage1_epochs     = stage1_epochs
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -647,8 +649,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             crd_sum      += losses["crd_loss"]
 
         # 5) 총 loss
+        # E10: stage1_epochs 동안 CTC loss 제외 (feature pre-initialization)
+        in_stage1 = self.stage1_epochs > 0 and self.current_epoch < self.stage1_epochs
+        self.log("v/in_stage1", float(in_stage1), on_step=False, on_epoch=True)
         total_loss = (
-            ctc_loss
+            (torch.tensor(0.0, device=log_probs.device) if in_stage1 else ctc_loss)
             + self.kd_alpha * logit_kd_loss
             + self.layer_kd_alpha * layer_kd_loss
             + recon_sum
@@ -755,6 +760,8 @@ def main():
                    help="CRD InfoNCE temperature (default 0.07)")
     p.add_argument("--kd_top_k",        type=int,   default=0,
                    help="상위 K개 레이어만 KD에 사용 (default 0=전체, E9: 4)")
+    p.add_argument("--stage1_epochs",   type=int,   default=0,
+                   help="Two-stage training: stage1 동안 CTC loss 제외 (default 0=비활성화, E10a=20, E10b=30)")
 
     args = p.parse_args()
 
@@ -921,6 +928,7 @@ def main():
         crd_weight=args.crd_weight,
         crd_temperature=args.crd_temperature,
         kd_top_k=args.kd_top_k,
+        stage1_epochs=args.stage1_epochs,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
