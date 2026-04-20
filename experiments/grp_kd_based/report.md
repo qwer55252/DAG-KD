@@ -233,3 +233,67 @@ E2/E4 체크포인트에서 `eval_spk_probe.py`로 linear probe를 학습하여 
 - layer 7: weight=0.47
 - layer 15: weight=0.2 (20% 강도만 적용)
 - 버그 수정(chained assignment) 포함된 코드베이스에서 실행
+
+---
+
+## 9. E10 설계 — Two-Stage Training
+
+### 배경 및 동기
+
+E5~E9까지 KD 신호 품질 개선(layer-selective, CRD, top-k)에 집중했으나 모두 E4를 넘지 못했다. 근본 원인을 재검토하면, **CTC loss와 KD loss의 gradient 충돌**이 학습 전반에 걸쳐 최적화를 방해할 수 있다:
+
+- CTC gradient: "현재 student feature로 ASR 잘해"
+- KD gradient: "teacher feature 방향으로 이동해"
+
+두 신호가 동시에 경쟁하면 student encoder가 어중간한 지점에 수렴할 수 있다. 특히 초반 학습에서 student feature가 random initialization 상태일 때 이 충돌이 가장 심각하다.
+
+### 가설
+
+> **KD + disen loss로 student feature를 teacher 구조에 먼저 pre-initialize한 뒤, CTC loss를 추가하면 gradient 충돌 없이 ASR 최적화가 더 효과적으로 이루어져 E4 대비 WER이 개선된다.**
+
+이론적 근거: FitNets (Romero et al., 2015) — student 중간 레이어를 teacher hint로 먼저 학습(Stage 1)한 뒤 전체 KD fine-tuning(Stage 2)이 동시 학습 대비 우수함을 image classification에서 검증. 우리 student는 scratch 초기화이므로 이 이론이 직접 적용된다.
+
+### 실험 설계
+
+| ID | Stage 1 (KD only) | Stage 2 (Full) | 비고 |
+|---|---|---|---|
+| E10a | epoch 1~20 | epoch 21~100 | 짧은 pre-init |
+| E10b | epoch 1~30 | epoch 31~100 | 긴 pre-init |
+
+**Stage 1 losses** (CTC 없음):
+```
+loss = fm_loss + diff_loss + orth + spk_cls + grl + kd_alpha × logit_KD
+```
+- logit KD 포함: student CTC head에 teacher soft label로 방향성 제공
+- CTC hard label supervision 제외: ASR gradient 차단
+
+**Stage 2 losses** (E4 동일):
+```
+loss = CTC + kd_alpha × logit_KD + fm_loss + diff_loss + orth + spk_cls + grl
+```
+
+### 제어 플래그 추가
+
+```bash
+--stage1_epochs   # Stage 1 길이 (default=0: two-stage 비활성화, E10a=20, E10b=30)
+```
+
+### 구현
+
+`training_step`에서 `self.current_epoch < self.stage1_epochs` 조건으로 CTC loss 포함 여부 제어. 나머지 구조는 E4와 완전히 동일.
+
+```python
+if self.stage1_epochs > 0 and self.current_epoch < self.stage1_epochs:
+    total_loss = kd_terms + disen_terms  # CTC 제외
+else:
+    total_loss = ctc_loss + kd_terms + disen_terms  # E4 동일
+```
+
+### 리스크
+
+- Stage 1에서 CTC 없이 돌면 conformer encoder가 ASR과 무관한 방향으로 drift 가능
+- Stage 1이 너무 길면 Stage 2에서 CTC 복구에 시간 소요 → E10a(20ep)와 E10b(30ep) 비교로 민감도 확인
+
+### 공통 하이퍼파라미터
+
+E4와 동일: `disen_mode=3, grl_alpha=0.1, orth_weight=1.0, spk_cls_weight=1.0, grl_weight=1.0, kd_alpha=0.1, epochs=100, batch=32`
