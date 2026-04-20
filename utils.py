@@ -9,9 +9,14 @@ from omegaconf import OmegaConf
 from collections import defaultdict
 from typing import Optional, Dict, Any
 from torch.utils.data import ConcatDataset
-from nemo.collections import asr as nemo_asr
-from nemo.utils.app_state import AppState
-from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+try:
+    from nemo.collections import asr as nemo_asr
+    from nemo.utils.app_state import AppState
+    from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
+except Exception:  # nemo/megatron/transformer_engine 호환성 문제 무시
+    nemo_asr = None
+    AppState = None
+    SaveRestoreConnector = None
 
 
 # 파일 경로에서 speaker id 파싱: {spk}-{chapter}-{idx}.wav → spk
@@ -617,7 +622,7 @@ def int_list_arg(s):
 
 def save_mel_examples_from_manifest(
     manifest_path: str,
-    model: nemo_asr.models.EncDecCTCModelBPE,
+    model,  # nemo_asr.models.EncDecCTCModelBPE
     out_dir: str,
     num_examples: int = 4,
     split_name: str = "train",
@@ -1041,10 +1046,12 @@ def snapshot_sources(out_dir: str):
     train_path = Path(__file__).resolve()
     shutil.copy2(train_path, snap_dir / "train.py")
 
-    # 2) models.py / utils.py (import된 모듈의 실제 파일)
-    import models, utils
-    shutil.copy2(Path(models.__file__).resolve(), snap_dir / "models.py")
-    shutil.copy2(Path(utils.__file__).resolve(), snap_dir / "utils.py")
+    # 2) models.py / utils.py (파일 경로 기반 복사 — import 불필요)
+    src_dir = Path(__file__).resolve().parent
+    for fname in ("models.py", "models_wav2vec.py", "utils.py"):
+        src = src_dir / fname
+        if src.exists():
+            shutil.copy2(src, snap_dir / fname)
     
     # 실제 실행 커맨드 원문은 쉘에서 넘겨준 argv로 복원 가능
     (snap_dir / "cmd.txt").write_text(" ".join(map(str, sys.argv)) + "\n", encoding="utf-8")
