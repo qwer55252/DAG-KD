@@ -42,10 +42,10 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2,3 python train_wav2vec.py \
   --grp_disen_mode 1 \
   --grp_orth_weight 1.0 \
   --grp_spk_cls_weight 1.0 \
-  --batch_size 4 \
+  --batch_size 8 \
   --epochs 100 \
   --gpus 2 \
-  --learning_rate 1e-4 \
+  --learning_rate 1.5e-4 \
   --warmup_epochs 5 \
   --kd_warmup_epochs 10 \
   2>&1 | tee "$OUT/train.log"
