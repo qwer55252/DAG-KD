@@ -346,6 +346,13 @@ def main():
     p.add_argument("--grp_diff_steps",   type=int,      default=9)
     p.add_argument("--grp_rec_weight",   type=float,    default=1.0)
     p.add_argument("--grp_gen_weight",   type=float,    default=1.0)
+    # GRP-KD disentanglement (E2: orth + SpkCls)
+    p.add_argument("--grp_disen_mode",    type=int,   default=0,
+                   help="0=E1 baseline, 1=E2(orth + SpkCls on text/spk subspace)")
+    p.add_argument("--grp_orth_weight",   type=float, default=1.0,
+                   help="Weight for orthogonality loss on (z_t_text, z_t_spk)")
+    p.add_argument("--grp_spk_cls_weight", type=float, default=1.0,
+                   help="Weight for speaker classifier CE loss on z_t_spk")
 
     # Disentanglement
     p.add_argument("--use_disent",        type=str2bool,   default=True)
@@ -401,6 +408,10 @@ def main():
                    help="Student CNN feature extractor를 freeze (large 모델 fine-tuning 시 권장)")
     p.add_argument("--random_init_student", type=str2bool, default=False,
                    help="Student를 random initialization으로 시작 (KD 순수 효과 측정용)")
+    p.add_argument("--load_pretrained_feature_extractor", type=str2bool, default=False,
+                   help="random_init_student=True 상태에서도 CNN feature extractor만 "
+                        "pretrained weight을 로드. freeze_feature_extractor=True와 조합하면 "
+                        "'CNN만 pretrained+frozen, 나머지는 random init'이 된다.")
     # Student 아키텍처 커스텀 (random_init_student=True 전용)
     p.add_argument("--student_hidden_size",       type=int, default=-1,
                    help="Student hidden dim override. -1=모델 기본값. e.g. 384 (base 768의 절반)")
@@ -574,6 +585,9 @@ def main():
         grp_diff_steps=args.grp_diff_steps,
         grp_rec_weight=args.grp_rec_weight,
         grp_gen_weight=args.grp_gen_weight,
+        grp_disen_mode=args.grp_disen_mode,
+        grp_orth_weight=args.grp_orth_weight,
+        grp_spk_cls_weight=args.grp_spk_cls_weight,
         # Disentanglement
         use_disent=args.use_disent,
         tch_spk_layers=args.tch_spk_layers,
@@ -609,6 +623,7 @@ def main():
         kd_warmup_epochs=args.kd_warmup_epochs,
         freeze_feature_extractor=args.freeze_feature_extractor,
         random_init_student=args.random_init_student,
+        load_pretrained_feature_extractor=args.load_pretrained_feature_extractor,
         student_hidden_size=args.student_hidden_size,
         student_num_heads=args.student_num_heads,
         student_intermediate_size=args.student_intermediate_size,
