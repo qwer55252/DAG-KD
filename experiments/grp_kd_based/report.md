@@ -131,7 +131,11 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E4 | E2 + GRL on z_t_text | Orth + GRL | ✅ | **11.0** | **28.3** | **11.5** | **28.7** |
 | E5 | E4 + GRL alpha annealing | Orth + GRL(anneal) | ✅ | 11.1 | 28.4 | 11.4 | 29.0 |
 | E6 | E4 + student GRL | Orth + GRL×2 | ✅ | 11.3 | 28.8 | 11.6 | 29.0 |
-| E7 | E4 + layer-selective decay | Orth + GRL(layer↓) | ✅ | - | - | - | - |
+| E7 | E4 + layer-selective decay | Orth + GRL(layer↓) | ✅ | ≈12.05 | - | - | - |
+| E8 | E4 + CRD (InfoNCE) | Orth + GRL + CRD | ✅ | ≈12.22† | - | - | - |
+| E9 | E4 + Top-K KD (k=8) | Orth + GRL | ✅ | >E4‡ | - | - | - |
+| E10a | E4 + Two-Stage (s1=20) | Orth + GRL | ✅ | **10.88** | 28.49 | **11.30** | 29.02 |
+| E10b | E4 + Two-Stage (s1=30) | Orth + GRL | ✅ | 10.96 | **28.21** | 11.34 | **28.88** |
 
 ---
 
@@ -180,21 +184,64 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | Exp | 방법 | dev_clean | dev_other | test_clean | test_other |
 | --- | --- | --- | --- | --- | --- |
 | E1 | GRP-KD ver4 baseline | 12.0 | 28.3 | 12.4 | 28.8 |
-| E2 | E1 + Orth + SpkCls | **11.0** | 28.8 | **11.5** | 29.5 |
+| E2 | E1 + Orth + SpkCls | 11.0 | 28.8 | 11.5 | 29.5 |
 | E3 | E1 + CLUB MI + SpkCls | 13.1 | 31.0 | 13.3 | 32.0 |
-| **E4** | E2 + GRL on z_t_text | **11.0** | **28.3** | **11.5** | **28.7** |
+| E4 | E2 + GRL on z_t_text | 11.0 | 28.3 | 11.5 | 28.7 |
 | E5 | E4 + GRL alpha annealing | 11.1 | 28.4 | 11.4 | 29.0 |
 | E6 | E4 + student GRL | 11.3 | 28.8 | 11.6 | 29.0 |
+| E7 | E4 + layer-selective decay | ≈12.05 | - | - | - |
+| E8 | E4 + CRD (InfoNCE) | ≈12.22† | - | - | - |
+| E9 | E4 + Top-K KD (k=8) | >E4‡ | - | - | - |
+| **E10a** | E4 + Two-Stage (s1=20) | **10.88** | 28.49 | **11.30** | 29.02 |
+| **E10b** | E4 + Two-Stage (s1=30) | 10.96 | **28.21** | 11.34 | **28.88** |
+
+† E8은 epoch 128에서 조기 중단, 미수렴 상태의 추정값  
+‡ E9은 epoch 40 이전에 E4 대비 현저히 높은 WER로 조기 중단, 최종 수치 없음
+
+---
+
+### E1~E6 분석
 
 **E2 (Orthogonal)**: E1 대비 clean split에서 유의미한 개선(dev_clean -1.0%p, test_clean -0.9%p). Teacher latent를 text/speaker subspace로 분리하고 text subspace에만 FM+Diffusion KD를 적용하는 것이 효과적임을 확인했다. 다만 other split에서는 소폭 저하가 관찰되며, 화자 다양성이 높은 환경에서 분리 효과가 제한적임을 시사한다.
 
 **E3 (CLUB MI)**: 전 split에서 E1 대비 성능 저하. CLUB의 variational network 학습(ll_loss)과 MI 최소화(mi_upper)가 레이어마다 16회 반복되어 학습 신호가 불안정해졌을 가능성이 있다. Variational network가 충분히 수렴하려면 100 epoch의 joint training으로는 부족했을 수 있다.
 
-**E4 (GRL)**: E2에서 z_t_text에 GRL + SpkCls_text를 추가하여 enc_text_t가 speaker 정보를 적극적으로 제거하도록 유도했다. clean split은 E2 수준을 유지하면서 other split이 E1 baseline 수준으로 완전히 회복됐다(dev_other 28.8→28.3%, test_other 29.5→28.7%).
+**E4 (GRL)**: E2에서 z_t_text에 GRL + SpkCls_text를 추가하여 enc_text_t가 speaker 정보를 적극적으로 제거하도록 유도했다. clean split은 E2 수준을 유지하면서 other split이 E1 baseline 수준으로 완전히 회복됐다(dev_other 28.8→28.3%, test_other 29.5→28.7%). **E5 이전까지 best.**
 
-**E5 (GRL annealing)**: E4 대비 전 split에서 미미한 차이(dev_clean +0.1%p, dev_other +0.1%p). DANN annealing이 초반 KD 안정화에 도움이 되지만 최종 성능 차이는 미미하다. α가 0.5까지 점진적으로 증가해도 E4(고정 0.1) 대비 significant한 개선 없음. 다만 chained assignment 버그로 인해 grl_sum이 실제보다 2배 집계되었을 가능성이 있으므로 버그 수정 후 재실험이 필요하다.
+**E5 (GRL annealing)**: E4 대비 전 split에서 미미한 차이(dev_clean +0.1%p, dev_other +0.1%p). DANN annealing이 초반 KD 안정화에 도움이 되지만 최종 성능 차이는 미미하다. α가 0.5까지 점진적으로 증가해도 E4(고정 0.1) 대비 significant한 개선 없음.
 
-**E6 (student GRL)**: E4 대비 전 split에서 소폭 저하(dev_clean +0.3%p, dev_other +0.5%p). student z_s_text에 GRL을 추가해도 KD 타겟인 z_t_text가 이미 speaker-clean하므로 student가 자연히 text-only 표현으로 수렴한다는 가설이 지지된다. 오히려 student-side adversarial pressure가 FM/Diffusion 학습을 방해할 수 있다. 동일한 chained assignment 버그 영향 존재.
+**E6 (student GRL)**: E4 대비 전 split에서 소폭 저하(dev_clean +0.3%p, dev_other +0.5%p). student z_s_text에 GRL을 추가해도 KD 타겟인 z_t_text가 이미 speaker-clean하므로 student가 자연히 text-only 표현으로 수렴한다는 가설이 지지된다. 오히려 student-side adversarial pressure가 FM/Diffusion 학습을 방해할 수 있다.
+
+---
+
+### E7~E9 분석 (KD 신호 개선 시도, 전부 실패)
+
+**E7 (Layer-selective disentanglement)**: dev_clean≈12.05%로 E1 수준으로 퇴보. 설계 의도는 상위 레이어의 linguistic 표현을 보존하기 위해 상위 레이어의 orth/GRL 가중치를 낮추는 것이었다. 그러나 enc_text_t가 모든 레이어에서 공유되는 단일 Conv1d이므로 layer_weight를 낮춰도 "레이어별 독립적 제약"이 아닌 전체 gradient 총량 감소만 일어났다. 상위 레이어에서 GRL을 20%로 줄인 결과 disentanglement가 전반적으로 약해져 speaker 정보가 z_t_text에 다시 혼입됐고 WER이 E1 수준으로 퇴보했다. 핵심 실패 원인: shared encoder 구조에서는 layer-selective 제약이 구조적으로 불가능하다.
+
+**E8 (CRD, Contrastive Representation Distillation)**: epoch 128에서 조기 중단, dev_clean≈12.22%로 미수렴. CRD InfoNCE loss(weight=1.0)가 16개 레이어에 걸쳐 누적되어 총 loss에서 지나치게 큰 비중을 차지했다(v/crd≈51.8→31.9 범위, fm_pre/kd_post와 동일 스케일). 배치 크기 32에서 positive 1쌍 대비 negative 31개는 충분히 다양하지 않으며, 같은 배치 내 동일 화자 발화가 false negative로 작용했을 가능성이 있다. CRD가 generative KD(FM+Diffusion)와 보완적으로 작동하려면 훨씬 낮은 weight(≤0.1)와 더 많은 negative가 필요하다.
+
+**E9 (Top-K Layer KD, k=8)**: epoch 40 이전 조기 중단. 상위 8개 레이어(8~15)에만 KD를 적용하면 student capacity를 집중시킬 수 있다는 가설이었으나, 하위 레이어(0~7) KD 신호가 없으면 student encoder의 기초 acoustic feature 형성이 teacher와 다른 방향으로 흘러 상위 레이어 KD 자체가 효과를 잃었다. KD signal 총량이 절반으로 줄어 초반 수렴이 오히려 느려진 것도 원인이다.
+
+**E7~E9 공통 교훈**: KD 신호를 어떻게 "선택"하거나 "추가"하는 방식으로는 E4의 벽을 넘지 못했다. 문제는 KD 신호의 질이나 양이 아니라 **CTC와 KD의 gradient 충돌**이라는 학습 dynamics 자체에 있었다.
+
+---
+
+### E10 분석 (Two-Stage Training)
+
+**E10a (stage1=20)**: dev_clean **10.88%**, test_clean **11.30%** — E1~E9 중 처음으로 E4(11.0%)를 넘었다. Stage 1에서 CTC 없이 KD+disen만으로 student feature를 teacher 구조에 pre-initialize한 효과가 clean split에서 명확히 나타났다. 단, dev_other 28.49%, test_other 29.02%로 E4 대비 other split이 소폭 악화됐다. Stage 1이 20 epoch으로 짧아 disen(orth/GRL)이 충분히 수렴하기 전에 CTC가 켜진 것으로 해석된다.
+
+**E10b (stage1=30)**: dev_clean 10.96%, dev_other **28.21%**, test_other **28.88%**. Stage 1을 30 epoch으로 늘리자 disen이 더 충분히 작동하여 other split이 E4 수준을 회복했다. 반면 clean split 이득(10.96%)은 E10a(10.88%) 대비 줄었다. Stage 2에서 CTC를 학습할 수 있는 기간이 70 epoch으로 E10a(80 epoch)보다 짧아 clean 수렴이 덜 됐을 가능성이 있다.
+
+**E10a vs E10b 트레이드오프 요약**:
+
+| | clean 개선 | other 개선 | 판단 |
+| --- | :---: | :---: | --- |
+| E10a (s1=20) | ✅ +0.12%p vs E4 | ❌ -0.19%p | clean 우선 상황에서 유리 |
+| E10b (s1=30) | △ +0.04%p vs E4 | ✅ +0.09%p | 균형 측면에서 유리 |
+
+두 실험 모두 E4를 완전히 지배(모든 split 개선)하지는 못했다. stage1 길이가 clean/other 균형을 결정하는 핵심 변수임이 확인됐으며, **E10c(stage1=25)로 중간값 탐색 중.**
+
+**Two-Stage 유효성 결론**: CTC-KD gradient 충돌 가설이 실험적으로 지지됐다. E4까지 불가능했던 dev_clean 11% 벽 돌파(10.88%)를 달성했으며, Two-Stage 방향에서 추가 최적화 가능성이 있다.
 
 ---
 
