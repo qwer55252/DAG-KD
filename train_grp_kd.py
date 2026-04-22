@@ -28,6 +28,7 @@ import math
 import torch
 import aiohttp
 import argparse
+import torchaudio
 import statistics
 import numpy as np
 import torch.nn as nn
@@ -633,17 +634,17 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
-        # E12: disen_mode=5 — mel 기반 energy + temporal variance를 prosody anchor로 사용
-        # torchaudio 불필요: self.preprocessor mel로 결정론적 prosody 특징 추출
+        # E12: disen_mode=5 — F0 + RMS energy를 prosody anchor로 사용 (결정론적, 의미 있는 신호)
         self._pros_acoustic = None
         if self.disen_mode == 5:
             with torch.no_grad():
-                mel, _ = self.preprocessor(input_signal=signal, length=sig_len)  # (B, n_mels, T)
-                # 발화 단위 평균 log-mel energy: 음량(loudness) 대리 지표
-                energy = mel.mean(dim=(1, 2), keepdim=False).unsqueeze(1)        # (B, 1)
-                # 시간축 표준편차의 평균: 에너지 변화 속도 (강세/발화 속도 proxy)
-                temp_var = mel.std(dim=2).mean(dim=1, keepdim=True)              # (B, 1)
-                acoustic = torch.cat([energy, temp_var], dim=1)                  # (B, 2)
+                # F0: (B, T_frames) → utterance-level mean → (B, 1)
+                f0 = torchaudio.functional.detect_pitch_frequency(
+                    signal, 16000
+                ).mean(dim=1, keepdim=True)                  # (B, 1)
+                # RMS energy: (B, 1)
+                energy = signal.pow(2).mean(dim=1, keepdim=True).sqrt()
+                acoustic = torch.cat([f0, energy], dim=1)    # (B, 2)
                 # batch 정규화: 학습 안정성
                 acoustic = (acoustic - acoustic.mean(0, keepdim=True)) / (
                     acoustic.std(0, keepdim=True) + 1e-8
