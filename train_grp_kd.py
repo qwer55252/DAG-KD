@@ -28,6 +28,7 @@ import math
 import torch
 import aiohttp
 import argparse
+import torchaudio
 import statistics
 import numpy as np
 import torch.nn as nn
@@ -44,7 +45,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 from datasets import load_dataset, DownloadConfig, config as hf_config
 
-from models import ClubGaussian, GradientReversalLayer, GlobalProsodyReferenceEncoder
+from models import ClubGaussian, GradientReversalLayer
 from utils import (
     scan_speakers,
     build_manifest_from_hf_with_meta,
@@ -359,12 +360,12 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             if disen_mode == 4:
                 self.grl_s = GradientReversalLayer(alpha=grl_alpha)
                 self.spk_cls_s = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
-            # disen_mode=5: orth + GRL on z_t_text + 3-way prosody (enc_pros_t + GST supervision)
+            # disen_mode=5: orth + GRL on z_t_text + 3-way prosody (enc_pros_t + F0/energy supervision)
             if disen_mode == 5:
                 self.grl = GradientReversalLayer(alpha=grl_alpha)
                 self.spk_cls_text = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
                 self.enc_pros_t = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
-                self.pros_ref   = GlobalProsodyReferenceEncoder(n_mels=80)
+                self.pros_proj  = nn.Linear(2, latent_dim)  # F0 + energy → latent
 
         _flow_cfg = dict(flow_cfg or {})
         self.fm_latent   = FMLatent(latent_dim=latent_dim, flow_cfg=_flow_cfg)
@@ -483,10 +484,12 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                     (z_t_text * z_t_pros).sum(dim=1).pow(2).mean()
                     + (z_t_spk  * z_t_pros).sum(dim=1).pow(2).mean()
                 )
-                if hasattr(self, "_pros_ref_emb") and self._pros_ref_emb is not None:
-                    # _pros_ref_emb: (B, 96), z_t_pros.mean(dim=2): (B, 96)
+                if hasattr(self, "_pros_acoustic") and self._pros_acoustic is not None:
+                    # pros_proj: Linear(2, 96), trained jointly with enc_pros_t
+                    # F0+energy (결정론적 신호) → latent anchor → z_t_pros 유도
+                    pros_target = self.pros_proj(self._pros_acoustic)   # (B, 96)
                     out["pros_sup_loss"] = F.mse_loss(
-                        z_t_pros.mean(dim=2), self._pros_ref_emb.detach()
+                        z_t_pros.mean(dim=2), pros_target
                     )
 
             # Speaker classifier (teacher spk latent, all disen modes)
@@ -631,14 +634,22 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
-        # E11: disen_mode=5 — mel 기반 prosody reference 1회 계산 후 레이어 루프에서 공유
-        self._pros_ref_emb = None
+        # E12: disen_mode=5 — F0 + RMS energy를 prosody anchor로 사용 (결정론적, 의미 있는 신호)
+        self._pros_acoustic = None
         if self.disen_mode == 5:
             with torch.no_grad():
-                mel, _ = self.preprocessor(input_signal=signal, length=sig_len)
-                pros_ref_raw = self.pros_ref(mel)            # (B, gru_dim=96)
-            # latent_dim과 차원이 맞지 않으면 linear projection 없이 그대로 사용 (둘 다 96)
-            self._pros_ref_emb = pros_ref_raw.detach()
+                # F0: (B, T_frames) → utterance-level mean → (B, 1)
+                f0 = torchaudio.functional.detect_pitch_frequency(
+                    signal, 16000
+                ).mean(dim=1, keepdim=True)                  # (B, 1)
+                # RMS energy: (B, 1)
+                energy = signal.pow(2).mean(dim=1, keepdim=True).sqrt()
+                acoustic = torch.cat([f0, energy], dim=1)    # (B, 2)
+                # batch 정규화: 학습 안정성
+                acoustic = (acoustic - acoustic.mean(0, keepdim=True)) / (
+                    acoustic.std(0, keepdim=True) + 1e-8
+                )
+            self._pros_acoustic = acoustic
 
         # E5: DANN-style alpha annealing — training_step마다 grl.alpha 업데이트
         if self.disen_mode in (3, 4) and self.grl_anneal:

@@ -421,3 +421,75 @@ E10c의 모든 설정(stage1=25, grl_alpha=0.1, kd_alpha=0.1 등) 유지하고 d
 - enc_pros_t가 teacher feature에서 prosody를 실제로 분리하는지는 GST supervision 품질에 의존
 - GlobalProsodyReferenceEncoder output이 speaker 정보를 일부 포함할 수 있어 z_t_pros supervision이 impure할 수 있음
 - 재구성에 z_t_pros 추가로 lat_dec 입력 스케일 변화 (3벡터 합 vs 2벡터 합) → 초반 학습 불안정 가능성
+
+### E11 결과 (진행 중 조기 종료)
+
+| epoch | val WER |
+|---|---|
+| 39 | 14.1% |
+
+E10c(epoch 39 기준 ~13.4%) 대비 0.7%p 뒤처짐. 원인 분석:
+
+- `GlobalProsodyReferenceEncoder`가 **랜덤 초기화 상태로 frozen** (`torch.no_grad()` + `.detach()`)
+- enc_pros_t가 랜덤 GRU 출력에 맞추도록 강제 → noise supervision
+- orth 제약이 z_t_text를 무의미한 방향으로 밀어냄 → WER 악화
+
+→ E11 조기 종료, E12로 prosody supervision 방식 개선
+
+---
+
+## 11. E12 설계 — 3-Way Orth + F0/Energy Acoustic Anchor
+
+### E12 배경 및 동기
+
+E11 실패의 근본 원인은 pros_ref가 학습되지 않은 랜덤 특징을 제공한다는 것이다. prosody supervision target이 의미 없으면 enc_pros_t가 random direction에 orthogonal 제약을 받아 오히려 text representation을 오염시킨다.
+
+해결책: 신호처리 기반으로 **결정론적이고 의미 있는** acoustic prosody 특징을 추출하여 supervision anchor로 사용한다.
+
+- **F0 (Fundamental Frequency)**: `torchaudio.functional.detect_pitch_frequency` → 발화 평균 pitch (B, 1)
+- **RMS Energy**: waveform 제곱 평균의 제곱근 (B, 1)
+- `pros_proj = nn.Linear(2, latent_dim)`: 학습 가능한 투영 (jointly trained with enc_pros_t)
+
+### E12 가설
+
+> F0와 energy는 prosody의 핵심 acoustic 신호이며, 이를 anchor로 사용하면 enc_pros_t가 실제 prosody subspace를 학습하고, z_t_text가 더 순수한 linguistic representation이 됨으로써 E10c 대비 WER이 개선된다.
+
+### E12 아키텍처
+
+```text
+teacher feature → enc_text_t → z_t_text (96)  ← KD 타겟
+               → enc_spk_t  → z_t_spk  (96)
+               → enc_pros_t → z_t_pros (96)
+
+waveform → detect_pitch_frequency → mean F0 (B, 1)
+         → pow(2).mean.sqrt       → RMS energy (B, 1)
+         → cat([f0, energy])      → (B, 2)
+         → pros_proj (Linear, trained) → pros_target (B, 96)
+
+supervision: MSE(z_t_pros.mean(-1), pros_target)
+
+재구성: z_t_text + z_t_spk + z_t_pros → lat_dec
+orth 3쌍: (text⊥spk) + (text⊥pros) + (spk⊥pros)
+GRL on z_t_text: 변경 없음
+```
+
+### E11 대비 변경사항
+
+| 항목 | E11 | E12 |
+| --- | --- | --- |
+| prosody anchor | GlobalProsodyReferenceEncoder (랜덤 frozen) | F0 + RMS energy (결정론적) |
+| anchor 학습 여부 | No (frozen) | pros_proj만 학습 (F0/energy는 고정) |
+| supervision 품질 | noise (랜덤) | 의미 있는 acoustic signal |
+| 나머지 구조 | - | 동일 (orth 3쌍, GRL, Two-stage) |
+
+### E12 실험 설계
+
+| ID  | 기반  | disen_mode     | stage1 | prosody anchor  | 비고                      |
+| --- | ----- | -------------- | ------ | --------------- | ------------------------- |
+| E12 | E10c  | 5 (3-way orth) | 25     | F0 + RMS energy | pros_proj = Linear(2, 96) |
+
+### E12 리스크
+
+- F0 추출 실패 구간(무성음, 배경 잡음)에서 0 또는 이상값이 나올 수 있음 → batch 정규화로 완화
+- F0 + energy가 prosody의 전체가 아닌 일부만 포착 → 그래도 랜덤보다는 의미 있음
+- pros_proj와 enc_pros_t의 jointly training이 circular collapse 없이 수렴할지 → orth 제약이 regularizer로 작동
