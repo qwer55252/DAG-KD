@@ -192,8 +192,9 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E7 | E4 + layer-selective decay | ≈12.05 | - | - | - |
 | E8 | E4 + CRD (InfoNCE) | ≈12.22† | - | - | - |
 | E9 | E4 + Top-K KD (k=8) | >E4‡ | - | - | - |
-| **E10a** | E4 + Two-Stage (s1=20) | **10.88** | 28.49 | **11.30** | 29.02 |
-| **E10b** | E4 + Two-Stage (s1=30) | 10.96 | **28.21** | 11.34 | **28.88** |
+| E10a | E4 + Two-Stage (s1=20) | 10.88 | 28.49 | 11.30 | 29.02 |
+| E10b | E4 + Two-Stage (s1=30) | 10.96 | 28.21 | 11.34 | 28.88 |
+| **E10c** | E4 + Two-Stage (s1=25) | **10.59** | **27.80** | **11.22** | **28.23** |
 
 † E8은 epoch 128에서 조기 중단, 미수렴 상태의 추정값  
 ‡ E9은 epoch 40 이전에 E4 대비 현저히 높은 WER로 조기 중단, 최종 수치 없음
@@ -242,6 +243,10 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 두 실험 모두 E4를 완전히 지배(모든 split 개선)하지는 못했다. stage1 길이가 clean/other 균형을 결정하는 핵심 변수임이 확인됐으며, **E10c(stage1=25)로 중간값 탐색 중.**
 
 **Two-Stage 유효성 결론**: CTC-KD gradient 충돌 가설이 실험적으로 지지됐다. E4까지 불가능했던 dev_clean 11% 벽 돌파(10.88%)를 달성했으며, Two-Stage 방향에서 추가 최적화 가능성이 있다.
+
+**E10c (stage1=25)**: dev_clean **10.59%**, dev_other **27.80%**, test_clean **11.22%**, test_other **28.23%** — 4개 split 전부 E4를 넘었다. E10a의 clean 이득과 E10b의 other 이득이 동시에 실현됐다. stage1=25가 sweet spot으로 확인: 20ep은 disen 수렴 부족, 30ep은 Stage 2 CTC 기간 부족 — 25ep은 둘 다 충족했다.
+
+E4 대비 최종 개선: dev_clean -0.41%p, dev_other -0.50%p, test_clean -0.28%p, test_other -0.47%p. **현재 best: E10c.**
 
 ---
 
