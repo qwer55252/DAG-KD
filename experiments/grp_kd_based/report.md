@@ -446,9 +446,10 @@ E11 실패의 근본 원인은 pros_ref가 학습되지 않은 랜덤 특징을 
 
 해결책: 신호처리 기반으로 **결정론적이고 의미 있는** acoustic prosody 특징을 추출하여 supervision anchor로 사용한다.
 
-- **F0 (Fundamental Frequency)**: `torchaudio.functional.detect_pitch_frequency` → 발화 평균 pitch (B, 1)
-- **RMS Energy**: waveform 제곱 평균의 제곱근 (B, 1)
+- **mel energy**: `mel.mean(dim=(1,2))` → 발화 단위 평균 log-mel energy (음량 대리 지표, B, 1)
+- **temporal variance**: `mel.std(dim=2).mean(dim=1)` → 시간축 에너지 변화량 (강세/속도 proxy, B, 1)
 - `pros_proj = nn.Linear(2, latent_dim)`: 학습 가능한 투영 (jointly trained with enc_pros_t)
+- torchaudio 불필요: `self.preprocessor` mel로 결정론적 추출
 
 ### E12 가설
 
