@@ -28,7 +28,6 @@ import math
 import torch
 import aiohttp
 import argparse
-import torchaudio
 import statistics
 import numpy as np
 import torch.nn as nn
@@ -634,17 +633,19 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
-        # E12: disen_mode=5 — F0 + RMS energy를 prosody anchor로 사용 (결정론적, 의미 있는 신호)
+        # E12: disen_mode=5 — mel 기반 frame-level energy + spectral centroid를 prosody anchor로 사용
         self._pros_acoustic = None
         if self.disen_mode == 5:
             with torch.no_grad():
-                # F0: (B, T_frames) → utterance-level mean → (B, 1)
-                f0 = torchaudio.functional.detect_pitch_frequency(
-                    signal, 16000
-                ).mean(dim=1, keepdim=True)                  # (B, 1)
-                # RMS energy: (B, 1)
-                energy = signal.pow(2).mean(dim=1, keepdim=True).sqrt()
-                acoustic = torch.cat([f0, energy], dim=1)    # (B, 2)
+                mel, _ = self.preprocessor(input_signal=signal, length=sig_len)  # (B, n_mels, T)
+                mel_lin = mel.exp()                                               # log-mel → linear
+                # Frame-level energy: sum over freq → (B, T) → utterance mean → (B, 1)
+                energy = mel_lin.sum(dim=1).mean(dim=1, keepdim=True)
+                # Spectral centroid: frequency-weighted mean (brightness proxy) → (B, 1)
+                freq_idx = torch.arange(mel.size(1), device=mel.device, dtype=mel.dtype)
+                centroid = (mel_lin * freq_idx.view(1, -1, 1)).sum(dim=1).mean(dim=1, keepdim=True) \
+                           / (mel_lin.sum(dim=1).mean(dim=1, keepdim=True) + 1e-8)
+                acoustic = torch.cat([energy, centroid], dim=1)                  # (B, 2)
                 # batch 정규화: 학습 안정성
                 acoustic = (acoustic - acoustic.mean(0, keepdim=True)) / (
                     acoustic.std(0, keepdim=True) + 1e-8
