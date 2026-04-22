@@ -44,7 +44,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 from datasets import load_dataset, DownloadConfig, config as hf_config
 
-from models import ClubGaussian, GradientReversalLayer
+from models import ClubGaussian, GradientReversalLayer, GlobalProsodyReferenceEncoder
 from utils import (
     scan_speakers,
     build_manifest_from_hf_with_meta,
@@ -292,6 +292,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         crd_temperature: float = 0.07,
         kd_top_k: int = 0,
         stage1_epochs: int = 0,
+        pros_orth_weight: float = 1.0,
+        pros_sup_weight: float = 1.0,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -320,6 +322,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.crd_temperature   = crd_temperature
         self.kd_top_k          = kd_top_k
         self.stage1_epochs     = stage1_epochs
+        self.pros_orth_weight  = pros_orth_weight
+        self.pros_sup_weight   = pros_sup_weight
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -355,6 +359,12 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             if disen_mode == 4:
                 self.grl_s = GradientReversalLayer(alpha=grl_alpha)
                 self.spk_cls_s = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+            # disen_mode=5: orth + GRL on z_t_text + 3-way prosody (enc_pros_t + GST supervision)
+            if disen_mode == 5:
+                self.grl = GradientReversalLayer(alpha=grl_alpha)
+                self.spk_cls_text = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+                self.enc_pros_t = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+                self.pros_ref   = GlobalProsodyReferenceEncoder(n_mels=80)
 
         _flow_cfg = dict(flow_cfg or {})
         self.fm_latent   = FMLatent(latent_dim=latent_dim, flow_cfg=_flow_cfg)
@@ -432,6 +442,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "grl_loss":      torch.zeros((), device=s_bct.device),
             "grl_s_loss":    torch.zeros((), device=s_bct.device),
             "crd_loss":      torch.zeros((), device=s_bct.device),
+            "pros_orth_loss": torch.zeros((), device=s_bct.device),
+            "pros_sup_loss":  torch.zeros((), device=s_bct.device),
         }
 
         # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
@@ -446,8 +458,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             z_t_spk  = self.enc_spk_t(t_bct)           # (B, latent_dim, T)
             z_t_text_d = z_t_text.detach()
 
-            # Recon: (z_t_text + z_t_spk) → teacher feature
-            out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk), t_bct)
+            # Recon: 2-way (disen_mode=5는 3-way로 override)
+            if self.disen_mode != 5:
+                out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk), t_bct)
 
             # Student 투영 (text only)
             z_s_text = self.proj_text_s(s_bct)          # (B, latent_dim, T)
@@ -460,13 +473,29 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 out["club_lll_loss"] = layer_disen_w * self.club.ll_loss(z_t_text, z_t_spk)
             elif self.disen_mode in (3, 4):
                 out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+            elif self.disen_mode == 5:
+                # 3-way orth: text⊥spk + text⊥pros + spk⊥pros
+                z_t_pros = self.enc_pros_t(t_bct)           # (B, latent_dim, T)
+                # Recon: 3-way 완전 분해 (text + spk + pros)
+                out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk + z_t_pros), t_bct)
+                out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                if hasattr(self, "_pros_ref_emb") and self._pros_ref_emb is not None:
+                    pros_ref = F.interpolate(
+                        self._pros_ref_emb.unsqueeze(2),
+                        size=z_t_pros.size(2), mode='nearest'
+                    ).squeeze(2)                             # (B, latent_dim)
+                    out["pros_orth_loss"] = layer_disen_w * (
+                        (z_t_text * z_t_pros).sum(dim=1).pow(2).mean()
+                        + (z_t_spk  * z_t_pros).sum(dim=1).pow(2).mean()
+                    )
+                    out["pros_sup_loss"] = F.mse_loss(z_t_pros.mean(dim=2), pros_ref.detach())
 
             # Speaker classifier (teacher spk latent, all disen modes)
             if spk_id is not None:
                 spk_logits = self.spk_cls(z_t_spk)
                 out["spk_cls_loss"] = F.cross_entropy(spk_logits, spk_id)
-                # disen_mode=3,4: teacher GRL on z_t_text
-                if self.disen_mode in (3, 4):
+                # disen_mode=3,4,5: teacher GRL on z_t_text
+                if self.disen_mode in (3, 4, 5):
                     grl_logits = self.spk_cls_text(self.grl(z_t_text))
                     out["grl_loss"] = layer_disen_w * F.cross_entropy(grl_logits, spk_id)
                 # disen_mode=4: student GRL on z_s_text
@@ -603,6 +632,15 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
         # 4) Version별 latent space 손실 (레이어 합산, 원본과 동일)
+        # E11: disen_mode=5 — mel 기반 prosody reference 1회 계산 후 레이어 루프에서 공유
+        self._pros_ref_emb = None
+        if self.disen_mode == 5:
+            with torch.no_grad():
+                mel, _ = self.preprocessor(input_signal=signal, length=sig_len)
+                pros_ref_raw = self.pros_ref(mel)            # (B, gru_dim=96)
+            # latent_dim과 차원이 맞지 않으면 linear projection 없이 그대로 사용 (둘 다 96)
+            self._pros_ref_emb = pros_ref_raw.detach()
+
         # E5: DANN-style alpha annealing — training_step마다 grl.alpha 업데이트
         if self.disen_mode in (3, 4) and self.grl_anneal:
             total_steps = max(1, self.trainer.estimated_stepping_batches)
@@ -624,7 +662,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         club_lll_sum = torch.zeros((), device=log_probs.device)
         grl_sum      = torch.zeros((), device=log_probs.device)
         grl_s_sum    = torch.zeros((), device=log_probs.device)
-        crd_sum      = torch.zeros((), device=log_probs.device)
+        crd_sum       = torch.zeros((), device=log_probs.device)
+        pros_orth_sum = torch.zeros((), device=log_probs.device)
+        pros_sup_sum  = torch.zeros((), device=log_probs.device)
         num_layers = len(self.stu_feats)
         k = self.kd_top_k if self.kd_top_k > 0 else num_layers
         stu_feats_sel = self.stu_feats[-k:]
@@ -646,7 +686,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             club_lll_sum += losses["club_lll_loss"]
             grl_sum      += losses["grl_loss"]
             grl_s_sum    += losses["grl_s_loss"]
-            crd_sum      += losses["crd_loss"]
+            crd_sum       += losses["crd_loss"]
+            pros_orth_sum += losses["pros_orth_loss"]
+            pros_sup_sum  += losses["pros_sup_loss"]
 
         # 5) 총 loss
         # E10: stage1_epochs 동안 CTC loss 제외 (feature pre-initialization)
@@ -666,6 +708,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + self.grl_weight * grl_sum
             + self.grl_s_weight * grl_s_sum
             + self.crd_weight * crd_sum
+            + self.pros_orth_weight * pros_orth_sum
+            + self.pros_sup_weight  * pros_sup_sum
         )
 
         # 6) 로깅
@@ -684,6 +728,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("v/grl",        grl_sum,      on_step=True, on_epoch=True)
         self.log("v/grl_s",      grl_s_sum,    on_step=True, on_epoch=True)
         self.log("v/crd",        crd_sum,      on_step=True, on_epoch=True)
+        self.log("v/pros_orth",  pros_orth_sum, on_step=True, on_epoch=True)
+        self.log("v/pros_sup",   pros_sup_sum,  on_step=True, on_epoch=True)
         self.log("train_loss",   total_loss,   on_step=True, on_epoch=True, prog_bar=True)
         return total_loss
 
@@ -762,6 +808,10 @@ def main():
                    help="상위 K개 레이어만 KD에 사용 (default 0=전체, E9: 4)")
     p.add_argument("--stage1_epochs",   type=int,   default=0,
                    help="Two-stage training: stage1 동안 CTC loss 제외 (default 0=비활성화, E10a=20, E10b=30)")
+    p.add_argument("--pros_orth_weight", type=float, default=1.0,
+                   help="3-way prosody orth loss 가중치 (disen_mode=5, default 1.0)")
+    p.add_argument("--pros_sup_weight",  type=float, default=1.0,
+                   help="GST supervision MSE loss 가중치 (disen_mode=5, default 1.0)")
 
     args = p.parse_args()
 
@@ -929,6 +979,8 @@ def main():
         crd_temperature=args.crd_temperature,
         kd_top_k=args.kd_top_k,
         stage1_epochs=args.stage1_epochs,
+        pros_orth_weight=args.pros_orth_weight,
+        pros_sup_weight=args.pros_sup_weight,
     )
 
     # disen_mode >= 1: sample_id → speaker_class 룩업 테이블 주입
