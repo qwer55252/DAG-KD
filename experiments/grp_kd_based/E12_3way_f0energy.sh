@@ -16,7 +16,7 @@
 # 가설: 의미 있는 acoustic anchor(F0/energy)로 enc_pros_t를 유도하면
 #       prosody 분리가 실제로 일어나고 z_t_text가 더 순수한 linguistic 표현이 됨
 
-CUDA_VISIBLE_DEVICES=0 python train_grp_kd.py \
+CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python3 train_grp_kd.py \
   --wandb_run grp_kd_E12_3way_f0energy \
   --wandb_project GRP-based \
   --out outputs/grp_kd_based/E12_3way_f0energy \
