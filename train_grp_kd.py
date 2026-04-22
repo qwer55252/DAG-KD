@@ -479,16 +479,15 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 # Recon: 3-way 완전 분해 (text + spk + pros)
                 out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk + z_t_pros), t_bct)
                 out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                out["pros_orth_loss"] = layer_disen_w * (
+                    (z_t_text * z_t_pros).sum(dim=1).pow(2).mean()
+                    + (z_t_spk  * z_t_pros).sum(dim=1).pow(2).mean()
+                )
                 if hasattr(self, "_pros_ref_emb") and self._pros_ref_emb is not None:
-                    pros_ref = F.interpolate(
-                        self._pros_ref_emb.unsqueeze(2),
-                        size=z_t_pros.size(2), mode='nearest'
-                    ).squeeze(2)                             # (B, latent_dim)
-                    out["pros_orth_loss"] = layer_disen_w * (
-                        (z_t_text * z_t_pros).sum(dim=1).pow(2).mean()
-                        + (z_t_spk  * z_t_pros).sum(dim=1).pow(2).mean()
+                    # _pros_ref_emb: (B, 96), z_t_pros.mean(dim=2): (B, 96)
+                    out["pros_sup_loss"] = F.mse_loss(
+                        z_t_pros.mean(dim=2), self._pros_ref_emb.detach()
                     )
-                    out["pros_sup_loss"] = F.mse_loss(z_t_pros.mean(dim=2), pros_ref.detach())
 
             # Speaker classifier (teacher spk latent, all disen modes)
             if spk_id is not None:
