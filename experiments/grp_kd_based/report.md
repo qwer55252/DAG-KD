@@ -136,6 +136,9 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E9 | E4 + Top-K KD (k=8) | Orth + GRL | ✅ | >E4‡ | - | - | - |
 | E10a | E4 + Two-Stage (s1=20) | Orth + GRL | ✅ | **10.88** | 28.49 | **11.30** | 29.02 |
 | E10b | E4 + Two-Stage (s1=30) | Orth + GRL | ✅ | 10.96 | **28.21** | 11.34 | **28.88** |
+| E10c | E4 + Two-Stage (s1=25) | Orth + GRL | ✅ | **10.59** | **27.80** | **11.22** | **28.23** |
+| E13 | E10c + 3-Way F0 precompute | Orth + GRL + pros(Conv1d) | ✅ | 11.22 | 28.53 | 11.59 | 29.24 |
+| E14 | E10c + 3-Way GPRE | Orth + GRL + pros(GPRE+F0seq) | ✅ | - | - | - | - |
 
 ---
 
@@ -195,6 +198,8 @@ kd_alpha=0.1, kd_temperature=1.0, kd_loss_type=mse
 | E10a | E4 + Two-Stage (s1=20) | 10.88 | 28.49 | 11.30 | 29.02 |
 | E10b | E4 + Two-Stage (s1=30) | 10.96 | 28.21 | 11.34 | 28.88 |
 | **E10c** | E4 + Two-Stage (s1=25) | **10.59** | **27.80** | **11.22** | **28.23** |
+| E13 | E10c + 3-Way F0 precompute | 11.22 | 28.53 | 11.59 | 29.24 |
+| E14 | E10c + 3-Way GPRE | - | - | - | - |
 
 † E8은 epoch 128에서 조기 중단, 미수렴 상태의 추정값  
 ‡ E9은 epoch 40 이전에 E4 대비 현저히 높은 WER로 조기 중단, 최종 수치 없음
@@ -352,145 +357,55 @@ E4와 동일: `disen_mode=3, grl_alpha=0.1, orth_weight=1.0, spk_cls_weight=1.0,
 
 ---
 
-## 10. E11 설계 — 3-Way Orthogonal Disentanglement (Text / Speaker / Prosody)
+## 11. E13 분석 — 3-Way F0 Precompute (Negative Result)
 
-### 배경 및 동기
+**결과**: dev_clean 11.22%, dev_other 28.53%, test_clean 11.59%, test_other 29.24% — E10c 대비 4개 split 전부 퇴보.
 
-E10c(Two-stage, stage1=25)로 dev_clean 10.59%, dev_other 27.80%를 달성했다. 논문의 핵심 novelty는 disentanglement에 있으므로, Two-stage로 확보한 안정적인 학습 기반 위에서 disentanglement 자체를 강화하는 방향으로 확장한다.
+**실패 원인**:
 
-현재 E4/E10c의 2-way 분리(text vs speaker)는 teacher feature를 text + speaker 두 성분으로만 분해한다. 그러나 ASR 인코더 feature에는 prosody(운율) 성분도 혼재하며, 이는 ASR 관련 linguistic content와 독립적이다. prosody를 별도 subspace로 분리하면 z_t_text가 더 순수한 linguistic representation이 되어 WER이 추가 개선될 수 있다.
-
-**MI 기반 3-way 분리는 MI_ablation 실험에서 이미 실패가 확인됐다** (tp MI 추가 시 성능 하락). 따라서 E4에서 검증된 **orthogonal 제약** 방식으로 3-way 분리를 구현한다.
-
-### 가설
-
-> **teacher feature를 text / speaker / prosody 3개 subspace로 orth 분해하고, prosody subspace를 mel 기반 GST supervision으로 유도하면, z_t_text가 더 순수한 linguistic representation이 되어 E10c 대비 WER이 추가 개선된다.**
-
-### 아키텍처
-
-**현재 (2-way):**
-```
-teacher feature → enc_text_t → z_t_text (96)  ← KD 타겟
-               → enc_spk_t  → z_t_spk  (96)
-재구성: z_t_text + z_t_spk → lat_dec → teacher feature
-```
-
-**E11 (3-way):**
-```
-teacher feature → enc_text_t → z_t_text (96)  ← KD 타겟 (변경 없음)
-               → enc_spk_t  → z_t_spk  (96)
-               → enc_pros_t → z_t_pros (96)  ← 신규
-
-signal → mel → GlobalProsodyReferenceEncoder → pros_ref_emb (96, detach)
-supervision: MSE(z_t_pros.mean(-1), pros_ref_emb)
-
-재구성: z_t_text + z_t_spk + z_t_pros → lat_dec → teacher feature
-orth 3쌍: (text⊥spk) + (text⊥pros) + (spk⊥pros)
-GRL on z_t_text: 변경 없음 (speaker 제거)
-FM + Diffusion: z_s_text ↔ z_t_text (변경 없음)
-```
-
-**reconstruction 완전성**: z_t_pros가 재구성에 참여하므로 teacher feature의 prosody 성분이 누락 없이 분해된다. 이전 단순 orth(pros from mel only) 방식의 재구성 불완전 문제 해소.
-
-### 구현 변경사항
-
-1. `disen_mode=5` 신규 추가 (disen_mode=3 완전 유지, 독립적 확장)
-2. `enc_pros_t = nn.Conv1d(teacher_dim, latent_dim, 1)` 추가
-3. `pros_ref = GlobalProsodyReferenceEncoder(n_mels=80)` 추가 (models.py에서 import)
-4. `training_step`: mel 추출 → pros_ref_emb 계산 (레이어 루프 전 1회)
-5. `_compute_v_losses_one_layer`: z_t_pros 계산 + orth 2쌍 + GST supervision + 재구성 수정
-6. 새 loss 누산기: `pros_orth_sum`, `pros_sup_sum`
-
-### 제어 플래그 추가
-
-```bash
---pros_orth_weight   # text⊥pros + spk⊥pros orth loss 가중치 (default 1.0)
---pros_sup_weight    # GST supervision MSE loss 가중치 (default 1.0)
-```
-
-### 실험 설계
-
-| ID | 기반 | disen_mode | stage1 | 비고 |
-|---|---|---|---|---|
-| E11 | E10c | 5 (3-way orth) | 25 | Two-stage + 3-way disen |
-
-E10c의 모든 설정(stage1=25, grl_alpha=0.1, kd_alpha=0.1 등) 유지하고 disen_mode만 5로 변경.
-
-### 리스크
-
-- enc_pros_t가 teacher feature에서 prosody를 실제로 분리하는지는 GST supervision 품질에 의존
-- GlobalProsodyReferenceEncoder output이 speaker 정보를 일부 포함할 수 있어 z_t_pros supervision이 impure할 수 있음
-- 재구성에 z_t_pros 추가로 lat_dec 입력 스케일 변화 (3벡터 합 vs 2벡터 합) → 초반 학습 불안정 가능성
-
-### E11 결과 (진행 중 조기 종료)
-
-| epoch | val WER |
-|---|---|
-| 39 | 14.1% |
-
-E10c(epoch 39 기준 ~13.4%) 대비 0.7%p 뒤처짐. 원인 분석:
-
-- `GlobalProsodyReferenceEncoder`가 **랜덤 초기화 상태로 frozen** (`torch.no_grad()` + `.detach()`)
-- enc_pros_t가 랜덤 GRU 출력에 맞추도록 강제 → noise supervision
-- orth 제약이 z_t_text를 무의미한 방향으로 밀어냄 → WER 악화
-
-→ E11 조기 종료, E12로 prosody supervision 방식 개선
+1. **pros_sup gradient 소멸** (`v/pros_sup_epoch = 0.036`): teacher feature → Conv1d → mean F0 예측은 linear path에서 trivially easy. 수 epoch 만에 수렴 후 gradient 소멸.
+2. **z_t_pros = 잔차 공간**: pros_sup gradient 소멸 후 z_t_pros는 "text/spk 이후 남는 임의 잔차"로 전락. E13의 enc_pros_t가 teacher feature와 같은 입력을 받아 선형 분리만 시도한 것이 근본 원인.
+3. **3-way 직교 제약의 이중 압박**: z_t_text가 spk와 pros 양쪽으로부터 직교 gradient를 받아 표현 용량이 압박됨.
 
 ---
 
-## 11. E12 설계 — 3-Way Orth + F0/Energy Acoustic Anchor
+## 12. E14 설계 — 3-Way GPRE (GlobalProsodyReferenceEncoder)
 
-### E12 배경 및 동기
+### E14 가설
 
-E11 실패의 근본 원인은 pros_ref가 학습되지 않은 랜덤 특징을 제공한다는 것이다. prosody supervision target이 의미 없으면 enc_pros_t가 random direction에 orthogonal 제약을 받아 오히려 text representation을 오염시킨다.
+> mel-spectrogram에서 프레임별 F0/energy를 supervision anchor로 사용하는 GPRE 기반 prosody encoder를 3번째 disentanglement 축으로 추가하면, z_t_pros의 각 프레임이 실제 운율 정보를 담도록 보장되어 E10c 대비 WER이 개선된다.
 
-해결책: 신호처리 기반으로 **결정론적이고 의미 있는** acoustic prosody 특징을 추출하여 supervision anchor로 사용한다.
+### E13 대비 변경점
 
-- **F0 (Fundamental Frequency)**: `torchaudio.functional.detect_pitch_frequency` → 발화 평균 pitch (B, 1)
-- **RMS Energy**: waveform 제곱 평균의 제곱근 (B, 1)
-- `pros_proj = nn.Linear(2, latent_dim)`: 학습 가능한 투영 (jointly trained with enc_pros_t)
-- `/opt/venv/bin/python3` 사용: torchaudio 2.5.1 설치된 venv 환경
+| 항목 | E13 | E14 |
+| --- | --- | --- |
+| pros encoder 입력 | teacher_feat (B,176,T) | mel (B,80,T_mel) — 독립 경로 |
+| pros encoder 구조 | Conv1d(1×1) | GlobalProsodyReferenceEncoder(Conv2d×3+GRU) |
+| pros supervision | mean F0 (발화 단위 2 스칼라) | 프레임별 F0/energy MSE (voiced mask 포함) |
+| gradient 소멸 여부 | ✅ 소멸 (trivially easy) | ❌ 소멸 안됨 (mel→F0는 비자명 과제) |
+| f0 데이터 | f0_stats_train.pt (N,2) | f0_seq_train.pt (N,T_max,2) dict |
 
-### E12 가설
-
-> F0와 energy는 prosody의 핵심 acoustic 신호이며, 이를 anchor로 사용하면 enc_pros_t가 실제 prosody subspace를 학습하고, z_t_text가 더 순수한 linguistic representation이 됨으로써 E10c 대비 WER이 개선된다.
-
-### E12 아키텍처
+### 파이프라인
 
 ```text
-teacher feature → enc_text_t → z_t_text (96)  ← KD 타겟
-               → enc_spk_t  → z_t_spk  (96)
-               → enc_pros_t → z_t_pros (96)
+mel (B,80,T_mel)
+  → GlobalProsodyReferenceEncoder [Conv2d×3(stride=2) + GRU]
+  → ref_seq (B, T_mel/8, 96)
+  → transpose + F.interpolate(size=T)
+  → z_t_pros (B, 96, T)           ← teacher feat와 독립된 경로
 
-waveform → detect_pitch_frequency → mean F0 (B, 1)
-         → pow(2).mean.sqrt       → RMS energy (B, 1)
-         → cat([f0, energy])      → (B, 2)
-         → pros_proj (Linear, trained) → pros_target (B, 96)
-
-supervision: MSE(z_t_pros.mean(-1), pros_target)
-
-재구성: z_t_text + z_t_spk + z_t_pros → lat_dec
-orth 3쌍: (text⊥spk) + (text⊥pros) + (spk⊥pros)
-GRL on z_t_text: 변경 없음
+pros_proj: Linear(96→2)
+  → pred (B, T, 2)                ← 프레임별 [f0, energy] 예측
+  → pros_sup_loss = MSE_voiced(pred_f0, f0_target) + MSE(pred_energy, energy_target)
 ```
 
-### E11 대비 변경사항
+### E14 Stage 구성
 
-| 항목 | E11 | E12 |
-| --- | --- | --- |
-| prosody anchor | GlobalProsodyReferenceEncoder (랜덤 frozen) | F0 + RMS energy (결정론적) |
-| anchor 학습 여부 | No (frozen) | pros_proj만 학습 (F0/energy는 고정) |
-| supervision 품질 | noise (랜덤) | 의미 있는 acoustic signal |
-| 나머지 구조 | - | 동일 (orth 3쌍, GRL, Two-stage) |
+- **Stage 1 (epoch 0-24)**: KD + orth + spk_cls + grl + pros_orth + pros_sup — GPRE가 Stage 1부터 안정화
+- **Stage 2 (epoch 25-100)**: + CTC — 3-way 직교 구조가 수렴된 상태에서 ASR 최적화
 
-### E12 실험 설계
+### E14 하이퍼파라미터
 
-| ID  | 기반  | disen_mode     | stage1 | prosody anchor  | 비고                      |
-| --- | ----- | -------------- | ------ | --------------- | ------------------------- |
-| E12 | E10c  | 5 (3-way orth) | 25     | F0 + RMS energy | pros_proj = Linear(2, 96) |
+E10c와 동일: `disen_mode=6, stage1_epochs=25, grl_alpha=0.1, orth_weight=1.0, spk_cls_weight=1.0, grl_weight=1.0, pros_orth_weight=1.0, pros_sup_weight=1.0, kd_alpha=0.1, epochs=100, batch=32`
 
-### E12 리스크
-
-- F0 추출 실패 구간(무성음, 배경 잡음)에서 0 또는 이상값이 나올 수 있음 → batch 정규화로 완화
-- F0 + energy가 prosody의 전체가 아닌 일부만 포착 → 그래도 랜덤보다는 의미 있음
-- pros_proj와 enc_pros_t의 jointly training이 circular collapse 없이 수렴할지 → orth 제약이 regularizer로 작동
+---
