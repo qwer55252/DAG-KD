@@ -678,7 +678,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 mel_clean, _ = self.preprocessor(
                     input_signal=signal, length=sig_len,
                 )                                                          # (B, n_mels, T_mel)
-            T = self.tch_feats[0].size(2)
+            # tch_feats stores (B, T, H_t): size(1)=T (time), size(2)=H_t (hidden)
+            T = self.tch_feats[0].size(1)
             ref_seq  = self.enc_pros_t(mel_clean, return_seq=True)        # (B, T', latent_dim)
             pros_t   = ref_seq.transpose(1, 2)                            # (B, latent_dim, T')
             pros_emb = F.interpolate(
@@ -698,7 +699,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 f0_target_norm = (f0_target - mu_n) / std_n               # (B, T, 2)
 
                 pred = self.pros_proj(pros_emb.permute(0, 2, 1))          # (B, T, 2)
-                vuv_mask = (f0_target[:, :, 0] > 10.0 / std_n[0])        # voiced (정규화 공간)
+                vuv_mask = (f0_target[:, :, 0] > 10.0)                    # voiced: raw f0 > 10 Hz
 
                 if vuv_mask.any():
                     f0_loss = F.mse_loss(
