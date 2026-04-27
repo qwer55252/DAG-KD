@@ -319,32 +319,59 @@ OUT=outputs/wav2vec/grp_kd_orth/B_E2_base_half_orth
 
 ---
 
-## 8. 결과 분석 템플릿 (Step 6용)
+## 8. 결과 분석 (Step 6)
 
-실험 완료 후 이 섹션에 다음을 채워 넣는다:
+### 실행 조건
+- 100 epochs, batch=8, lr=1.5e-4 (배치 4→8로 늘리며 LR 선형 스케일링), 2-GPU DDP, kd_warmup=10
+- 그 외 하이퍼파라미터는 §3 설계 그대로
 
-```markdown
-### Table 1: Track A — Large → Base
-
-| ID | 방법 | dev_clean | dev_other | test_clean | test_other |
-| --- | --- | --- | --- | --- | --- |
-| A-E1 | GRP-KD (ver4) | ? | ? | ? | ? |
-| A-E2 | + Orth + SpkCls | ? | ? | ? | ? |
-
-### Table 2: Track B — Base → Base-half (12L, d=384)
+### Table 1: Track A — Large → Base (94M student)
 
 | ID | 방법 | dev_clean | dev_other | test_clean | test_other |
 | --- | --- | --- | --- | --- | --- |
-| B-E1 | GRP-KD (ver4) | ? | ? | ? | ? |
-| B-E2 | + Orth + SpkCls | ? | ? | ? | ? |
+| **A-E1** | GRP-KD baseline | **14.28** | **38.10** | **14.92** | **40.36** |
+| A-E2 | + Orth + SpkCls | 14.97 | 39.44 | 15.45 | 42.05 |
+| Δ (E2−E1) | | +0.69 | +1.34 | +0.53 | +1.69 |
 
-분석:
-1. **Track 내부**: Clean split 개선폭이 Conformer E2(−1.0%p) 수준과 일치하는가
-2. **Track 간**: Track A와 B에서 orth-disen 개선 방향이 같은가 (같으면 layer depth 독립적 효과 입증)
-3. **Other split trade-off**: Conformer E2에서 관찰된 other 소폭 저하가 두 track 모두에서 재현되는가
-4. **Loss 수렴**: orth/spk_cls가 안정적으로 감소했는가. spk_acc가 50% 이상 도달했는가 (특히 Track B teacher base가 spk 정보를 충분히 가진가)
-5. **실패 시**: Track 한 쪽만 실패하면 그 track 고유 요인(layer align 또는 student scale-down) 때문. 양쪽 모두 실패면 wav2vec 구조 자체에서 orth-disen이 작동 안 하는 것 → 대안 분리 제약(CLUB, GRL) 검토
-```
+### Table 2: Track B — Base → Base-half, 12L d=384 (26.9M student)
+
+| ID | 방법 | dev_clean | dev_other | test_clean | test_other |
+| --- | --- | --- | --- | --- | --- |
+| **B-E1** | GRP-KD baseline | **18.06** | **43.48** | **18.52** | **46.32** |
+| B-E2 | + Orth + SpkCls | 19.39 | 45.93 | 20.28 | 48.26 |
+| Δ (E2−E1) | | +1.33 | +2.45 | +1.76 | +1.94 |
+
+### 가설 검증 결과 — **기각**
+
+§2 가설("orth-disen이 두 track 모두에서 baseline 대비 개선")은 **기각된다**.
+
+- 8개 split 모두에서 E2 > E1 (성능 저하)
+- 평균 저하 Track A 1.06 pp / Track B 1.87 pp — 노이즈가 아닌 일관된 효과
+- Conformer E2가 보였던 −1.0%p 개선은 **wav2vec2 파이프라인에서 재현되지 않음**
+
+### 핵심 관찰
+
+1. **Capacity-dependent 손해 폭**: 작은 student(Track B 26.9M)에서 손실이 큰 student(Track A 94M)보다 ~2배 더 큼. orth + spk_cls라는 추가 latent space + 손실항이 작은 capacity를 더 압박하는 양상. KD 기본 신호(z_t) 자체를 student가 충분히 흡수하지 못한 상태에서 분리 제약이 추가 부담으로 작용.
+
+2. **Other split이 더 큰 저하**: dev_other +1.34/+2.45, test_other +1.69/+1.94 — clean에 비해 1.5~2배 큰 저하. orth 제약이 noisy speech robustness를 더 해친다는 신호. teacher가 noise 환경에서 추출하는 정보 중 "speaker처럼 보이지만 실제로는 channel/SNR cue"를 spk subspace로 분리하면서 student가 channel-robust한 표현을 못 받는 것으로 해석 가능.
+
+3. **Conformer ↔ wav2vec2 갭**: Conformer GRP-KD에서 작동했던 `(z_t_text * z_t_spk).sum(1).pow(2).mean()` 직교 제약이 wav2vec2에서 작동하지 않는 이유 추정:
+   - **Latent 분포 차이**: Conformer는 mel-feature 입력으로 더 explicit한 prosody/spk 정보를 가지지만, wav2vec2는 raw waveform self-supervised로 학습된 표현이라 spk/text 분리가 이미 어느 정도 진행되어 있음 → 추가 분리 제약이 redundant하거나 over-regularization.
+   - **Teacher 본인의 자기-구분력**: wav2vec2-large는 ASR fine-tuned 모델이라 teacher latent 자체가 이미 text-leaning. 여기에 z_t_spk 인코더를 강제로 학습시키면 의미 없는 noise direction을 학습.
+   - **CTC + KD 조합 충돌**: wav2vec2는 CTC가 dominant loss라 CTC alignment에 도움 안 되는 latent regularization이 학습 dynamics에 negative interference.
+
+4. **Layer depth 변수 무관**: Track A(depth mismatch)와 Track B(width only) 둘 다 같은 방향으로 실패 → orth-disen 실패 원인이 layer alignment 방식이 아니라 **wav2vec2 latent space 자체의 특성** 때문임을 시사.
+
+### 후속 방향
+
+- **분리 제약 자체를 재고**: 단순 orth 대신 CLUB-style MI minimization 또는 GRL을 적용해 적응적/소프트한 분리로 시도 (Conformer DAG-KD 메인 라인의 `dagkd_club_modified` 계열 참조).
+- **Spk subspace 의존도 낮추기**: `grp_orth_weight`, `grp_spk_cls_weight`를 0.1, 0.01 등으로 sweep하여 부담을 줄이고 효과 곡선 확보.
+- **Teacher 후보 변경**: ASR fine-tuned가 아닌 SSL pretrained `wav2vec2-base`를 teacher로 두고 implicit text/spk 혼재가 더 강한 표현에서 disen이 의미를 갖는지 검증.
+- **Track B 우선 활용**: 본 실험에서 Track B baseline 18.5% test_clean은 26.9M params로 도달한 수치 — 실용적 KD 후보. 향후 disen 변형보다 Track B baseline을 출발점 삼아 다른 KD 변종(grp_gen_weight 조정, FM/Diff 단독 ablation)을 우선 검토.
+
+### 결론
+
+> **wav2vec2 파이프라인에서 직교 분리 + speaker classifier 형태의 hard disentanglement는 GRP-KD baseline 대비 일관된 성능 저하를 일으킨다.** Conformer에서 작동했던 분리 제약을 그대로 옮기는 것이 답이 아니며, wav2vec2 latent의 sparsity/지향성 특성을 고려한 **soft / MI-based 분리 제약**으로 접근 방향을 전환할 필요가 있다.
 
 ---
 
