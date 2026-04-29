@@ -346,6 +346,17 @@ def main():
     p.add_argument("--grp_diff_steps",   type=int,      default=9)
     p.add_argument("--grp_rec_weight",   type=float,    default=1.0)
     p.add_argument("--grp_gen_weight",   type=float,    default=1.0)
+    # GRP-KD v1 disentanglement (ContentVec-style)
+    p.add_argument("--use_speaker_adv",  type=str2bool, default=False,
+                   help="Latent에 speaker classifier+GRL → speaker info 제거")
+    p.add_argument("--use_speaker_cond", type=str2bool, default=False,
+                   help="FM/Diffusion meta-encoder에 speaker embedding 주입")
+    p.add_argument("--spk_adv_weight",   type=float,    default=0.1,
+                   help="Speaker adversarial loss 가중치 (0.01~0.5 범위 권장)")
+    p.add_argument("--spk_emb_dim",      type=int,      default=64,
+                   help="Speaker embedding 차원")
+    p.add_argument("--spk_adv_alpha",    type=float,    default=1.0,
+                   help="GRL gradient scaling factor (negate된 gradient에 곱)")
 
     # Disentanglement
     p.add_argument("--use_disent",        type=str2bool,   default=True)
@@ -574,6 +585,11 @@ def main():
         grp_diff_steps=args.grp_diff_steps,
         grp_rec_weight=args.grp_rec_weight,
         grp_gen_weight=args.grp_gen_weight,
+        use_speaker_adv=args.use_speaker_adv,
+        use_speaker_cond=args.use_speaker_cond,
+        spk_adv_weight=args.spk_adv_weight,
+        spk_emb_dim=args.spk_emb_dim,
+        spk_adv_alpha=args.spk_adv_alpha,
         # Disentanglement
         use_disent=args.use_disent,
         tch_spk_layers=args.tch_spk_layers,

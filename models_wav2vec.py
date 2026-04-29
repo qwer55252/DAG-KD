@@ -106,6 +106,26 @@ class FlowMatchingModule(nn.Module):
 
 
 # ============================================================
+# Gradient Reversal Layer (Ganin & Lempitsky, ICML 2015)
+# ============================================================
+
+class _GRL(torch.autograd.Function):
+    """Forward identity, backward sign-flips and scales gradient by alpha."""
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+
+def grad_reverse(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    return _GRL.apply(x, alpha)
+
+
+# ============================================================
 # GRP-KD Components
 # Ref: "Knowledge Distillation via Generative Reconstruction
 #       Pathways for End-to-End ASR" (ICASSP 2026)
@@ -161,20 +181,52 @@ class GRPNoiseAdapter(nn.Module):
 
 
 class GRPSimpleDenoiser(nn.Module):
-    """Iterative 1D-CNN denoiser for diffusion pathway"""
-    def __init__(self, latent_dim: int, steps: int = 5):
+    """
+    Iterative 1D-CNN denoiser for diffusion pathway.
+
+    [v1 extension] FiLM speaker conditioning:
+      use_speaker_cond=True 시 spk_emb → MLP → (γ, β) 로 feature modulation.
+      pred_noise * (1 + γ) + β  형태로 적용. Identity initialization (γ=0, β=0)으로
+      conditioning이 disabled일 때와 거의 동일하게 시작.
+    """
+    def __init__(self, latent_dim: int, steps: int = 5,
+                 use_speaker_cond: bool = False, num_spk: int = 0,
+                 spk_emb_dim: int = 64):
         super().__init__()
         self.steps = steps
+        self.use_speaker_cond = use_speaker_cond
         self.net = nn.Sequential(
             nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
         )
+        if use_speaker_cond:
+            assert num_spk > 0, "num_spk must be > 0 when use_speaker_cond=True"
+            self.spk_embed = nn.Embedding(num_spk, spk_emb_dim)
+            # FiLM: γ, β 두 채널 → 각 latent_dim
+            self.film = nn.Linear(spk_emb_dim, 2 * latent_dim)
+            # Identity init: γ=0, β=0 → output = pred_noise (conditioning effect 없음 시작)
+            nn.init.zeros_(self.film.weight)
+            nn.init.zeros_(self.film.bias)
 
-    def forward(self, z_in):
+    def forward(self, z_in: torch.Tensor, speaker_ids: torch.Tensor = None):
+        """
+        z_in: (B, L, T)
+        speaker_ids: (B,) long — only used when use_speaker_cond=True
+        """
+        gamma = beta = None
+        if self.use_speaker_cond and speaker_ids is not None:
+            spk_emb = self.spk_embed(speaker_ids)             # (B, spk_emb_dim)
+            film = self.film(spk_emb)                          # (B, 2*L)
+            L = film.size(1) // 2
+            gamma = film[:, :L].unsqueeze(-1)                  # (B, L, 1)
+            beta  = film[:, L:].unsqueeze(-1)                  # (B, L, 1)
+
         x = z_in
         for _ in range(self.steps):
             pred_noise = self.net(x)
+            if gamma is not None:
+                pred_noise = pred_noise * (1.0 + gamma) + beta
             x = x - pred_noise / self.steps
         return x
 
@@ -188,22 +240,35 @@ class GRPFlowMatchingModule(nn.Module):
     FM loss (rectified flow): dalpha_dt=1, dsigma_dt=-1
       noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt) = s_f - velocity
       L_FM = MSE(noise_scheduled_x, t_f)
+
+    [v1 extension] Speaker conditioning (ContentVec mech 3):
+      use_speaker_cond=True 인 경우 meta_encoder 입력에 speaker embedding을 concat.
+      Inference 시 speaker_ids=None → zero spk embedding (pre-broadcast).
     """
     def __init__(self, latent_dim: int, time_embed_dim: int = 32,
-                 hidden_dim: int = 128, training_steps: int = 8):
+                 hidden_dim: int = 128, training_steps: int = 8,
+                 use_speaker_cond: bool = False, num_spk: int = 0,
+                 spk_emb_dim: int = 64):
         super().__init__()
         self.training_steps = training_steps
+        self.use_speaker_cond = use_speaker_cond
+        self.spk_emb_dim = spk_emb_dim if use_speaker_cond else 0
         self.time_embed = nn.Linear(1, time_embed_dim)
+        if use_speaker_cond:
+            assert num_spk > 0, "num_spk must be > 0 when use_speaker_cond=True"
+            self.spk_embed = nn.Embedding(num_spk, spk_emb_dim)
+        in_dim = latent_dim + time_embed_dim + self.spk_emb_dim
         self.meta_encoder = nn.Sequential(
-            nn.Linear(latent_dim + time_embed_dim, hidden_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim),
         )
 
     def forward(self, s_latent_bct: torch.Tensor, t_latent_bct: torch.Tensor,
-                steps: int = None):
+                steps: int = None, speaker_ids: torch.Tensor = None):
         """
         s_latent_bct, t_latent_bct: (B, L, T)
+        speaker_ids: (B,) long — only used when use_speaker_cond=True
         returns: fm_loss (scalar), s_out_bct: (B, L, T)
         """
         K = steps or self.training_steps
@@ -212,11 +277,26 @@ class GRPFlowMatchingModule(nn.Module):
         velocity = None
         s_f_btl = s_latent_bct.permute(0, 2, 1)  # keep original for loss
 
+        # Speaker embedding (if enabled)
+        spk_emb_bt = None
+        if self.use_speaker_cond:
+            if speaker_ids is not None:
+                # (B, spk_emb_dim) → broadcast to (B, T, spk_emb_dim)
+                spk_emb = self.spk_embed(speaker_ids)
+                spk_emb_bt = spk_emb.unsqueeze(1).expand(B, T, -1)
+            else:
+                # Inference fallback: zero embedding
+                spk_emb_bt = torch.zeros(B, T, self.spk_emb_dim,
+                                          device=x.device, dtype=x.dtype)
+
         for i in range(K, 0, -1):
             t_val = i / K
             t_inp = torch.full((B, T, 1), t_val, device=x.device, dtype=x.dtype)
             t_emb = self.time_embed(t_inp)             # (B, T, time_embed_dim)
-            h = torch.cat([x, t_emb], dim=-1)         # (B, T, L+time_embed_dim)
+            if spk_emb_bt is not None:
+                h = torch.cat([x, t_emb, spk_emb_bt], dim=-1)
+            else:
+                h = torch.cat([x, t_emb], dim=-1)
             velocity = self.meta_encoder(h)            # (B, T, L)
             x = x - velocity / K
 
@@ -231,6 +311,42 @@ class GRPFlowMatchingModule(nn.Module):
         return fm_loss, s_out_bct
 
 
+class GRPSpeakerAdversarial(nn.Module):
+    """
+    Latent → Speaker classification with Gradient Reversal Layer (GRL).
+
+    z_latent (B, L, T) → mean-pool over T → (B, L) → 2-layer MLP → (B, num_spk)
+
+    Forward path: GRL(alpha) → meanpool → MLP. Cross-entropy loss는 호출자에서 계산.
+    GRL이 forward에서는 identity, backward에서는 sign-flip:
+      - classifier MLP: 정상적으로 speaker 분류 학습 (CE loss 줄이려고 함)
+      - latent로 흐르는 gradient: 부호 반전 → latent에서 speaker 정보 제거 학습
+
+    Reference: ContentVec (ICML 2022) speaker disentanglement mechanism.
+    """
+    def __init__(self, latent_dim: int, num_spk: int, hidden: int = 256,
+                 alpha: float = 1.0, dropout: float = 0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_spk),
+        )
+
+    def forward(self, z_latent_bct: torch.Tensor) -> torch.Tensor:
+        """
+        z_latent_bct: (B, L, T)
+        returns: (B, num_spk) logits
+        """
+        # GRL: gradient sign-flip on latent
+        z_rev = grad_reverse(z_latent_bct, self.alpha)
+        # mean-pool over time → (B, L)
+        z_pooled = z_rev.mean(dim=-1)
+        return self.classifier(z_pooled)
+
+
 class GRPKDModule(nn.Module):
     """
     GRP-KD: Shared AutoEncoder + Flow Matching + Diffusion (version 4).
@@ -243,6 +359,12 @@ class GRPKDModule(nn.Module):
                     L_DF = MSE(z_deno, z_t.detach())
 
     Teacher 24 layers → Student 12 layers: uniform stride alignment.
+
+    [v1 disentanglement extensions, ContentVec-style]
+      - use_speaker_adv: TeacherAE latent z_t에 speaker classifier (with GRL)
+                        → latent에서 speaker info 제거. ContentVec mech 1+2 변형.
+      - use_speaker_cond: FM/Diffusion meta-encoder에 speaker embedding 주입
+                          → student가 speaker info를 carrying할 필요 없음. mech 3.
     """
 
     def __init__(
@@ -254,20 +376,51 @@ class GRPKDModule(nn.Module):
         diff_steps: int = 9,
         time_embed_dim: int = 32,
         hidden_dim: int = 128,
+        # v1 disentanglement
+        use_speaker_adv: bool = False,
+        use_speaker_cond: bool = False,
+        num_spk: int = 0,
+        spk_emb_dim: int = 64,
+        spk_adv_alpha: float = 1.0,
+        spk_adv_hidden: int = 256,
     ):
         super().__init__()
         self.fm_steps = fm_steps
         self.diff_steps = diff_steps
+        self.use_speaker_adv = use_speaker_adv
+        self.use_speaker_cond = use_speaker_cond
 
         self.tae = GRPTeacherAutoEncoder(teacher_dim, latent_dim)
         self.sproj = GRPStudentProjector(student_dim, latent_dim)
         self.adapter = GRPNoiseAdapter(latent_dim)
-        self.denoiser = GRPSimpleDenoiser(latent_dim, steps=diff_steps)
-        self.fm_latent = GRPFlowMatchingModule(latent_dim, time_embed_dim, hidden_dim, fm_steps)
+        self.denoiser = GRPSimpleDenoiser(
+            latent_dim, steps=diff_steps,
+            use_speaker_cond=use_speaker_cond, num_spk=num_spk, spk_emb_dim=spk_emb_dim,
+        )
+        self.fm_latent = GRPFlowMatchingModule(
+            latent_dim, time_embed_dim, hidden_dim, fm_steps,
+            use_speaker_cond=use_speaker_cond, num_spk=num_spk, spk_emb_dim=spk_emb_dim,
+        )
 
-    def forward(self, tch_feats: list, stu_feats: list):
+        if use_speaker_adv:
+            assert num_spk > 0, "num_spk must be > 0 when use_speaker_adv=True"
+            self.spk_adv = GRPSpeakerAdversarial(
+                latent_dim=latent_dim, num_spk=num_spk,
+                hidden=spk_adv_hidden, alpha=spk_adv_alpha,
+            )
+        else:
+            self.spk_adv = None
+
+    def forward(self, tch_feats: list, stu_feats: list,
+                speaker_ids: torch.Tensor = None):
+        """
+        반환:
+          - (L_rec, L_fm, L_df, L_spk_adv, spk_acc)  if use_speaker_adv
+          - (L_rec, L_fm, L_df)                       otherwise
+        """
         pairs = self._align_layers(tch_feats, stu_feats)
         L_rec_list, L_fm_list, L_df_list = [], [], []
+        L_spk_adv_list, spk_acc_list = [], []
 
         for x_t_raw, x_s in pairs:
             # Align time dimension if needed
@@ -279,23 +432,37 @@ class GRPKDModule(nn.Module):
             # 1. Teacher AE recon loss
             z_t, t_rec = self.tae(x_t_raw)
             L_rec_list.append(F.mse_loss(t_rec, x_t_raw.detach()))
+
+            # 1-b. Speaker adversarial on z_t (gradient는 GRL을 통해 z_t에 흘러감)
+            if self.use_speaker_adv and speaker_ids is not None:
+                spk_logits = self.spk_adv(z_t)             # (B, num_spk)
+                L_spk_adv_list.append(F.cross_entropy(spk_logits, speaker_ids))
+                spk_pred = spk_logits.argmax(dim=-1)
+                spk_acc_list.append((spk_pred == speaker_ids).float().mean())
+
             z_t_stop = z_t.detach()   # z_t used as fixed target for FM and DF
 
             # 2. Student latent projection
             z_s = self.sproj(x_s)
 
-            # 3. FM pathway
-            fm_loss, _ = self.fm_latent(z_s, z_t_stop, steps=self.fm_steps)
+            # 3. FM pathway (with optional speaker conditioning)
+            fm_loss, _ = self.fm_latent(z_s, z_t_stop, steps=self.fm_steps,
+                                         speaker_ids=speaker_ids)
             L_fm_list.append(fm_loss)
 
-            # 4. Diffusion pathway
+            # 4. Diffusion pathway (with optional speaker conditioning)
             z_noisy, _ = self.adapter(z_s)
-            z_deno = self.denoiser(z_noisy)
+            z_deno = self.denoiser(z_noisy, speaker_ids=speaker_ids)
             L_df_list.append(F.mse_loss(z_deno, z_t_stop))
 
         L_rec = torch.stack(L_rec_list).mean()
         L_fm  = torch.stack(L_fm_list).mean()
         L_df  = torch.stack(L_df_list).mean()
+
+        if self.use_speaker_adv and L_spk_adv_list:
+            L_spk_adv = torch.stack(L_spk_adv_list).mean()
+            spk_acc = torch.stack(spk_acc_list).mean()
+            return L_rec, L_fm, L_df, L_spk_adv, spk_acc
         return L_rec, L_fm, L_df
 
     def _align_layers(self, tch_feats, stu_feats):
@@ -592,6 +759,12 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         grp_diff_steps: int = 9,
         grp_rec_weight: float = 1.0,
         grp_gen_weight: float = 1.0,
+        # GRP-KD v1 disentanglement (ContentVec-style)
+        use_speaker_adv: bool = False,
+        use_speaker_cond: bool = False,
+        spk_adv_weight: float = 0.1,
+        spk_emb_dim: int = 64,
+        spk_adv_alpha: float = 1.0,
         # Disentanglement
         use_disent: bool = True,
         # Teacher 레이어 선택 (1-based, Factorization용)
@@ -736,6 +909,9 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         self.use_grp_kd = use_grp_kd
         self.grp_rec_weight = grp_rec_weight
         self.grp_gen_weight = grp_gen_weight
+        self.use_speaker_adv = use_speaker_adv
+        self.use_speaker_cond = use_speaker_cond
+        self.spk_adv_weight = spk_adv_weight
         self.use_disent = use_disent
         self.tch_spk_layers = tch_spk_layers
         self.tch_txt_layers = tch_txt_layers
@@ -879,6 +1055,11 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             latent_dim=grp_latent_dim,
             fm_steps=grp_fm_steps,
             diff_steps=grp_diff_steps,
+            use_speaker_adv=use_speaker_adv,
+            use_speaker_cond=use_speaker_cond,
+            num_spk=self.num_spk,
+            spk_emb_dim=spk_emb_dim,
+            spk_adv_alpha=spk_adv_alpha,
         ) if use_grp_kd else None
 
         # ---- Text speaker probe ----
@@ -1038,17 +1219,27 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         grp_rec_loss = torch.tensor(0.0, device=self.device)
         grp_fm_loss  = torch.tensor(0.0, device=self.device)
         grp_df_loss  = torch.tensor(0.0, device=self.device)
+        grp_spk_adv_loss = torch.tensor(0.0, device=self.device)
         if self.use_grp_kd and self.grpkd is not None and self.tch_feats and self.stu_feats:
-            grp_rec_loss, grp_fm_loss, grp_df_loss = self.grpkd(
+            grp_out = self.grpkd(
                 tch_feats=self.tch_feats,
                 stu_feats=self.stu_feats,
+                speaker_ids=speaker_ids if (self.use_speaker_adv or self.use_speaker_cond) else None,
             )
+            if self.use_speaker_adv:
+                grp_rec_loss, grp_fm_loss, grp_df_loss, grp_spk_adv_loss, grp_spk_acc = grp_out
+                self.log("train/grp_spk_adv", grp_spk_adv_loss, on_step=False, on_epoch=True)
+                self.log("train/grp_spk_acc", grp_spk_acc,      on_step=False, on_epoch=True)
+            else:
+                grp_rec_loss, grp_fm_loss, grp_df_loss = grp_out
+
             self.log("train/grp_rec",  grp_rec_loss, on_step=False, on_epoch=True)
             self.log("train/grp_fm",   grp_fm_loss,  on_step=False, on_epoch=True)
             self.log("train/grp_df",   grp_df_loss,  on_step=False, on_epoch=True)
             total = total + (
                 self.grp_rec_weight * grp_rec_loss
                 + self.grp_gen_weight * (grp_fm_loss + grp_df_loss)
+                + self.spk_adv_weight * grp_spk_adv_loss
             )
 
         # 5) CTC + KD 정규화 가중합
