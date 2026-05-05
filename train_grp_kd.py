@@ -282,6 +282,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         disen_mode: int = 0,
         num_spk: int = 1,
         orth_weight: float = 1.0,
+        club_mi_weight: float = 0.1,
         spk_cls_weight: float = 1.0,
         grl_weight: float = 1.0,
         grl_alpha: float = 1.0,
@@ -295,6 +296,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         stage1_epochs: int = 0,
         pros_orth_weight: float = 1.0,
         pros_sup_weight: float = 1.0,
+        use_text_in: bool = False,
+        vib_beta: float = 0.0,
+        cross_cov_weight: float = 0.0,
+        orth_recon: bool = False,
         n_mels: int = 80,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -314,6 +319,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         self.disen_mode     = disen_mode
         self.orth_weight    = orth_weight
+        self.club_mi_weight = club_mi_weight
         self.spk_cls_weight = spk_cls_weight
         self.grl_weight        = grl_weight
         self.grl_anneal        = grl_anneal
@@ -326,6 +332,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.stage1_epochs     = stage1_epochs
         self.pros_orth_weight  = pros_orth_weight
         self.pros_sup_weight   = pros_sup_weight
+        self.use_text_in       = use_text_in
+        self.vib_beta          = vib_beta
+        self.cross_cov_weight  = cross_cov_weight
+        self.orth_recon        = orth_recon
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -347,8 +357,15 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.spk_cls = SpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
             # sample_id → speaker_class 룩업 테이블 (register_buffer: 저장/로드 가능, 학습 X)
             self.spk_table: torch.Tensor | None = None
-            # disen_mode=2: CLUB MI 추정기 (orth_loss 대체)
-            if disen_mode == 2:
+            # E22: VIB — z_t_text를 N(μ,σ²)로 reparameterize
+            if vib_beta > 0:
+                self.vib_mu     = nn.Conv1d(latent_dim, latent_dim, kernel_size=1)
+                self.vib_logvar = nn.Conv1d(latent_dim, latent_dim, kernel_size=1)
+                nn.init.zeros_(self.vib_logvar.weight)
+                nn.init.constant_(self.vib_logvar.bias, -5.0)  # 초기 σ ≈ 0.08 → 안정적 시작
+            # disen_mode=2: CLUB MI (orth 대체)
+            # disen_mode=3 + club_mi_weight>0: E20 orth+GRL+spk_cls + CLUB MI 조합
+            if disen_mode == 2 or (disen_mode == 3 and club_mi_weight > 0):
                 self.club = ClubGaussian(
                     x_dim=latent_dim, y_dim=latent_dim,
                     hidden_size=128, max_samples=2048,
@@ -496,6 +513,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             "spk_pros_orth_loss": torch.zeros((), device=s_bct.device),
             "pros_sup_loss":      torch.zeros((), device=s_bct.device),
             "f0_grl_loss":        torch.zeros((), device=s_bct.device),
+            "vib_kl_loss":        torch.zeros((), device=s_bct.device),
+            "cross_cov_loss":     torch.zeros((), device=s_bct.device),
+            "orth_recon_proj":    torch.zeros((), device=s_bct.device),
         }
 
         # ── disen_mode >= 1: 병렬 인코더 + 직교 제약 ──────────────
@@ -507,6 +527,17 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
             # Teacher 병렬 인코더
             z_t_text = self.enc_text_t(t_bct)          # (B, latent_dim, T)
+            if self.use_text_in:
+                z_t_text = F.instance_norm(z_t_text)   # 채널별 mean/var 제거 → speaker style 소거
+            if self.vib_beta > 0:
+                mu      = self.vib_mu(z_t_text)
+                log_var = self.vib_logvar(z_t_text)
+                if self.training:
+                    z_t_text = mu + torch.randn_like(mu) * torch.exp(0.5 * log_var)
+                else:
+                    z_t_text = mu
+                # KL(N(μ,σ²) ‖ N(0,I)) — Alemi et al. ICLR 2017 eq.(6)
+                out["vib_kl_loss"] = (-0.5 * (1 + log_var - mu.pow(2) - log_var.exp())).mean()
             # disen_mode=8,9: enc_nontxt_t replaces enc_spk_t; placeholder overridden in mode block
             z_t_spk  = self.enc_spk_t(t_bct) if self.disen_mode not in (8, 9) else z_t_text.detach()
             z_t_text_d = z_t_text.detach()
@@ -627,14 +658,44 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                         z_t_pros.mean(dim=2), pros_target
                     )
             else:
-                out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text + z_t_spk), t_bct)
+                if self.orth_recon and self.disen_mode in (3, 4):
+                    # E24: Gram-Schmidt — z_t_text에서 z_t_spk 방향 성분 제거 후 recon
+                    # recon gradient가 z_t_text를 speaker 방향으로 밀 수 없도록 구조적으로 차단
+                    # ∂L_recon/∂z_t_text = (I - û_spk û_spk^T) · ∂L/∂z_t_text_orth
+                    # Ravfogel et al. ACL 2020 (INLP) null-space projection 개념 동적 적용
+                    spk_unit      = z_t_spk / (z_t_spk.norm(dim=1, keepdim=True) + 1e-8)
+                    proj          = (z_t_text * spk_unit).sum(dim=1, keepdim=True) * spk_unit
+                    z_t_text_recon = z_t_text - proj
+                    out["orth_recon_proj"] = proj.norm(dim=1).mean()  # 제거된 speaker 성분 크기 모니터링
+                else:
+                    z_t_text_recon = z_t_text
+                out["recon_loss"] = self.recon_crit(self.lat_dec(z_t_text_recon + z_t_spk), t_bct)
                 if self.disen_mode == 1:
                     out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
                 elif self.disen_mode == 2:
-                    out["club_mi_loss"]  = layer_disen_w * self.club.mi_upper(z_t_text, z_t_spk, K=8)
+                    # E19: Stage 1에선 ll_loss만 실행 → variational net q 워밍업
+                    # Stage 2부터 mi_upper 추가 (q 수렴 후 MI 최소화)
+                    in_stage1_club = self.stage1_epochs > 0 and self.current_epoch < self.stage1_epochs
+                    if not in_stage1_club:
+                        out["club_mi_loss"] = layer_disen_w * self.club.mi_upper(z_t_text, z_t_spk, K=8)
                     out["club_lll_loss"] = layer_disen_w * self.club.ll_loss(z_t_text, z_t_spk)
                 elif self.disen_mode in (3, 4):
                     out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                    if self.cross_cov_weight > 0:
+                        # utterance-level cross-covariance (B, D) — speaker info is utterance-level
+                        zt = z_t_text.mean(dim=2)          # (B, D)
+                        zs = z_t_spk.mean(dim=2)           # (B, D)
+                        zt = (zt - zt.mean(0)) / (zt.std(0) + 1e-5)
+                        zs = (zs - zs.mean(0)) / (zs.std(0) + 1e-5)
+                        # cross-covariance matrix (D, D), normalized by D
+                        # Barlow Twins / VICReg style: minimize all pairwise correlations
+                        C = (zt.T @ zs) / (zt.shape[0] - 1)   # (D, D)
+                        out["cross_cov_loss"] = layer_disen_w * C.pow(2).sum() / zt.shape[1]
+                    if self.club_mi_weight > 0 and hasattr(self, "club"):
+                        in_stage1_club = self.stage1_epochs > 0 and self.current_epoch < self.stage1_epochs
+                        if not in_stage1_club:
+                            out["club_mi_loss"] = layer_disen_w * self.club.mi_upper(z_t_text, z_t_spk, K=8)
+                        out["club_lll_loss"] = layer_disen_w * self.club.ll_loss(z_t_text, z_t_spk)
 
             # Speaker classifier (teacher spk latent, all disen modes)
             if spk_id is not None:
@@ -882,6 +943,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         spk_pros_orth_sum = torch.zeros((), device=log_probs.device)
         pros_sup_sum      = torch.zeros((), device=log_probs.device)
         f0_grl_sum        = torch.zeros((), device=log_probs.device)
+        vib_kl_sum        = torch.zeros((), device=log_probs.device)
+        cross_cov_sum     = torch.zeros((), device=log_probs.device)
+        orth_recon_proj_sum = torch.zeros((), device=log_probs.device)
         num_layers = len(self.stu_feats)
         k = self.kd_top_k if self.kd_top_k > 0 else num_layers
         stu_feats_sel = self.stu_feats[-k:]
@@ -911,6 +975,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             spk_pros_orth_sum += losses["spk_pros_orth_loss"]
             pros_sup_sum      += losses["pros_sup_loss"]
             f0_grl_sum        += losses["f0_grl_loss"]
+            vib_kl_sum          += losses["vib_kl_loss"]
+            cross_cov_sum       += losses["cross_cov_loss"]
+            orth_recon_proj_sum += losses["orth_recon_proj"]
 
         # 5) 총 loss
         # E10: stage1_epochs 동안 CTC loss 제외 (feature pre-initialization)
@@ -925,7 +992,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + fm_pre_sum + fm_post_sum
             + self.orth_weight * orth_sum
             + self.spk_cls_weight * spk_cls_sum
-            + self.orth_weight * club_mi_sum   # club_mi도 orth_weight 재사용
+            + self.club_mi_weight * club_mi_sum
             + club_lll_sum                     # variational net 학습, 별도 weight 없음
             + self.grl_weight * grl_sum
             + self.grl_s_weight * grl_s_sum
@@ -935,6 +1002,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + self.pros_sup_weight  * pros_sup_sum
             + self.pros_sup_weight  * pros_sup_loss_6
             + self.grl_weight       * f0_grl_sum
+            + self.vib_beta         * vib_kl_sum
+            + self.cross_cov_weight * cross_cov_sum
         )
 
         # 6) 로깅
@@ -950,6 +1019,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("v/spk_cls",    spk_cls_sum,  on_step=True, on_epoch=True)
         self.log("v/club_mi",    club_mi_sum,  on_step=True, on_epoch=True)
         self.log("v/club_lll",   club_lll_sum, on_step=True, on_epoch=True)
+        self.log("v/vib_kl",          vib_kl_sum,         on_step=True, on_epoch=True)
+        self.log("v/cross_cov",       cross_cov_sum,      on_step=True, on_epoch=True)
+        self.log("v/orth_recon_proj", orth_recon_proj_sum, on_step=True, on_epoch=True)
         self.log("v/grl",        grl_sum,      on_step=True, on_epoch=True)
         self.log("v/grl_s",      grl_s_sum,    on_step=True, on_epoch=True)
         self.log("v/crd",        crd_sum,       on_step=True, on_epoch=True)
@@ -1014,6 +1086,8 @@ def main():
                    help="0=E1, 1=orth+spk_cls, 2=CLUB MI, 3=orth+GRL(teacher), "
                         "4=orth+GRL(teacher+student), 5=3-way+F0stats, 6=3-way+GPRE+F0seq")
     p.add_argument("--orth_weight",    type=float, default=1.0)
+    p.add_argument("--club_mi_weight", type=float, default=0.1,
+                   help="CLUB MI upper bound loss weight (disen_mode=2: orth 대체, disen_mode=3: orth에 추가)")
     p.add_argument("--spk_cls_weight", type=float, default=1.0)
     p.add_argument("--grl_weight",     type=float, default=1.0)
     p.add_argument("--grl_alpha",      type=float, default=0.1,
@@ -1039,6 +1113,14 @@ def main():
                    help="Two-stage training: stage1 동안 CTC loss 제외 (default 0=비활성화, E10a=20, E10b=30)")
 
     # 3-way prosody disentanglement (disen_mode=5)
+    p.add_argument("--use_text_in",      type=str2bool, default=False,
+                   help="E21: z_t_text에 InstanceNorm1d 적용 → 화자 채널 통계 제거")
+    p.add_argument("--vib_beta",         type=float,    default=0.0,
+                   help="E22: VIB KL penalty weight β (Alemi et al., ICLR 2017). 0=비활성화")
+    p.add_argument("--cross_cov_weight", type=float,    default=0.0,
+                   help="E23: Cross-covariance decorrelation weight (Barlow Twins/VICReg style). 0=비활성화")
+    p.add_argument("--orth_recon",       type=lambda x: x.lower() == "true", default=False,
+                   help="E24: recon 경로에서 Gram-Schmidt로 z_t_text의 speaker 방향 제거 (Ravfogel ACL 2020 INLP)")
     p.add_argument("--pros_orth_weight", type=float, default=1.0,
                    help="text⊥pros + spk⊥pros orth loss 가중치 (disen_mode=5)")
     p.add_argument("--pros_sup_weight",  type=float, default=1.0,
@@ -1211,6 +1293,7 @@ def main():
         disen_mode=args.disen_mode,
         num_spk=num_spk,
         orth_weight=args.orth_weight,
+        club_mi_weight=args.club_mi_weight,
         spk_cls_weight=args.spk_cls_weight,
         grl_weight=args.grl_weight,
         grl_alpha=args.grl_alpha,
@@ -1224,6 +1307,10 @@ def main():
         stage1_epochs=args.stage1_epochs,
         pros_orth_weight=args.pros_orth_weight,
         pros_sup_weight=args.pros_sup_weight,
+        use_text_in=args.use_text_in,
+        vib_beta=args.vib_beta,
+        cross_cov_weight=args.cross_cov_weight,
+        orth_recon=args.orth_recon,
         n_mels=getattr(teacher.cfg.preprocessor, "features", 80),
     )
 
