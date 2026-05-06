@@ -22,6 +22,10 @@
 # E24: orth_recon=True  (recon gradient 차단)
 # E25: orth_recon=True + cosine_orth=True  (orth 자체도 크기 우회 불가)
 # → recon gradient + orth gradient 양쪽 모두 speaker 방향 강화 불가
+#
+# ── orth_weight=100 근거 ────────────────────────────────────────────────────
+# cosine orth loss ∈ [0, 1]이므로 raw orth (E10c 기준 ~5.47)와 gradient 스케일 맞추려면
+# orth_weight를 100배 올려야 comparable한 regularization 강도 유지
 
 CUDA_VISIBLE_DEVICES=0 python train_grp_kd.py \
   --wandb_run grp_kd_E25_cosine_orth \
@@ -43,7 +47,7 @@ CUDA_VISIBLE_DEVICES=0 python train_grp_kd.py \
   --flow_steps 8 \
   --kd_loss_type mse \
   --disen_mode 3 \
-  --orth_weight 1.0 \
+  --orth_weight 100.0 \
   --spk_cls_weight 1.0 \
   --grl_weight 1.0 \
   --grl_alpha 0.1 \
