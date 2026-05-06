@@ -300,6 +300,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         vib_beta: float = 0.0,
         cross_cov_weight: float = 0.0,
         orth_recon: bool = False,
+        cosine_orth: bool = False,
         n_mels: int = 80,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -336,6 +337,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.vib_beta          = vib_beta
         self.cross_cov_weight  = cross_cov_weight
         self.orth_recon        = orth_recon
+        self.cosine_orth       = cosine_orth
 
         self.recon_crit = nn.MSELoss()
         self.kd_crit    = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
@@ -680,7 +682,14 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                         out["club_mi_loss"] = layer_disen_w * self.club.mi_upper(z_t_text, z_t_spk, K=8)
                     out["club_lll_loss"] = layer_disen_w * self.club.ll_loss(z_t_text, z_t_spk)
                 elif self.disen_mode in (3, 4):
-                    out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
+                    if self.cosine_orth:
+                        # E25: cos²(θ) — 크기 우회 불가, 방향만 제어
+                        # Wang et al. NeurIPS 2020 (unit hypersphere), Schroff et al. CVPR 2015 (FaceNet)
+                        zt_n = z_t_text / (z_t_text.norm(dim=1, keepdim=True) + 1e-8)
+                        zs_n = z_t_spk  / (z_t_spk.norm(dim=1,  keepdim=True) + 1e-8)
+                        out["orth_loss"] = layer_disen_w * (zt_n * zs_n).sum(dim=1).pow(2).mean()
+                    else:
+                        out["orth_loss"] = layer_disen_w * (z_t_text * z_t_spk).sum(dim=1).pow(2).mean()
                     if self.cross_cov_weight > 0:
                         # utterance-level cross-covariance (B, D) — speaker info is utterance-level
                         zt = z_t_text.mean(dim=2)          # (B, D)
@@ -1121,6 +1130,8 @@ def main():
                    help="E23: Cross-covariance decorrelation weight (Barlow Twins/VICReg style). 0=비활성화")
     p.add_argument("--orth_recon",       type=lambda x: x.lower() == "true", default=False,
                    help="E24: recon 경로에서 Gram-Schmidt로 z_t_text의 speaker 방향 제거 (Ravfogel ACL 2020 INLP)")
+    p.add_argument("--cosine_orth",      type=lambda x: x.lower() == "true", default=False,
+                   help="E25: orth loss를 cos²(θ)로 교체 — 벡터 크기 우회 차단 (Wang NeurIPS 2020)")
     p.add_argument("--pros_orth_weight", type=float, default=1.0,
                    help="text⊥pros + spk⊥pros orth loss 가중치 (disen_mode=5)")
     p.add_argument("--pros_sup_weight",  type=float, default=1.0,
@@ -1311,6 +1322,7 @@ def main():
         vib_beta=args.vib_beta,
         cross_cov_weight=args.cross_cov_weight,
         orth_recon=args.orth_recon,
+        cosine_orth=args.cosine_orth,
         n_mels=getattr(teacher.cfg.preprocessor, "features", 80),
     )
 
