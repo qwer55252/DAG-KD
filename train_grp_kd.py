@@ -301,6 +301,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         cross_cov_weight: float = 0.0,
         orth_recon: bool = False,
         cosine_orth: bool = False,
+        stage2_orth_weight: float = -1.0,
+        stage2_grl_weight: float = -1.0,
         n_mels: int = 80,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -337,6 +339,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.vib_beta          = vib_beta
         self.cross_cov_weight  = cross_cov_weight
         self.orth_recon        = orth_recon
+        # stage2_orth/grl_weight: -1이면 stage1과 동일한 값 사용 (E10c 호환)
+        self.stage2_orth_weight = orth_weight if stage2_orth_weight < 0 else stage2_orth_weight
+        self.stage2_grl_weight  = grl_weight  if stage2_grl_weight  < 0 else stage2_grl_weight
         self.cosine_orth       = cosine_orth
 
         self.recon_crit = nn.MSELoss()
@@ -992,6 +997,9 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # E10: stage1_epochs 동안 CTC loss 제외 (feature pre-initialization)
         in_stage1 = self.stage1_epochs > 0 and self.current_epoch < self.stage1_epochs
         self.log("v/in_stage1", float(in_stage1), on_step=False, on_epoch=True)
+        # E26: stage에 따라 orth/grl 가중치 분기 (-1이면 stage1과 동일값 사용)
+        eff_orth_weight = self.orth_weight     if in_stage1 else self.stage2_orth_weight
+        eff_grl_weight  = self.grl_weight      if in_stage1 else self.stage2_grl_weight
         total_loss = (
             (torch.tensor(0.0, device=log_probs.device) if in_stage1 else ctc_loss)
             + self.kd_alpha * logit_kd_loss
@@ -999,18 +1007,18 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + recon_sum
             + kd_pre_sum + kd_post_sum
             + fm_pre_sum + fm_post_sum
-            + self.orth_weight * orth_sum
+            + eff_orth_weight * orth_sum
             + self.spk_cls_weight * spk_cls_sum
             + self.club_mi_weight * club_mi_sum
             + club_lll_sum                     # variational net 학습, 별도 weight 없음
-            + self.grl_weight * grl_sum
+            + eff_grl_weight * grl_sum
             + self.grl_s_weight * grl_s_sum
             + self.crd_weight * crd_sum
             + self.pros_orth_weight * pros_orth_sum
             + self.pros_orth_weight * spk_pros_orth_sum
             + self.pros_sup_weight  * pros_sup_sum
             + self.pros_sup_weight  * pros_sup_loss_6
-            + self.grl_weight       * f0_grl_sum
+            + eff_grl_weight        * f0_grl_sum
             + self.vib_beta         * vib_kl_sum
             + self.cross_cov_weight * cross_cov_sum
         )
@@ -1120,6 +1128,10 @@ def main():
                    help="상위 K개 레이어만 KD에 사용 (default 0=전체, E9: 4)")
     p.add_argument("--stage1_epochs",   type=int,   default=0,
                    help="Two-stage training: stage1 동안 CTC loss 제외 (default 0=비활성화, E10a=20, E10b=30)")
+    p.add_argument("--stage2_orth_weight", type=float, default=-1.0,
+                   help="E26: Stage2에서 사용할 orth_weight (-1=stage1과 동일, E26=0.1)")
+    p.add_argument("--stage2_grl_weight",  type=float, default=-1.0,
+                   help="E26: Stage2에서 사용할 grl_weight  (-1=stage1과 동일, E26=0.1)")
 
     # 3-way prosody disentanglement (disen_mode=5)
     p.add_argument("--use_text_in",      type=str2bool, default=False,
@@ -1323,6 +1335,8 @@ def main():
         cross_cov_weight=args.cross_cov_weight,
         orth_recon=args.orth_recon,
         cosine_orth=args.cosine_orth,
+        stage2_orth_weight=args.stage2_orth_weight,
+        stage2_grl_weight=args.stage2_grl_weight,
         n_mels=getattr(teacher.cfg.preprocessor, "features", 80),
     )
 
