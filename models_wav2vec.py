@@ -362,7 +362,10 @@ class GRPKDModule(nn.Module):
             # Speaker classifier on z_t_spk
             if speaker_ids is not None:
                 spk_logits = self.spk_cls(z_t_spk)
-                L_spk_cls_list.append(F.cross_entropy(spk_logits, speaker_ids))
+                valid_mask = (speaker_ids >= 0) & (speaker_ids < spk_logits.size(-1))
+                if valid_mask.any():
+                    targets = speaker_ids[valid_mask].long()
+                    L_spk_cls_list.append(F.cross_entropy(spk_logits[valid_mask], targets))
 
             # FM(pre) on text subspace
             fm_loss, _ = self.fm_latent(z_s_text, z_t_text_d, steps=self.fm_steps)

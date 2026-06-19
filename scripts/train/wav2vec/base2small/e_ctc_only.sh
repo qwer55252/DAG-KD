@@ -4,7 +4,7 @@
 # Student: wav2vec2-base config, random init, hidden=384, heads=6, ffn=1536 (~24M)
 # GPU: 0
 
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 
 OUT=outputs/wav2vec/base2small/e_ctc_only
 mkdir -p "$OUT"

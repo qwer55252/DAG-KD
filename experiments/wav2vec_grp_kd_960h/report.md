@@ -96,3 +96,74 @@ Sequential 단독 실행 (each run uses all 4 GPUs):
 - `scripts/train/wav2vec/grp_kd_960h/A_E1_kd.sh`
 - `scripts/train/wav2vec/grp_kd_960h/A_E2_kd_orth.sh`
 - `scripts/train/wav2vec/grp_kd_960h/dry_run_100h.sh` (개발용)
+
+## 9. 2026-05-27 재개 상태
+
+- A-E0는 `outputs/wav2vec/grp_kd_960h/A_E0_no_kd/checkpoints/last.ckpt`에서 재개.
+- 실행 세션: `tmux attach -t dagkd_A_E0_960h`
+- 재개 직후 확인: `Epoch 5` 학습 루프 진입, 4 GPU 사용 확인.
+- A-E1/A-E2는 A-E0의 final 4-split eval 확인 후 순차 실행.
+- A-E0/A-E1/A-E2 스크립트는 checkpoint가 있으면 `--resume_ckpt_path`를 자동 전달하고 `train.log`에 append하도록 수정.
+
+## 10. 2026-05-28 A-E0 완료 결과
+
+| Split | WER |
+| --- | ---: |
+| dev_clean | 4.63% |
+| dev_other | 12.55% |
+| test_clean | 4.82% |
+| test_other | 13.50% |
+
+- A-E0는 `max_epochs=10`까지 정상 완료.
+- clean 기준 single-digit 목표는 달성. `test_clean <= 5%` 기준으로 후속 A-E1 실행 조건 충족.
+- 다음 실행: A-E1 (`CTC + logit-KD + GRP-KD`, `grp_disen_mode=0`).
+
+## 11. 2026-05-28 A-E1 실행 상태
+
+- A-E1 실행 시작: `tmux attach -t dagkd_A_E1_960h`
+- W&B run: `wav2vec_960h_A_E1_kd`
+- 1차 실행은 `batch_size=16`에서 teacher forward 중 GPU 0 OOM으로 중단.
+- 대응: `train_wav2vec.py`에 `--accumulate_grad_batches` 옵션 추가.
+- A-E1/A-E2는 `batch_size=8`, `accumulate_grad_batches=2`로 변경해 effective batch 64 유지.
+- 재실행 W&B run: `wav2vec_960h_A_E1_kd` (`a7tpmx9n`)
+- 재실행 초기 확인: sanity check 통과, `Epoch 0` 학습 루프 진입, 4 GPU 모두 사용 확인.
+
+## 12. 2026-06-02 A-E1 완료 결과
+
+| Split | A-E0 CTC | A-E1 GRP-KD | Delta |
+| --- | ---: | ---: | ---: |
+| dev_clean | 4.63% | 5.68% | +1.05 pp |
+| dev_other | 12.55% | 13.81% | +1.26 pp |
+| test_clean | 4.82% | 5.84% | +1.02 pp |
+| test_other | 13.50% | 14.81% | +1.31 pp |
+
+- A-E1는 `max_epochs=10`까지 정상 완료.
+- GRP-KD는 SSL-pretrained student + 960h CTC baseline 위에서 개선을 주지 못했고, 모든 split에서 WER가 악화.
+- 결정: 기존 분기 기준(`E0 -> E1 개선 >= 0.3 pp`)을 만족하지 못하므로 A-E2는 자동 launch하지 않음.
+- 해석: random-init/약한 student에서 유효했던 GRP-KD가 strong SSL student에는 과한 teacher constraint로 작동했을 가능성이 큼.
+
+## 13. 2026-06-02 A-E2 실행 상태
+
+- 사용자 요청으로 A-E2 (`CTC + logit-KD + GRP-KD + orth + speaker CE`) 실행.
+- 1차 A-E2 실행은 GRP-KD speaker classifier CE에서 `spk_idx=-1` label이 들어가 device-side assert로 실패.
+- 원인: train manifest에 `spk_idx=-1` 샘플이 다수 존재하고, GRP-KD E2 speaker CE에는 기존 DAG speaker CE와 달리 valid-mask가 없었음.
+- 수정:
+  - `ManifestDataset`에서 `spk_idx < 0`이면 인접한 `speaker_id_mapping.json`과 `spk_id`로 복구 시도.
+  - `GRPKDModule._forward_disen`에서 speaker CE를 `0 <= speaker_id < num_spk`인 샘플에만 적용.
+- 재실행 세션: `tmux attach -t dagkd_A_E2_960h`
+- W&B run: `wav2vec_960h_A_E2_kd_orth` (`b9eilghh`)
+- 재실행 초기 확인: sanity check 통과, `Epoch 0` 학습 루프 진입, 4 GPU 모두 사용 확인.
+
+## 14. 2026-06-04 A-E2 완료 결과
+
+| Split | A-E0 CTC | A-E1 GRP-KD | A-E2 GRP-KD+Orth | E2 - E0 | E2 - E1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dev_clean | 4.63% | 5.68% | 5.31% | +0.68 pp | -0.37 pp |
+| dev_other | 12.55% | 13.81% | 13.22% | +0.67 pp | -0.59 pp |
+| test_clean | 4.82% | 5.84% | 5.30% | +0.48 pp | -0.54 pp |
+| test_other | 13.50% | 14.81% | 13.81% | +0.31 pp | -1.00 pp |
+
+- A-E2는 `max_epochs=10`까지 정상 완료.
+- Orth + speaker CE는 A-E1 대비 모든 split에서 WER를 회복시킴.
+- 하지만 A-E0 CTC baseline 대비로는 여전히 모든 split에서 악화.
+- 해석: disentanglement는 GRP-KD의 손상을 완화하지만, strong SSL-pretrained student에서는 teacher-side GRP constraint 자체가 CTC fine-tuning보다 유리하지 않음.

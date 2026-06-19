@@ -1,5 +1,5 @@
 #!/bin/bash
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 # Track A / E2 — wav2vec2 GRP-KD + Orthogonal disentanglement (disen_mode=1)
 # A_E1 과 동일, grp_disen_mode=1 + orth + spk_cls 추가
 # per-layer teacher 병렬 인코더(z_t_text / z_t_spk), text subspace에만 FM+Diff KD

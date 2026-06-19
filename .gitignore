@@ -5,3 +5,5 @@ outputs/*
 *.pyc
 lightning_logs/*
 pretrained_weights/*
+.claude/
+CLAUDE_tmp.md

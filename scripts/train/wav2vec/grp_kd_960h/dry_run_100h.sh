@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dry-run: validate SSL student + 4-GPU DDP + batch=10 memory fit on 100h
 # (smaller scan_speakers cost than 960h, manifests already cached)
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 OUT=outputs/wav2vec/grp_kd_960h/_dry_run
 rm -rf "$OUT"; mkdir -p "$OUT"
 

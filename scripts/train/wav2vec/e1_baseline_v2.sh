@@ -1,13 +1,17 @@
 #!/bin/bash
 export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
-# e2_dag_kd: Random init student + CTC + LogitKD + Disentanglement (DAG-KD 제안 방법)
-# v2: phys_loss_lambda=1e-3 추가 (이전 실패 원인: raw f0/energy MSE가 ~1300 폭주 → fix)
-OUT=outputs/wav2vec/e2_dag_kd_v2
+# wav2vec2 E1-v2: Baseline (조건 재통제)
+# 변경 사항 (vs e1_baseline):
+#   - learning_rate: 3e-4 → 1e-4  (E0-S와 동일하게 맞춤)
+#   - freeze_feature_extractor: (없음) → True  (E0-S와 동일하게 맞춤)
+#   - warmup_epochs: (없음) → 5
+# 목적: E0-S(5.84%)와 동일 조건에서 Logit KD의 순효과 측정
+OUT=outputs/wav2vec/e1_baseline_v2
 mkdir -p "$OUT"
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --wandb_project DAG-KD-wav2vec \
-  --wandb_run wav2vec_e2_dag_kd_v2 \
+  --wandb_run wav2vec_e1_baseline_v2 \
   --out "$OUT" \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
@@ -16,7 +20,6 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --test_split test.clean \
   --teacher_name facebook/wav2vec2-large-960h \
   --student_name facebook/wav2vec2-base-960h \
-  --random_init_student True \
   --use_ctc True \
   --use_logit_kd True \
   --kd_alpha 0.5 \
@@ -24,17 +27,12 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --use_layer_kd False \
   --use_flow False \
   --use_diffkd False \
-  --use_disent True \
-  --tch_spk_layers "8" \
-  --tch_txt_layers "24" \
-  --stu_spk_layers "4" \
-  --stu_txt_layers "12" \
-  --use_txt_spk_probe True \
-  --phys_loss_lambda 1e-3 \
-  --batch_size 4 \
+  --use_disent False \
+  --use_txt_spk_probe False \
+  --batch_size 8 \
   --epochs 100 \
   --gpus 4 \
   --learning_rate 1e-4 \
   --warmup_epochs 5 \
-  --kd_warmup_epochs 10 \
+  --freeze_feature_extractor True \
   2>&1 | tee "$OUT/train.log"

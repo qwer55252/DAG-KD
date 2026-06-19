@@ -55,10 +55,23 @@ class ManifestDataset(torch.utils.data.Dataset):
         self.processor = processor
         self.sample_rate = sample_rate
         self.data: List[Dict] = []
+        spk2idx = {}
+        spk_map_path = os.path.join(os.path.dirname(manifest_path), "speaker_id_mapping.json")
+        if os.path.isfile(spk_map_path):
+            with open(spk_map_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            spk2idx = {int(k): int(v) for k, v in payload.get("spk2idx", {}).items()}
         with open(manifest_path, "r", encoding="utf-8") as f:
             for idx, line in enumerate(f):
                 obj = json.loads(line.strip())
                 obj["_dataset_idx"] = idx
+                if int(obj.get("spk_idx", -1)) < 0 and spk2idx:
+                    try:
+                        raw_spk = int(obj.get("spk_id", -1))
+                    except Exception:
+                        raw_spk = -1
+                    if raw_spk in spk2idx:
+                        obj["spk_idx"] = spk2idx[raw_spk]
                 self.data.append(obj)
 
     def __len__(self):
@@ -316,6 +329,7 @@ def main():
     # Logging/ckpt
     p.add_argument("--epochs",         type=int,      default=100)
     p.add_argument("--gpus",           type=int,      default=1)
+    p.add_argument("--accumulate_grad_batches", type=int, default=1)
     p.add_argument("--out",            type=str,      default="outputs")
     p.add_argument("--resume_ckpt_path", type=str,    default="")
 
@@ -463,13 +477,20 @@ def main():
         except Exception as e:
             print(f"[WARN] could not load split '{split_name}': {e}")
 
-    # ---- Speaker scan ----
-    print("[INFO] scanning speakers from train split...")
-    spk2idx, idx2spk = scan_speakers(train_ds)
-    num_spk = len(spk2idx)
-    print(f"[SCAN] num_speakers={num_spk}")
+    # ---- Speaker scan (load cached mapping if available; iterating HF ds is slow for 960h) ----
     spk_map_path = os.path.join(manifest_dir, "speaker_id_mapping.json")
-    if not os.path.isfile(spk_map_path):
+    if os.path.isfile(spk_map_path):
+        with open(spk_map_path) as f:
+            _m = json.load(f)
+        spk2idx = {int(k): int(v) for k, v in _m["spk2idx"].items()}
+        idx2spk = {int(k): int(v) for k, v in _m["idx2spk"].items()}
+        num_spk = int(_m.get("num_speakers", len(spk2idx)))
+        print(f"[SCAN] loaded cached speaker mapping: num_speakers={num_spk}")
+    else:
+        print("[INFO] scanning speakers from train split...")
+        spk2idx, idx2spk = scan_speakers(train_ds)
+        num_spk = len(spk2idx)
+        print(f"[SCAN] num_speakers={num_spk}")
         save_speaker_mapping(spk2idx, idx2spk, spk_map_path)
 
     # ---- Manifest 생성 ----
@@ -516,19 +537,22 @@ def main():
         dev_clean_manifest = tm_val
         test_clean_manifest = tm_test
 
-    # ---- Phys cache 생성 ----
+    # ---- Phys cache 생성 (use_disent=True일 때만 필요) ----
     HOP_MS = 10.0
     WIN_MS = 25.0
     SR = args.sample_rate
-    print(f"[INFO] building phys_cache in {phys_cache_root}")
-    if args.test_mode:
-        build_phys_cache_for_manifest(train_manifest, "test_mode_train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-        build_phys_cache_for_manifest(dev_clean_manifest, "test_mode_val", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-        build_phys_cache_for_manifest(test_clean_manifest, "test_mode_test", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+    if args.use_disent:
+        print(f"[INFO] building phys_cache in {phys_cache_root}")
+        if args.test_mode:
+            build_phys_cache_for_manifest(train_manifest, "test_mode_train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+            build_phys_cache_for_manifest(dev_clean_manifest, "test_mode_val", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+            build_phys_cache_for_manifest(test_clean_manifest, "test_mode_test", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        else:
+            build_phys_cache_for_manifest(train_manifest, "train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+            build_phys_cache_for_manifest(dev_clean_manifest, "dev_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+            build_phys_cache_for_manifest(test_clean_manifest, "test_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
     else:
-        build_phys_cache_for_manifest(train_manifest, "train", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-        build_phys_cache_for_manifest(dev_clean_manifest, "dev_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
-        build_phys_cache_for_manifest(test_clean_manifest, "test_clean", phys_cache_root=phys_cache_root, HOP_MS=HOP_MS, WIN_MS=WIN_MS, SR=SR)
+        print(f"[INFO] skipping phys_cache build (use_disent=False)")
 
     # ---- Processor (tokenizer + feature extractor) ----
     processor_name = args.processor_name if args.processor_name else args.student_name
@@ -555,6 +579,7 @@ def main():
         logger=wandb,
         callbacks=[ckpt_cb],
         gradient_clip_val=1.0,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
 
     # ---- 모델 ----

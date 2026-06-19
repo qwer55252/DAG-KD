@@ -1,5 +1,5 @@
 #!/bin/bash
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 # Track A / E1 — wav2vec2 GRP-KD baseline (disen_mode=0)
 # Teacher: wav2vec2-large-960h (24L, d=1024)
 # Student: wav2vec2-base-960h  (12L, d=768), random-init transformer + pretrained+frozen CNN
