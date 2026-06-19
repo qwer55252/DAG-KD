@@ -3,7 +3,7 @@
 # Track A (large→base), latent에서 speaker info 제거 (GRL).
 # vs C_E1 → adversarial 단독 효과.
 # GPU: $CUDA_VISIBLE_DEVICES (default 2,3)
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 
 OUT=outputs/wav2vec/grp_kd_disen_v1/C_E2_speaker_adv
 mkdir -p "$OUT"

@@ -3,7 +3,7 @@
 # Track A (large→base). E2 + E3 두 메커니즘 모두 적용.
 # vs C_E2/C_E3 → 두 메커니즘의 시너지 / 중복 검증.
 # GPU: $CUDA_VISIBLE_DEVICES (default 2,3)
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 
 OUT=outputs/wav2vec/grp_kd_disen_v1/C_E4_full
 mkdir -p "$OUT"
