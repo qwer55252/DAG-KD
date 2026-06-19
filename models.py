@@ -369,6 +369,15 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.spk_enc = nn.Conv1d(self.dim_t, self.latent_dim, kernel_size=1) # (B, 96, T)
         self.spk_dec = nn.Conv1d(self.latent_dim, self.dim_t, kernel_size=1) # (B, 96, T)
 
+        # Cross-Reconstruction Decoder: txt_emb + spk_emb → teacher last layer (DRIT/MUNIT 방식)
+        # use_cross_recon=True 일 때만 사용; False면 기존 trivial AE 경로 유지
+        self.cross_dec = nn.Conv1d(self.latent_dim, self.dim_t, kernel_size=1) # (B, dim_t, T)
+        self.use_cross_recon = bool(getattr(cfg, "use_cross_recon", False))
+
+        # Physical quantity normalization 플래그
+        # use_phys_norm=True: f0/energy z-score, voicing BCE / False: 기존 MSE 전체
+        self.use_phys_norm = bool(getattr(cfg, "use_phys_norm", False))
+
         # Speaker classifier (파란 박스 - teacher speaker embedding CE)
         self.num_spk = getattr(cfg, "num_spk", 0)
         if self.num_spk > 1:
@@ -986,6 +995,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         else:
             rec_spk = torch.tensor(0.0, device=spk_emb.device)
 
+        # ----- Optional Cross Reconstruction Loss -----
+        if self.use_cross_recon:
+            # Cross-Reconstruction (DRIT/MUNIT): txt_emb + spk_emb → teacher last layer
+            # 두 embedding의 합으로 teacher representation을 복원해야 분리가 의미 있음
+            rec_cross = F.mse_loss(self.cross_dec(txt_emb + spk_emb), last)
+            rec_txt = rec_cross
+            rec_spk = torch.zeros(1, device=txt_emb.device)
+
         # ====== Speaker static (B,96) 만들기 ======
         # backbone 통과 후 stats pooling 추천
         # TODO: backbone이 아니라 그냥 바로 spk_emb에서 스피커 예측하도록 하는게 좋을 듯?
@@ -1022,7 +1039,14 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 phys_pred = self.prosody_predictor(pros_emb)
                 if phys_pred.size(-1) != phys_targets.size(-1):
                     phys_pred = F.interpolate(phys_pred, size=phys_targets.size(-1), mode='linear', align_corners=False)
-                phys_loss = F.mse_loss(phys_pred, phys_targets)
+                if self.use_phys_norm:
+                    phys_loss_fe = F.mse_loss(phys_pred[:, :2, :], phys_targets[:, :2, :])
+                    phys_loss_vuv = F.binary_cross_entropy_with_logits(
+                        phys_pred[:, 2:, :], phys_targets[:, 2:, :]
+                    )
+                    phys_loss = phys_loss_fe + phys_loss_vuv
+                else:
+                    phys_loss = F.mse_loss(phys_pred, phys_targets)
         else:
             # Prosody 전체 비활성 — MI ts쌍만 사용됨
             pros_emb = None
@@ -1269,11 +1293,13 @@ class DistilDAGKDCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
             out_cpu[b] = phys
 
-        # TODO: 정규화 한 버전 vs 안 한 버전 비교하기
-        # (선택) 정규화: 기존과 동일하게 frame축 기준 z-score
-        # mean = out_cpu.mean(dim=-1, keepdim=True)
-        # std = out_cpu.std(dim=-1, keepdim=True).clamp_min(1e-5)
-        # out_cpu = (out_cpu - mean) / std
+        if self.use_phys_norm:
+            # 채널별 정규화: f0(ch0), energy(ch1)은 z-score (Hz/dB 스케일 차이 보정)
+            # voicing(ch2)은 0/1 이진값이므로 정규화 없이 그대로 유지 (BCE target)
+            mean = out_cpu[:, :2, :].mean(dim=-1, keepdim=True)
+            std = out_cpu[:, :2, :].std(dim=-1, keepdim=True).clamp_min(1e-5)
+            out_cpu[:, :2, :] = (out_cpu[:, :2, :] - mean) / std
+        # else: 정규화 없이 원본 값 그대로 사용 (기존 동작)
 
         # GPU로 한 번에 올림
         out = out_cpu.to(self.device, non_blocking=True)
