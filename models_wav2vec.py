@@ -149,6 +149,20 @@ class GRPTeacherAutoEncoder(nn.Module):
         return z_t, rec
 
 
+class GRPSpeakerClassifier(nn.Module):
+    """z_spk (B, latent_dim, T) → mean pool → fc → logits (B, num_spk).
+
+    Ported from train_grp_kd.py:215-223 (SpeakerClassifier).
+    """
+    def __init__(self, latent_dim: int, num_spk: int):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, num_spk)
+
+    def forward(self, z_spk_bct):
+        pooled = z_spk_bct.mean(dim=2)   # (B, latent_dim)
+        return self.fc(pooled)            # (B, num_spk)
+
+
 class GRPStudentProjector(nn.Module):
     """Student feature (B, C_s, T) → latent (B, L, T)"""
     def __init__(self, student_dim: int, latent_dim: int):
@@ -195,6 +209,7 @@ class GRPSimpleDenoiser(nn.Module):
         super().__init__()
         self.steps = steps
         self.use_speaker_cond = use_speaker_cond
+        self.num_spk = num_spk
         self.net = nn.Sequential(
             nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -216,7 +231,10 @@ class GRPSimpleDenoiser(nn.Module):
         """
         gamma = beta = None
         if self.use_speaker_cond and speaker_ids is not None:
-            spk_emb = self.spk_embed(speaker_ids)             # (B, spk_emb_dim)
+            valid = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+            safe_ids = speaker_ids.clamp(min=0, max=self.num_spk - 1).long()
+            spk_emb = self.spk_embed(safe_ids)                # (B, spk_emb_dim)
+            spk_emb = spk_emb * valid.to(spk_emb.dtype).unsqueeze(-1)
             film = self.film(spk_emb)                          # (B, 2*L)
             L = film.size(1) // 2
             gamma = film[:, :L].unsqueeze(-1)                  # (B, L, 1)
@@ -253,6 +271,7 @@ class GRPFlowMatchingModule(nn.Module):
         self.training_steps = training_steps
         self.use_speaker_cond = use_speaker_cond
         self.spk_emb_dim = spk_emb_dim if use_speaker_cond else 0
+        self.num_spk = num_spk
         self.time_embed = nn.Linear(1, time_embed_dim)
         if use_speaker_cond:
             assert num_spk > 0, "num_spk must be > 0 when use_speaker_cond=True"
@@ -282,7 +301,10 @@ class GRPFlowMatchingModule(nn.Module):
         if self.use_speaker_cond:
             if speaker_ids is not None:
                 # (B, spk_emb_dim) → broadcast to (B, T, spk_emb_dim)
-                spk_emb = self.spk_embed(speaker_ids)
+                valid = (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+                safe_ids = speaker_ids.clamp(min=0, max=self.num_spk - 1).long()
+                spk_emb = self.spk_embed(safe_ids)
+                spk_emb = spk_emb * valid.to(spk_emb.dtype).unsqueeze(-1)
                 spk_emb_bt = spk_emb.unsqueeze(1).expand(B, T, -1)
             else:
                 # Inference fallback: zero embedding
@@ -351,12 +373,9 @@ class GRPKDModule(nn.Module):
     """
     GRP-KD: Shared AutoEncoder + Flow Matching + Diffusion (version 4).
 
-    Ported from reference DistilFlowMatchingCTCModelBPE (version=4):
-      1. TeacherAE: z_t, t_rec = TAE(t_feat)  → L_rec = MSE(t_rec, t_feat)
-      2. Student proj: z_s = SProj(s_feat)
-      3. FM: L_FM = GRPFlowMatchingModule(z_s, z_t.detach())
-      4. Diffusion: z_noisy = NoiseAdapter(z_s); z_deno = Denoiser(z_noisy)
-                    L_DF = MSE(z_deno, z_t.detach())
+    disen_mode == 0 : E1 baseline — TeacherAE + StudentProjector (원본 ver4 그대로)
+    disen_mode >= 1 : E2 — 병렬 인코더(z_t_text / z_t_spk) + text-only KD + orth + SpkCls
+      ported from train_grp_kd.py:324-466.
 
     Teacher 24 layers → Student 12 layers: uniform stride alignment.
 
@@ -383,13 +402,17 @@ class GRPKDModule(nn.Module):
         spk_emb_dim: int = 64,
         spk_adv_alpha: float = 1.0,
         spk_adv_hidden: int = 256,
+        disen_mode: int = 0,
     ):
         super().__init__()
         self.fm_steps = fm_steps
         self.diff_steps = diff_steps
         self.use_speaker_adv = use_speaker_adv
         self.use_speaker_cond = use_speaker_cond
+        self.num_spk = num_spk
+        self.disen_mode = int(disen_mode)
 
+        # ── 공통 (E1에서만 쓰이지만 disen_mode=0 호환을 위해 항상 선언) ──
         self.tae = GRPTeacherAutoEncoder(teacher_dim, latent_dim)
         self.sproj = GRPStudentProjector(student_dim, latent_dim)
         self.adapter = GRPNoiseAdapter(latent_dim)
@@ -411,14 +434,32 @@ class GRPKDModule(nn.Module):
         else:
             self.spk_adv = None
 
-    def forward(self, tch_feats: list, stu_feats: list,
-                speaker_ids: torch.Tensor = None):
+        # ── E2 전용 (disen_mode >= 1) ──
+        if self.disen_mode >= 1:
+            # teacher 병렬 인코더 / decoder
+            self.enc_text_t = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+            self.enc_spk_t  = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+            self.proj_text_s = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
+            self.lat_dec = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
+            # speaker classifier on z_t_spk
+            self.spk_cls = GRPSpeakerClassifier(latent_dim=latent_dim, num_spk=num_spk)
+
+    def forward(self, tch_feats: list, stu_feats: list, speaker_ids: torch.Tensor = None):
         """
-        반환:
-          - (L_rec, L_fm, L_df, L_spk_adv, spk_acc)  if use_speaker_adv
-          - (L_rec, L_fm, L_df)                       otherwise
+        disen_mode == 0 반환:
+          - (L_rec, L_fm, L_df, L_spk_adv, spk_acc) if use_speaker_adv
+          - (L_rec, L_fm, L_df) otherwise
+        disen_mode >= 1 반환: (L_rec, L_fm, L_df, L_orth, L_spk_cls)
         """
         pairs = self._align_layers(tch_feats, stu_feats)
+        if self.disen_mode == 0:
+            return self._forward_baseline(pairs, speaker_ids=speaker_ids)
+        return self._forward_disen(pairs, speaker_ids=speaker_ids)
+
+    def _valid_speaker_mask(self, speaker_ids: torch.Tensor) -> torch.Tensor:
+        return (speaker_ids >= 0) & (speaker_ids < self.num_spk)
+
+    def _forward_baseline(self, pairs, speaker_ids=None):
         L_rec_list, L_fm_list, L_df_list = [], [], []
         L_spk_adv_list, spk_acc_list = [], []
 
@@ -436,9 +477,12 @@ class GRPKDModule(nn.Module):
             # 1-b. Speaker adversarial on z_t (gradient는 GRL을 통해 z_t에 흘러감)
             if self.use_speaker_adv and speaker_ids is not None:
                 spk_logits = self.spk_adv(z_t)             # (B, num_spk)
-                L_spk_adv_list.append(F.cross_entropy(spk_logits, speaker_ids))
-                spk_pred = spk_logits.argmax(dim=-1)
-                spk_acc_list.append((spk_pred == speaker_ids).float().mean())
+                valid_mask = self._valid_speaker_mask(speaker_ids)
+                if valid_mask.any():
+                    targets = speaker_ids[valid_mask].long()
+                    L_spk_adv_list.append(F.cross_entropy(spk_logits[valid_mask], targets))
+                    spk_pred = spk_logits[valid_mask].argmax(dim=-1)
+                    spk_acc_list.append((spk_pred == targets).float().mean())
 
             z_t_stop = z_t.detach()   # z_t used as fixed target for FM and DF
 
@@ -464,6 +508,59 @@ class GRPKDModule(nn.Module):
             spk_acc = torch.stack(spk_acc_list).mean()
             return L_rec, L_fm, L_df, L_spk_adv, spk_acc
         return L_rec, L_fm, L_df
+
+    def _forward_disen(self, pairs, speaker_ids=None):
+        """E2: per-layer enc_text_t/enc_spk_t 로 분리 → text subspace에만 FM+Diff."""
+        L_rec_list, L_fm_list, L_df_list = [], [], []
+        L_orth_list, L_spk_cls_list = [], []
+
+        for x_t_raw, x_s in pairs:
+            # Align time dimension
+            if x_t_raw.size(-1) != x_s.size(-1):
+                x_t_raw = F.interpolate(
+                    x_t_raw, size=x_s.size(-1), mode="linear", align_corners=False
+                )
+
+            # Teacher 병렬 인코더
+            z_t_text = self.enc_text_t(x_t_raw)
+            z_t_spk  = self.enc_spk_t(x_t_raw)
+            z_t_text_d = z_t_text.detach()
+
+            # Recon: (z_t_text + z_t_spk) → teacher feature
+            L_rec_list.append(F.mse_loss(self.lat_dec(z_t_text + z_t_spk), x_t_raw.detach()))
+
+            # Student text-only projection
+            z_s_text = self.proj_text_s(x_s)
+
+            # Orthogonal disentanglement
+            L_orth_list.append((z_t_text * z_t_spk).sum(dim=1).pow(2).mean())
+
+            # Speaker classifier on z_t_spk
+            if speaker_ids is not None:
+                spk_logits = self.spk_cls(z_t_spk)
+                valid_mask = (speaker_ids >= 0) & (speaker_ids < spk_logits.size(-1))
+                if valid_mask.any():
+                    targets = speaker_ids[valid_mask].long()
+                    L_spk_cls_list.append(F.cross_entropy(spk_logits[valid_mask], targets))
+
+            # FM(pre) on text subspace
+            fm_loss, _ = self.fm_latent(z_s_text, z_t_text_d, steps=self.fm_steps)
+            L_fm_list.append(fm_loss)
+
+            # Diffusion on text subspace
+            z_noisy, _ = self.adapter(z_s_text)
+            z_deno = self.denoiser(z_noisy)
+            L_df_list.append(F.mse_loss(z_deno, z_t_text_d))
+
+        L_rec  = torch.stack(L_rec_list).mean()
+        L_fm   = torch.stack(L_fm_list).mean()
+        L_df   = torch.stack(L_df_list).mean()
+        L_orth = torch.stack(L_orth_list).mean()
+        if L_spk_cls_list:
+            L_spk_cls = torch.stack(L_spk_cls_list).mean()
+        else:
+            L_spk_cls = L_rec.new_zeros(())
+        return L_rec, L_fm, L_df, L_orth, L_spk_cls
 
     def _align_layers(self, tch_feats, stu_feats):
         """Uniform stride alignment: teacher 24 → student 12 layers."""
@@ -765,6 +862,10 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         spk_adv_weight: float = 0.1,
         spk_emb_dim: int = 64,
         spk_adv_alpha: float = 1.0,
+        # GRP-KD disentanglement (E2)
+        grp_disen_mode: int = 0,
+        grp_orth_weight: float = 1.0,
+        grp_spk_cls_weight: float = 1.0,
         # Disentanglement
         use_disent: bool = True,
         # Teacher 레이어 선택 (1-based, Factorization용)
@@ -810,6 +911,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         freeze_feature_extractor: bool = False,
         # Student 초기화
         random_init_student: bool = False,
+        load_pretrained_feature_extractor: bool = False,
         # Student 아키텍처 커스텀 (random_init_student=True일 때만 적용)
         # -1이면 student_name 모델의 기본값 사용
         student_hidden_size: int = -1,
@@ -863,6 +965,15 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             if student_intermediate_size > 0:
                 _cfg.intermediate_size = student_intermediate_size
             self.student = Wav2Vec2ForCTC(_cfg)
+            # Optionally load pretrained feature extractor (CNN) only.
+            # CNN feature extractor는 hidden_size에 독립 (raw waveform → conv_dim=512).
+            # Track B 처럼 transformer 차원이 pretrained와 달라도 CNN은 로드 가능.
+            if load_pretrained_feature_extractor:
+                pretrained = Wav2Vec2ForCTC.from_pretrained(student_name)
+                self.student.wav2vec2.feature_extractor.load_state_dict(
+                    pretrained.wav2vec2.feature_extractor.state_dict()
+                )
+                del pretrained
         else:
             self.student = Wav2Vec2ForCTC.from_pretrained(student_name)
         if freeze_feature_extractor:
@@ -1049,6 +1160,9 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         ) if use_diffkd else None
 
         # ---- GRP-KD (multi-layer AE+FM+DF, 논문 대조군) ----
+        self.grp_disen_mode = int(grp_disen_mode)
+        self.grp_orth_weight = grp_orth_weight
+        self.grp_spk_cls_weight = grp_spk_cls_weight
         self.grpkd = GRPKDModule(
             teacher_dim=self.dim_t,
             student_dim=self.dim_s,
@@ -1060,6 +1174,7 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
             num_spk=self.num_spk,
             spk_emb_dim=spk_emb_dim,
             spk_adv_alpha=spk_adv_alpha,
+            disen_mode=self.grp_disen_mode,
         ) if use_grp_kd else None
 
         # ---- Text speaker probe ----
@@ -1216,23 +1331,33 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
         total = total + flow_loss + diff_loss
 
         # 4-b) GRP-KD (multi-layer AE + FM + DF, 논문 대조군)
+        # disen_mode == 0 : E1 baseline → (L_rec, L_fm, L_df)
+        # disen_mode >= 1 : E2 disen   → (L_rec, L_fm, L_df, L_orth, L_spk_cls)
         grp_rec_loss = torch.tensor(0.0, device=self.device)
         grp_fm_loss  = torch.tensor(0.0, device=self.device)
         grp_df_loss  = torch.tensor(0.0, device=self.device)
         grp_spk_adv_loss = torch.tensor(0.0, device=self.device)
+        grp_orth_loss = torch.tensor(0.0, device=self.device)
+        grp_spk_cls_loss = torch.tensor(0.0, device=self.device)
         if self.use_grp_kd and self.grpkd is not None and self.tch_feats and self.stu_feats:
             grp_out = self.grpkd(
                 tch_feats=self.tch_feats,
                 stu_feats=self.stu_feats,
-                speaker_ids=speaker_ids if (self.use_speaker_adv or self.use_speaker_cond) else None,
+                speaker_ids=speaker_ids if (
+                    self.use_speaker_adv or self.use_speaker_cond or self.grp_disen_mode >= 1
+                ) else None,
             )
-            if self.use_speaker_adv:
+            if self.grp_disen_mode == 0 and self.use_speaker_adv:
                 grp_rec_loss, grp_fm_loss, grp_df_loss, grp_spk_adv_loss, grp_spk_acc = grp_out
                 self.log("train/grp_spk_adv", grp_spk_adv_loss, on_step=False, on_epoch=True)
                 self.log("train/grp_spk_acc", grp_spk_acc,      on_step=False, on_epoch=True)
-            else:
+            elif self.grp_disen_mode == 0:
                 grp_rec_loss, grp_fm_loss, grp_df_loss = grp_out
-
+            else:
+                (
+                    grp_rec_loss, grp_fm_loss, grp_df_loss,
+                    grp_orth_loss, grp_spk_cls_loss,
+                ) = grp_out
             self.log("train/grp_rec",  grp_rec_loss, on_step=False, on_epoch=True)
             self.log("train/grp_fm",   grp_fm_loss,  on_step=False, on_epoch=True)
             self.log("train/grp_df",   grp_df_loss,  on_step=False, on_epoch=True)
@@ -1241,6 +1366,13 @@ class DistilDAGKDWav2Vec2(pl.LightningModule):
                 + self.grp_gen_weight * (grp_fm_loss + grp_df_loss)
                 + self.spk_adv_weight * grp_spk_adv_loss
             )
+            if self.grp_disen_mode >= 1:
+                self.log("train/grp_orth",    grp_orth_loss,    on_step=False, on_epoch=True)
+                self.log("train/grp_spk_cls", grp_spk_cls_loss, on_step=False, on_epoch=True)
+                total = total + (
+                    self.grp_orth_weight * grp_orth_loss
+                    + self.grp_spk_cls_weight * grp_spk_cls_loss
+                )
 
         # 5) CTC + KD 정규화 가중합
         # kd_warmup_epochs 동안은 CTC only로 학습 후 KD 활성화

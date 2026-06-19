@@ -18,7 +18,7 @@
 #   nohup bash scripts/train/wav2vec/base2small/run_sequential.sh \
 #     > outputs/wav2vec/base2small/run_sequential.log 2>&1 &
 
-export WANDB_API_KEY=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
+export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
 
 cd /workspace/DAG-KD
 

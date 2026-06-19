@@ -1,13 +1,19 @@
 #!/bin/bash
 export WANDB_API_KEY="${WANDB_API_KEY:?Set WANDB_API_KEY before running}"
-# e2_dag_kd: Random init student + CTC + LogitKD + Disentanglement (DAG-KD 제안 방법)
-# v2: phys_loss_lambda=1e-3 추가 (이전 실패 원인: raw f0/energy MSE가 ~1300 폭주 → fix)
-OUT=outputs/wav2vec/e2_dag_kd_v2
+# e2_layer_dag_kd: Random init student + CTC + Layer KD + Disentanglement (Fix #3 제안 방법)
+# 근거:
+#   - E2-C (Layer KD) = 18.79%  → E2-B (Logit KD) = 20.51% 보다 우수
+#   - E2-D (Logit KD + Disent) = 25.50% → phys_loss 폭주로 실패
+#   - Fix: Layer KD를 base로 + Disentanglement 적용 + phys_loss_lambda 수정
+# 비교 기준:
+#   - E2-C (Layer KD only): disentanglement 추가 효과 검증
+#   - E2-D (Logit KD + Disent, 이전 실패): 구조 재설계 후 성능 변화 확인
+OUT=outputs/wav2vec/e2_layer_dag_kd
 mkdir -p "$OUT"
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --wandb_project DAG-KD-wav2vec \
-  --wandb_run wav2vec_e2_dag_kd_v2 \
+  --wandb_run wav2vec_e2_layer_dag_kd \
   --out "$OUT" \
   --data_script ./librispeech_asr.py \
   --data_cfg train_100 \
@@ -18,10 +24,9 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 python train_wav2vec.py \
   --student_name facebook/wav2vec2-base-960h \
   --random_init_student True \
   --use_ctc True \
-  --use_logit_kd True \
-  --kd_alpha 0.5 \
-  --kd_temperature 1.0 \
-  --use_layer_kd False \
+  --use_logit_kd False \
+  --use_layer_kd True \
+  --layer_kd_alpha 0.5 \
   --use_flow False \
   --use_diffkd False \
   --use_disent True \

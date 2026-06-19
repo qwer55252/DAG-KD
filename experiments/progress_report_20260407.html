@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>DAG-KD 진행상황 보고 — 2026.04.07</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+    background: #1a1a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  .slide {
+    width: 1100px;
+    background: #ffffff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  /* Header */
+  .header {
+    background: linear-gradient(135deg, #1e3a5f 0%, #2563a8 100%);
+    color: white;
+    padding: 28px 40px 22px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .header-left .title {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  .header-left .subtitle {
+    font-size: 13px;
+    color: #a8c4e8;
+    margin-top: 4px;
+  }
+  .header-right {
+    text-align: right;
+    font-size: 12px;
+    color: #a8c4e8;
+    line-height: 1.8;
+  }
+
+  /* Body */
+  .body {
+    padding: 22px 36px 26px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 16px;
+  }
+
+  .section {
+    background: #f7f9fc;
+    border-radius: 8px;
+    padding: 14px 18px;
+    border-left: 4px solid #2563a8;
+  }
+  .section.wide {
+    grid-column: 1 / -1;
+  }
+  .section.green  { border-left-color: #16a34a; }
+  .section.orange { border-left-color: #d97706; }
+  .section.purple { border-left-color: #7c3aed; }
+  .section.red    { border-left-color: #dc2626; }
+
+  .section-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #374151;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block;
+    background: #2563a8;
+  }
+  .dot.green  { background: #16a34a; }
+  .dot.orange { background: #d97706; }
+  .dot.purple { background: #7c3aed; }
+  .dot.red    { background: #dc2626; }
+
+  /* Idea box */
+  .idea-box {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12.5px;
+    color: #1e3a5f;
+    line-height: 1.6;
+  }
+  .idea-box strong { color: #1d4ed8; }
+
+  /* Result table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th {
+    background: #e8edf5;
+    color: #374151;
+    font-weight: 600;
+    padding: 6px 10px;
+    text-align: center;
+    border-bottom: 1px solid #d1d5db;
+  }
+  td {
+    padding: 6px 10px;
+    text-align: center;
+    border-bottom: 1px solid #f0f0f0;
+    color: #374151;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.label { text-align: left; font-weight: 500; }
+  td.best { color: #16a34a; font-weight: 700; }
+  td.worst { color: #dc2626; }
+  td.running { color: #d97706; font-style: italic; }
+  .badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 99px;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .badge-done { background: #dcfce7; color: #16a34a; }
+  .badge-run  { background: #fef3c7; color: #d97706; }
+  .badge-fail { background: #fee2e2; color: #dc2626; }
+  .badge-ref  { background: #ede9fe; color: #7c3aed; }
+
+  /* Timeline */
+  .timeline {
+    display: flex;
+    gap: 0;
+    font-size: 11.5px;
+    align-items: stretch;
+  }
+  .tl-item {
+    flex: 1;
+    text-align: center;
+    position: relative;
+    padding: 0 4px;
+  }
+  .tl-item:not(:last-child)::after {
+    content: '→';
+    position: absolute;
+    right: -8px;
+    top: 12px;
+    color: #9ca3af;
+    font-size: 14px;
+  }
+  .tl-top {
+    background: #2563a8;
+    color: white;
+    border-radius: 4px 4px 0 0;
+    padding: 5px 4px 3px;
+    font-weight: 700;
+    font-size: 11px;
+  }
+  .tl-top.done  { background: #16a34a; }
+  .tl-top.run   { background: #d97706; }
+  .tl-top.next  { background: #9ca3af; }
+  .tl-body {
+    background: #f7f9fc;
+    border: 1px solid #e5e7eb;
+    border-top: none;
+    border-radius: 0 0 4px 4px;
+    padding: 5px 4px;
+    color: #4b5563;
+    line-height: 1.5;
+    font-size: 10.5px;
+  }
+
+  /* Next steps */
+  .step-list { list-style: none; }
+  .step-list li {
+    padding: 4px 0;
+    font-size: 12px;
+    color: #374151;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    line-height: 1.5;
+  }
+  .step-num {
+    min-width: 18px; height: 18px;
+    background: #2563a8; color: white;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    margin-top: 1px;
+  }
+
+  .footer {
+    background: #f1f5f9;
+    border-top: 1px solid #e2e8f0;
+    padding: 10px 36px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+</style>
+</head>
+<body>
+<div class="slide">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="title">DAG-KD: ASR Knowledge Distillation 진행상황 보고</div>
+      <div class="subtitle">Disentanglement-Augmented Knowledge Distillation for Speech Recognition</div>
+    </div>
+    <div class="header-right">
+      보고일: 2026년 4월 7일<br>
+      데이터: LibriSpeech train-clean-100<br>
+      Teacher: wav2vec2-large-960h &nbsp;|&nbsp; Student: wav2vec2-base-960h
+    </div>
+  </div>
+
+  <div class="body">
+
+    <!-- 핵심 아이디어 -->
+    <div class="section wide">
+      <div class="section-title"><span class="dot"></span> 연구 핵심 아이디어</div>
+      <div class="idea-box">
+        기존 KD는 Teacher의 표현을 <strong>통째로</strong> Student가 모사하도록 학습 — Student의 제한된 capacity가 ASR에 불필요한 <strong>화자/prosody 정보 재현에 낭비</strong>됨.<br>
+        DAG-KD는 Teacher 표현 내부의 <strong>Content(언어) 정보와 Non-linguistic(화자) 정보를 분리(Disentanglement)</strong>한 뒤,
+        ASR에 유효한 <strong>Content 중심 정보만</strong> Student에게 선택적으로 증류하여 더 작고 효율적인 ASR Student 모델을 학습한다.
+      </div>
+    </div>
+
+    <!-- 실험 현황 테이블 -->
+    <div class="section wide green">
+      <div class="section-title"><span class="dot green"></span> 실험 결과 현황 (WER % — 낮을수록 좋음)</div>
+      <table>
+        <tr>
+          <th style="text-align:left; width:190px">실험</th>
+          <th>구성</th>
+          <th>학생 초기화</th>
+          <th>dev-clean ↓</th>
+          <th>dev-other ↓</th>
+          <th>test-clean ↓</th>
+          <th>test-other ↓</th>
+          <th>상태</th>
+        </tr>
+        <!-- Reference -->
+        <tr>
+          <td class="label">E0-T &nbsp;<span class="badge badge-ref">Reference</span></td>
+          <td>Teacher 단독 fine-tuning (CTC only)</td>
+          <td>Pre-trained (Large)</td>
+          <td>7.39</td>
+          <td>18.15</td>
+          <td>7.44</td>
+          <td>18.95</td>
+          <td><span class="badge badge-done">완료</span></td>
+        </tr>
+        <tr>
+          <td class="label">E0-S &nbsp;<span class="badge badge-ref">Reference</span></td>
+          <td>Student 단독 fine-tuning (CTC only)</td>
+          <td>Pre-trained (Base)</td>
+          <td>5.85</td>
+          <td>17.30</td>
+          <td>5.84</td>
+          <td>19.25</td>
+          <td><span class="badge badge-done">완료</span></td>
+        </tr>
+        <!-- E1 -->
+        <tr style="background:#f0f7ff">
+          <td class="label">E1 &nbsp;<span class="badge badge-ref">KD Baseline</span></td>
+          <td>CTC + Logit KD</td>
+          <td>Pre-trained (Base)</td>
+          <td class="worst">9.48</td>
+          <td class="worst">26.38</td>
+          <td class="worst">9.71</td>
+          <td class="worst">28.46</td>
+          <td><span class="badge badge-done">완료</span></td>
+        </tr>
+        <!-- E2 Ablation -->
+        <tr>
+          <td class="label">E2-A &nbsp;CTC Only</td>
+          <td>CTC only (KD 없음, 하한선)</td>
+          <td>Random Init</td>
+          <td class="worst">23.84</td>
+          <td class="worst">50.23</td>
+          <td class="worst">24.14</td>
+          <td class="worst">53.10</td>
+          <td><span class="badge badge-done">완료</span></td>
+        </tr>
+        <tr>
+          <td class="label">E2-B &nbsp;Logit KD</td>
+          <td>CTC + Logit KD</td>
+          <td>Random Init</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td class="running">진행 중</td>
+          <td class="running">—</td>
+          <td><span class="badge badge-run">실행 중</span></td>
+        </tr>
+        <tr>
+          <td class="label">E2-C &nbsp;Layer KD</td>
+          <td>CTC + Layer-wise KD (MSE)</td>
+          <td>Random Init</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td><span class="badge badge-run">대기 중</span></td>
+        </tr>
+        <tr style="background:#f0fdf4">
+          <td class="label"><strong>E2-D &nbsp;DAG-KD</strong> ★</td>
+          <td>CTC + Logit KD + Disentanglement (제안)</td>
+          <td>Random Init</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td class="running">—</td>
+          <td><span class="badge badge-run">대기 중</span></td>
+        </tr>
+      </table>
+      <div style="font-size:10.5px; color:#6b7280; margin-top:8px; padding-left:4px;">
+        * E1은 사전학습 가중치 사용으로 WER이 낮지만, E2는 Random Init으로 KD 효과를 순수하게 측정 (변인 통제).
+        &nbsp;&nbsp;S-DisKD(NeMo) 실험에서는 화자 Factor KD 적용 시 test-clean 14.08% → 13.55% (+0.53%p) 개선 확인.
+      </div>
+    </div>
+
+    <!-- 실험 진행 타임라인 -->
+    <div class="section orange">
+      <div class="section-title"><span class="dot orange"></span> 실험 진행 타임라인</div>
+      <div class="timeline">
+        <div class="tl-item">
+          <div class="tl-top done">E0</div>
+          <div class="tl-body">Reference<br>Teacher / Student<br>단독 fine-tuning<br><strong>완료 ✓</strong></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-top done">E1</div>
+          <div class="tl-body">KD Baseline<br>CTC + Logit KD<br>(Pre-trained init)<br><strong>완료 ✓</strong></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-top done">E2-A</div>
+          <div class="tl-body">CTC Only<br>(Random init)<br>하한선 확인<br><strong>완료 ✓</strong></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-top run">E2-B/C/D</div>
+          <div class="tl-body">Logit KD<br>Layer KD<br>DAG-KD<br><strong>순차 실행 중</strong></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-top next">분석</div>
+          <div class="tl-body">E2 결과 비교<br>가설 검증<br>리포트 작성<br><em>예정</em></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 다음 계획 -->
+    <div class="section purple">
+      <div class="section-title"><span class="dot purple"></span> 향후 계획</div>
+      <ul class="step-list">
+        <li>
+          <span class="step-num">1</span>
+          <span>E2 ablation 완료 후 <strong>CTC Only / Logit KD / Layer KD / DAG-KD 성능 비교표</strong> 작성 → Disentanglement의 순효과 정량화</span>
+        </li>
+        <li>
+          <span class="step-num">2</span>
+          <span>E1(pre-trained init KD)이 E0-S(단독 FT)보다 WER이 높은 원인 분석 — KD loss 간섭 여부, LR 민감도 확인</span>
+        </li>
+        <li>
+          <span class="step-num">3</span>
+          <span>S-DisKD에서 확인된 <strong>Speaker Factor KD 효과(+0.53%p)</strong>를 wav2vec2 프레임워크로 이식 · 검증</span>
+        </li>
+        <li>
+          <span class="step-num">4</span>
+          <span>E2 결과 기반으로 최종 제안 방법 구성 확정 후 전체 데이터(train-960h) 학습 실험 진행</span>
+        </li>
+      </ul>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    <span>DAG-KD Project &nbsp;|&nbsp; Teacher: wav2vec2-large-960h (317M) → Student: wav2vec2-base-960h (94M) &nbsp;|&nbsp; GPU: 4× CUDA, 100 epochs</span>
+    <span>2026.04.07</span>
+  </div>
+
+</div>
+</body>
+</html>
